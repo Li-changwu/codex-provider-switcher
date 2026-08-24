@@ -17,16 +17,16 @@ import {
 } from "../../src/core/rollouts";
 import type { CodexLayout } from "../../src/core/types";
 
-test("updates active and archived provider rows while preserving every other byte", async () => {
+test("updates actual session_meta provider metadata and preserves every other byte", async () => {
   await withLayout(async (layout) => {
     const activePath = join(layout.sessionsDir, "active.jsonl");
     const archivedPath = join(layout.archivedSessionsDir, "archived.jsonl");
-    const activeProvider = providerLine("active", "openai");
-    const activeMessage = messageLine("active", true);
-    const archivedProvider = providerLine("archived", "openai");
-    const archivedMessage = messageLine("archived", false);
-    const activeBefore = `${activeProvider}\r\n${activeMessage}\n`;
-    const archivedBefore = `${archivedProvider}\n${archivedMessage}`;
+    const activeMeta = sessionMetaLine("active", "openai");
+    const activeMessage = messageLine(true);
+    const archivedMeta = sessionMetaLine("archived", "openai");
+    const archivedMessage = messageLine(false);
+    const activeBefore = `${activeMeta}\r\n${activeMessage}\n`;
+    const archivedBefore = `${archivedMeta}\n${archivedMessage}`;
     await writeFile(activePath, activeBefore, "utf8");
     await writeFile(archivedPath, archivedBefore, "utf8");
 
@@ -35,14 +35,15 @@ test("updates active and archived provider rows while preserving every other byt
     assert.equal(report.encryptedContentCount, 1);
     assert.match(report.warnings[0] ?? "", /encrypted_content/);
     assert.deepEqual(
-      report.changes.map(({ path, sessionId, encryptedContent }) => ({
+      report.changes.map(({ path, sessionId, beforeProvider, encryptedContent }) => ({
         path,
         sessionId,
+        beforeProvider,
         encryptedContent,
       })),
       [
-        { path: activePath, sessionId: "active", encryptedContent: true },
-        { path: archivedPath, sessionId: "archived", encryptedContent: false },
+        { path: activePath, sessionId: "active", beforeProvider: "openai", encryptedContent: true },
+        { path: archivedPath, sessionId: "archived", beforeProvider: "openai", encryptedContent: false },
       ],
     );
 
@@ -50,11 +51,11 @@ test("updates active and archived provider rows while preserving every other byt
     assert.equal(result.applied, 2);
     assert.equal(
       await readFile(activePath, "utf8"),
-      `${activeProvider.replace('"openai"', '"custom"')}\r\n${activeMessage}\n`,
+      `${activeMeta.replace('"openai"', '"custom"')}\r\n${activeMessage}\n`,
     );
     assert.equal(
       await readFile(archivedPath, "utf8"),
-      `${archivedProvider.replace('"openai"', '"custom"')}\n${archivedMessage}`,
+      `${archivedMeta.replace('"openai"', '"custom"')}\n${archivedMessage}`,
     );
   });
 });
@@ -63,10 +64,10 @@ test("rejects malformed JSONL during preflight before writing any file", async (
   await withLayout(async (layout) => {
     const validPath = join(layout.sessionsDir, "valid.jsonl");
     const malformedPath = join(layout.archivedSessionsDir, "malformed.jsonl");
-    await writeFile(validPath, `${providerLine("valid", "openai")}\n`, "utf8");
+    await writeFile(validPath, `${sessionMetaLine("valid", "openai")}\n`, "utf8");
     await writeFile(
       malformedPath,
-      `${providerLine("bad", "openai")}\n{"session_id":`,
+      `${sessionMetaLine("bad", "openai")}\n{"type":"response_item"`,
       "utf8",
     );
     const validBefore = await readFile(validPath, "utf8");
@@ -82,10 +83,10 @@ test("rejects malformed JSONL during preflight before writing any file", async (
   });
 });
 
-test("fails closed for duplicate or different provider session IDs", async () => {
+test("fails closed for multiple session IDs in one rollout", async () => {
   await withLayout(async (layout) => {
-    const path = join(layout.sessionsDir, "unknown-layout.jsonl");
-    const before = `${providerLine("one", "openai")}\n${providerLine("two", "openai")}\n`;
+    const path = join(layout.sessionsDir, "multiple-sessions.jsonl");
+    const before = `${sessionMetaLine("one", "openai")}\n${sessionMetaLine("two", "openai")}\n`;
     await writeFile(path, before, "utf8");
 
     await assert.rejects(
@@ -97,10 +98,32 @@ test("fails closed for duplicate or different provider session IDs", async () =>
   });
 });
 
-test("rejects provider metadata nested outside the root object", async () => {
+test("rejects duplicate session IDs across active and archived rollouts before writing", async () => {
+  await withLayout(async (layout) => {
+    const activePath = join(layout.sessionsDir, "same-active.jsonl");
+    const archivedPath = join(layout.archivedSessionsDir, "same-archived.jsonl");
+    const activeBefore = `${sessionMetaLine("duplicate", "openai")}\n`;
+    const archivedBefore = `${sessionMetaLine("duplicate", "openai")}\n`;
+    await writeFile(activePath, activeBefore, "utf8");
+    await writeFile(archivedPath, archivedBefore, "utf8");
+
+    await assert.rejects(
+      () => collectRolloutChanges(layout, "custom"),
+      (error: unknown) =>
+        error instanceof RolloutValidationError && error.code === "unsupported-layout",
+    );
+    assert.equal(await readFile(activePath, "utf8"), activeBefore);
+    assert.equal(await readFile(archivedPath, "utf8"), archivedBefore);
+  });
+});
+
+test("rejects provider metadata nested outside session_meta.payload.model_provider", async () => {
   await withLayout(async (layout) => {
     const path = join(layout.sessionsDir, "nested-provider.jsonl");
-    const before = `${JSON.stringify({ session_id: "nested", data: { provider: "openai" } })}\n`;
+    const before = `${JSON.stringify({
+      type: "session_meta",
+      payload: { id: "nested", model_provider: "openai", provider: "openai" },
+    })}\n`;
     await writeFile(path, before, "utf8");
 
     await assert.rejects(
@@ -112,10 +135,10 @@ test("rejects provider metadata nested outside the root object", async () => {
   });
 });
 
-test("leaves a rollout without a non-target provider completely untouched", async () => {
+test("leaves a rollout with the target provider completely untouched", async () => {
   await withLayout(async (layout) => {
     const path = join(layout.sessionsDir, "unchanged.jsonl");
-    const before = `${providerLine("same", "custom")}\n${messageLine("same", false)}\n`;
+    const before = `${sessionMetaLine("same", "custom")}\n${messageLine(false)}\n`;
     await writeFile(path, before, "utf8");
 
     const changes = await collectRolloutChanges(layout, "custom");
@@ -125,12 +148,30 @@ test("leaves a rollout without a non-target provider completely untouched", asyn
   });
 });
 
+test("rejects a forged change without scan provenance and leaves the file unchanged", async () => {
+  await withLayout(async (layout) => {
+    const path = join(layout.sessionsDir, "forged.jsonl");
+    const before = `${sessionMetaLine("forged", "openai")}\n`;
+    await writeFile(path, before, "utf8");
+    const changes = await collectRolloutChanges(layout, "custom");
+    assert.equal(changes.length, 1);
+    const forged = { ...changes[0] };
+
+    await assert.rejects(
+      () => applyRolloutChanges([forged]),
+      (error: unknown) =>
+        error instanceof RolloutValidationError && error.code === "change-mismatch",
+    );
+    assert.equal(await readFile(path, "utf8"), before);
+  });
+});
+
 test("refuses to rename a file whose bytes changed after preflight", async () => {
   await withLayout(async (layout) => {
     const path = join(layout.sessionsDir, "changed-after-scan.jsonl");
-    await writeFile(path, `${providerLine("stale", "openai")}\n`, "utf8");
+    await writeFile(path, `${sessionMetaLine("stale", "openai")}\n`, "utf8");
     const changes = await collectRolloutChanges(layout, "custom");
-    const changed = `${providerLine("stale", "openai", "changed-title")}\n`;
+    const changed = `${sessionMetaLine("stale", "openai", "changed-title")}\n`;
     await writeFile(path, changed, "utf8");
 
     await assert.rejects(
@@ -145,7 +186,7 @@ test("refuses to rename a file whose bytes changed after preflight", async () =>
 test("cancellation before the first rename leaves the old file and temp file state clean", async () => {
   await withLayout(async (layout) => {
     const path = join(layout.sessionsDir, "cancelled.jsonl");
-    const before = `${providerLine("cancelled", "openai")}\n`;
+    const before = `${sessionMetaLine("cancelled", "openai")}\n`;
     await writeFile(path, before, "utf8");
     const changes = await collectRolloutChanges(layout, "custom");
     const controller = new AbortController();
@@ -168,7 +209,7 @@ test("cancellation before the first rename leaves the old file and temp file sta
 test("cleans the sibling temp file when a single-file write fails", async () => {
   await withLayout(async (layout) => {
     const path = join(layout.sessionsDir, "write-failure.jsonl");
-    const before = `${providerLine("failure", "openai")}\n`;
+    const before = `${sessionMetaLine("failure", "openai")}\n`;
     await writeFile(path, before, "utf8");
     const changes = await collectRolloutChanges(layout, "custom");
 
@@ -187,11 +228,11 @@ test("cleans the sibling temp file when a single-file write fails", async () => 
   });
 });
 
-test("rejects a rollout that contains no session_id event", async () => {
+test("rejects a rollout without a session_meta event", async () => {
   await withLayout(async (layout) => {
     await writeFile(
       join(layout.sessionsDir, "missing-session.jsonl"),
-      `${JSON.stringify({ message: "no session" })}\n`,
+      `${messageLine(false)}\n`,
       "utf8",
     );
 
@@ -223,21 +264,24 @@ async function withLayout(callback: (layout: CodexLayout) => Promise<void>): Pro
   }
 }
 
-function providerLine(
+function sessionMetaLine(
   sessionId: string,
   provider: string | null,
   title = "Keep title",
 ): string {
   const providerValue = provider === null ? "null" : JSON.stringify(provider);
-  return ` { "session_id": ${JSON.stringify(sessionId)}, "provider" : ${providerValue}, "title": ${JSON.stringify(title)}, "timestamp": "2026-08-25T00:00:00.000Z", "unknown": "Keep\\nunknown bytes" } `;
+  return ` { "timestamp": "2026-08-25T00:00:00.000Z", "type" : "session_meta", "payload" : { "id": ${JSON.stringify(sessionId)}, "model_provider" : ${providerValue}, "title": ${JSON.stringify(title)}, "unknown": "Keep\\nunknown bytes" }, "unknown_record_field": { "keep": true } } `;
 }
 
-function messageLine(sessionId: string, encrypted: boolean): string {
+function messageLine(encrypted: boolean): string {
   return JSON.stringify({
-    session_id: sessionId,
-    type: "message",
-    data: encrypted ? { encrypted_content: "opaque-history" } : { text: "Keep message" },
-    title: "Keep message title",
     timestamp: "2026-08-25T00:01:00.000Z",
+    type: "response_item",
+    payload: {
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "Keep message" }],
+    },
+    ...(encrypted ? { encrypted_content: "opaque-history" } : {}),
   });
 }

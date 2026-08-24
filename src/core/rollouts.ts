@@ -10,6 +10,9 @@ import {
 import { basename, dirname, join } from "node:path";
 import type { CodexLayout } from "./types";
 
+const rolloutChangeProvenance = new WeakSet<object>();
+type ProvenancedRolloutChange = RolloutChange;
+
 export interface RolloutReplacement {
   line: number;
   start: number;
@@ -90,10 +93,18 @@ export async function scanRollouts(
 ): Promise<RolloutScanResult> {
   assertProvider(targetProvider);
   const changes: RolloutChange[] = [];
+  const sessionIds = new Set<string>();
   let encryptedContentCount = 0;
 
   for (const path of await findRolloutFiles(layout)) {
     const observed = await scanRolloutFile(path, targetProvider);
+    if (sessionIds.has(observed.sessionId)) {
+      throw new RolloutValidationError(
+        "unsupported-layout",
+        `Session ${observed.sessionId} appears in more than one rollout: ${path}`,
+      );
+    }
+    sessionIds.add(observed.sessionId);
     if (observed.encryptedContent) {
       encryptedContentCount += 1;
     }
@@ -144,8 +155,9 @@ export async function applyRolloutChanges(
 }
 
 interface ObservedRollout {
+  sessionId: string;
   encryptedContent: boolean;
-  change?: RolloutChange;
+  change?: ProvenancedRolloutChange;
 }
 
 interface JsonlLine {
@@ -209,8 +221,8 @@ async function scanRolloutFile(
   let lineNumber = 0;
   let sessionId: string | undefined;
   const sessionIds = new Set<string>();
+  let beforeProvider: string | null | undefined;
   let providerSeen = false;
-  let beforeProvider: string | null = null;
   let encryptedContent = false;
   const replacements: RolloutReplacement[] = [];
 
@@ -218,6 +230,12 @@ async function scanRolloutFile(
     const record = parseJsonLine(path, lineNumber, entry.line);
     const properties = scanRootProperties(path, lineNumber, entry.line);
     assertUniqueRootKeys(path, lineNumber, properties);
+    if (properties.some((property) => property.name === "session_id" || property.name === "provider")) {
+      throw new RolloutValidationError(
+        "unsupported-layout",
+        `Rollout uses unsupported root session/provider metadata: ${path}`,
+      );
+    }
     if (containsNestedProvider(record)) {
       throw new RolloutValidationError(
         "unsupported-layout",
@@ -225,55 +243,62 @@ async function scanRolloutFile(
       );
     }
 
-    const sessionProperty = properties.find((property) => property.name === "session_id");
-    if (sessionProperty) {
-      const value = (record as Record<string, unknown>).session_id;
-      if (typeof value !== "string" || value.length === 0) {
+    if (record.type === "session_meta") {
+      const payloadProperty = properties.find((property) => property.name === "payload");
+      const payload = record.payload;
+      if (!payloadProperty || !isRecord(payload)) {
         throw new RolloutValidationError(
-          "missing-session-id",
-          `Rollout contains an invalid session_id at line ${lineNumber + 1}: ${path}`,
+          "unsupported-layout",
+          `Rollout session_meta has no object payload: ${path}`,
         );
       }
-      sessionId ??= value;
-      sessionIds.add(value);
+
+      const payloadProperties = scanObjectProperties(
+        path,
+        lineNumber,
+        entry.line,
+        payloadProperty.valueStart,
+      );
+      assertUniqueRootKeys(path, lineNumber, payloadProperties);
+      const id = payload.id;
+      if (typeof id !== "string" || id.length === 0) {
+        throw new RolloutValidationError(
+          "missing-session-id",
+          `Rollout session_meta has no valid payload.id: ${path}`,
+        );
+      }
+      sessionId ??= id;
+      sessionIds.add(id);
       if (sessionIds.size > 1) {
         throw new RolloutValidationError(
           "unsupported-layout",
-          `Rollout contains more than one session_id: ${path}`,
+          `Rollout contains more than one session ID: ${path}`,
         );
       }
-    }
 
-    const providerProperty = properties.find((property) => property.name === "provider");
-    if (providerProperty) {
-      if (providerSeen) {
-        throw new RolloutValidationError(
-          "unsupported-layout",
-          `Rollout contains duplicate provider session metadata: ${path}`,
-        );
-      }
-      providerSeen = true;
-      if (!sessionProperty || sessionId === undefined) {
-        throw new RolloutValidationError(
-          "unsupported-layout",
-          `Rollout provider metadata has no session_id: ${path}`,
-        );
-      }
-      const value = (record as Record<string, unknown>).provider;
-      if (value !== null && typeof value !== "string") {
-        throw new RolloutValidationError(
-          "unsupported-provider-metadata",
-          `Rollout provider metadata is not a string or null: ${path}`,
-        );
-      }
-      beforeProvider = value;
-      if (value !== targetProvider) {
-        replacements.push({
-          line: lineNumber,
-          start: providerProperty.valueStart,
-          end: providerProperty.valueEnd,
-          value: JSON.stringify(targetProvider),
-        });
+      const providerProperty = payloadProperties.find(
+        (property) => property.name === "model_provider",
+      );
+      if (providerProperty) {
+        const value = payload.model_provider;
+        if (value !== null && typeof value !== "string") {
+          throw new RolloutValidationError(
+            "unsupported-provider-metadata",
+            `Rollout model_provider is not a string or null: ${path}`,
+          );
+        }
+        if (!providerSeen) {
+          beforeProvider = value;
+          providerSeen = true;
+        }
+        if (value !== targetProvider) {
+          replacements.push({
+            line: lineNumber,
+            start: providerProperty.valueStart,
+            end: providerProperty.valueEnd,
+            value: JSON.stringify(targetProvider),
+          });
+        }
       }
     }
 
@@ -284,31 +309,52 @@ async function scanRolloutFile(
   if (sessionId === undefined) {
     throw new RolloutValidationError(
       "missing-session-id",
-      `Rollout does not contain a session_id event: ${path}`,
+      `Rollout does not contain a session_meta event: ${path}`,
     );
   }
 
   const contentHash = hash.digest("hex");
   return {
+    sessionId,
     encryptedContent,
     change:
-      providerSeen && beforeProvider !== targetProvider
-        ? {
+      replacements.length === 0
+        ? undefined
+        : brandChange({
             path,
             sessionId,
-            beforeProvider,
+            beforeProvider: beforeProvider ?? null,
             afterProvider: targetProvider,
             encryptedContent,
             contentHash,
             replacements,
-          }
-        : undefined,
+          }),
   };
+}
+
+function brandChange(change: RolloutChange): ProvenancedRolloutChange {
+  const branded = {
+    ...change,
+    replacements: Object.freeze([...change.replacements]),
+  } as ProvenancedRolloutChange;
+  rolloutChangeProvenance.add(branded);
+  return Object.freeze(branded);
+}
+
+function isProvenancedChange(value: unknown): value is ProvenancedRolloutChange {
+  return isRecord(value) && rolloutChangeProvenance.has(value);
 }
 
 function validateChangeList(changes: readonly RolloutChange[]): void {
   const seenPaths = new Set<string>();
-  for (const change of changes) {
+  for (const candidate of changes) {
+    if (!isProvenancedChange(candidate)) {
+      throw new RolloutValidationError(
+        "change-mismatch",
+        "Rollout change was not produced by the current scan.",
+      );
+    }
+    const change = candidate;
     if (seenPaths.has(change.path)) {
       throw new RolloutValidationError(
         "change-mismatch",
@@ -323,7 +369,7 @@ function validateChangeList(changes: readonly RolloutChange[]): void {
         `Rollout change has no valid preflight hash: ${change.path}`,
       );
     }
-    if (change.replacements.length === 0) {
+    if (!Array.isArray(change.replacements) || change.replacements.length === 0) {
       throw new RolloutValidationError(
         "change-mismatch",
         `Rollout change has no provider replacement: ${change.path}`,
@@ -445,8 +491,17 @@ function parseJsonLine(path: string, lineNumber: number, line: string): Record<s
 }
 
 function scanRootProperties(path: string, lineNumber: number, line: string): RootProperty[] {
+  return scanObjectProperties(path, lineNumber, line, 0);
+}
+
+function scanObjectProperties(
+  path: string,
+  lineNumber: number,
+  line: string,
+  objectStart: number,
+): RootProperty[] {
   const properties: RootProperty[] = [];
-  let cursor = skipWhitespace(line, 0);
+  let cursor = skipWhitespace(line, objectStart);
   if (line[cursor] !== "{") {
     throw new RolloutValidationError(
       "unsupported-layout",
@@ -466,7 +521,7 @@ function scanRootProperties(path: string, lineNumber: number, line: string): Roo
     if (line[cursor] !== ":") {
       throw new RolloutValidationError(
         "unsupported-layout",
-        `Rollout root property is malformed at line ${lineNumber + 1}: ${path}`,
+        `Rollout object property is malformed at line ${lineNumber + 1}: ${path}`,
       );
     }
     const valueStart = skipWhitespace(line, cursor + 1);
@@ -479,7 +534,7 @@ function scanRootProperties(path: string, lineNumber: number, line: string): Roo
     if (line[cursor] !== ",") {
       throw new RolloutValidationError(
         "unsupported-layout",
-        `Rollout root properties are malformed at line ${lineNumber + 1}: ${path}`,
+        `Rollout object properties are malformed at line ${lineNumber + 1}: ${path}`,
       );
     }
     cursor = skipWhitespace(line, cursor + 1);
@@ -487,7 +542,7 @@ function scanRootProperties(path: string, lineNumber: number, line: string): Roo
 
   throw new RolloutValidationError(
     "unsupported-layout",
-    `Rollout root object is not closed at line ${lineNumber + 1}: ${path}`,
+    `Rollout object is not closed at line ${lineNumber + 1}: ${path}`,
   );
 }
 
