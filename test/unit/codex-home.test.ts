@@ -103,6 +103,36 @@ test("refuses WSL environments and mounted Windows home paths", () => {
   );
 });
 
+test("refuses a WSL kernel release when environment markers are absent", () => {
+  assertUnsupportedHost(
+    {
+      env: {},
+      platform: "linux",
+      homeDir: "/home/ada",
+      extensionStorageUri: { scheme: "file", fsPath: "/home/ada/.vscode-server" },
+      kernelReleaseProbe: () => "5.15.153.1-microsoft-standard-WSL2",
+    },
+    "wsl",
+  );
+});
+
+test("does not run a kernel release probe for Windows hosts", () => {
+  let probeCalled = false;
+
+  resolveCodexLayout({
+    env: {},
+    platform: "win32",
+    homeDir: "C:\\Users\\Ada",
+    extensionStorageUri: { scheme: "file", fsPath: "C:\\Users\\Ada\\storage" },
+    kernelReleaseProbe: () => {
+      probeCalled = true;
+      throw new Error("Windows must not probe Linux kernel files");
+    },
+  });
+
+  assert.equal(probeCalled, false);
+});
+
 test("refuses Windows UNC and Windows-shaped paths on Linux hosts", () => {
   assertUnsupportedHost(
     {

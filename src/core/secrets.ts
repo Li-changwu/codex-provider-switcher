@@ -1,3 +1,4 @@
+import { posix, win32 } from "node:path";
 import type {
   ResolvedExtensionHostStorageLocation,
 } from "./types";
@@ -27,15 +28,15 @@ export class SecretStore {
     private readonly secrets: SecretStorageLike,
     storageLocation: ResolvedExtensionHostStorageLocation,
   ) {
-    if (!isVerifiedRemoteSshStorage(storageLocation)) {
+    if (!isVerifiedExtensionHostStorage(storageLocation)) {
       throw new UnsupportedSecretStorageError(
-        "SecretStorage must be a verified remote Extension Host storage target.",
+        "SecretStorage must use a verified Extension Host storage target.",
       );
     }
   }
 
   async set(profileSecretId: string, value: string): Promise<void> {
-    assertProfileSecretId(profileSecretId);
+    assertProfileSecretId(profileSecretId, "write");
     try {
       await this.secrets.store(profileSecretId, value);
     } catch {
@@ -44,7 +45,7 @@ export class SecretStore {
   }
 
   async get(profileSecretId: string): Promise<string | undefined> {
-    assertProfileSecretId(profileSecretId);
+    assertProfileSecretId(profileSecretId, "read");
     try {
       return await this.secrets.get(profileSecretId);
     } catch {
@@ -53,7 +54,7 @@ export class SecretStore {
   }
 
   async delete(profileSecretId: string): Promise<void> {
-    assertProfileSecretId(profileSecretId);
+    assertProfileSecretId(profileSecretId, "delete");
     try {
       await this.secrets.delete(profileSecretId);
     } catch {
@@ -62,22 +63,55 @@ export class SecretStore {
   }
 }
 
-function isVerifiedRemoteSshStorage(
+function isVerifiedExtensionHostStorage(
   storageLocation: ResolvedExtensionHostStorageLocation,
 ): boolean {
   const uri = storageLocation.uri;
-  return Boolean(
-    storageLocation.verified &&
-      storageLocation.isRemote &&
-      uri?.scheme === "vscode-remote" &&
-      uri.authority?.startsWith("ssh-remote+") &&
-      uri.fsPath.startsWith("/") &&
-      !/^\/mnt\/[a-z](?:\/|$)/i.test(uri.fsPath),
+  if (!uri) {
+    return false;
+  }
+  if (storageLocation.remoteAuthority) {
+    return (
+      storageLocation.platform === "linux" &&
+      uri.scheme === "vscode-remote" &&
+      uri.authority === storageLocation.remoteAuthority &&
+      uri.authority.startsWith("ssh-remote+") &&
+      isNativeLinuxPath(uri.fsPath)
+    );
+  }
+  return (
+    uri.scheme === "file" &&
+    !uri.authority &&
+    isNativeLocalPath(uri.fsPath, storageLocation.platform)
   );
 }
 
-function assertProfileSecretId(profileSecretId: string): void {
+function isNativeLocalPath(path: string, platform: NodeJS.Platform): boolean {
+  if (platform === "linux") {
+    return isNativeLinuxPath(path);
+  }
+  return (
+    platform === "win32" &&
+    win32.isAbsolute(path) &&
+    !/^\\\\|^\/\//.test(path) &&
+    !/^\\\\wsl(?:\.localhost)?\\/i.test(path)
+  );
+}
+
+function isNativeLinuxPath(path: string): boolean {
+  return (
+    posix.isAbsolute(path) &&
+    !/^\/\//.test(path) &&
+    !/^\/mnt\/[a-z](?:\/|$)/i.test(path) &&
+    !/^\/run\/desktop\/mnt\/host\/[a-z](?:\/|$)/i.test(path)
+  );
+}
+
+function assertProfileSecretId(
+  profileSecretId: string,
+  operation: "read" | "write" | "delete",
+): void {
   if (!profileSecretId.trim()) {
-    throw new SecretStorageError("write");
+    throw new SecretStorageError(operation);
   }
 }

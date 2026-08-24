@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { posix, win32 } from "node:path";
 import type { CodexLayout, ExtensionHostStorageUri } from "./types";
 
@@ -19,13 +20,19 @@ export interface ResolveCodexLayoutOptions {
   platform: NodeJS.Platform;
   homeDir: string;
   extensionStorageUri: ExtensionHostStorageUri;
+  kernelReleaseProbe?: () => string | undefined;
 }
 
 export function resolveCodexLayout(
   options: ResolveCodexLayoutOptions,
 ): CodexLayout {
   assertSupportedPlatform(options.platform);
-  assertNotWsl(options.env, options.homeDir, options.extensionStorageUri.fsPath);
+  assertNotWsl(
+    options.env,
+    resolveKernelRelease(options),
+    options.homeDir,
+    options.extensionStorageUri.fsPath,
+  );
 
   const path = options.platform === "win32" ? win32 : posix;
   const configuredCodexHome = options.env.CODEX_HOME;
@@ -64,13 +71,38 @@ function assertSupportedPlatform(platform: NodeJS.Platform): asserts platform is
 
 function assertNotWsl(
   env: Readonly<Record<string, string | undefined>>,
+  kernelRelease: string | undefined,
   ...paths: string[]
 ): void {
-  if (isWslEnvironment(env) || paths.some(isWslPath)) {
+  if (
+    isWslEnvironment(env) ||
+    isWslKernelRelease(kernelRelease) ||
+    paths.some(isWslPath)
+  ) {
     throw new UnsupportedHostError(
       "wsl",
       "Codex Provider Switcher does not support WSL Extension Hosts.",
     );
+  }
+}
+
+function resolveKernelRelease(
+  options: ResolveCodexLayoutOptions,
+): string | undefined {
+  if (options.platform !== "linux") {
+    return undefined;
+  }
+  return (options.kernelReleaseProbe ?? defaultLinuxKernelReleaseProbe)();
+}
+
+function defaultLinuxKernelReleaseProbe(): string | undefined {
+  if (process.platform !== "linux") {
+    return undefined;
+  }
+  try {
+    return readFileSync("/proc/sys/kernel/osrelease", "utf8");
+  } catch {
+    return undefined;
   }
 }
 
@@ -113,6 +145,10 @@ function isWslEnvironment(env: Readonly<Record<string, string | undefined>>): bo
     const value = env[key];
     return value !== undefined && value !== "";
   });
+}
+
+function isWslKernelRelease(kernelRelease: string | undefined): boolean {
+  return Boolean(kernelRelease && /microsoft|wsl/i.test(kernelRelease));
 }
 
 function isWslPath(candidate: string): boolean {

@@ -1,11 +1,21 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile, chmod } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import type { CodexLayout } from "../../src/core/types";
 import {
   ProfileStore,
+  ProfileStoreError,
   type ProfileFileSystem,
 } from "../../src/core/profiles";
 import {
@@ -26,7 +36,7 @@ test("creates normalized profile IDs and deterministic collision suffixes", asyn
       kind: "custom",
       configText: 'model_provider = "research"\n',
       providerId: "research",
-      apiKeySecretId: "profile.research-proxy.secret",
+      apiKeySecretId: "supplied-but-not-persisted",
     });
     const second = await store.create({
       name: "Research Proxy!",
@@ -37,6 +47,10 @@ test("creates normalized profile IDs and deterministic collision suffixes", asyn
 
     assert.equal(first.id, "research-proxy");
     assert.equal(second.id, "research-proxy-2");
+    assert.equal(
+      first.apiKeySecretId,
+      "codex-provider-switcher.profile.research-proxy.api-key",
+    );
     assert.equal(first.configFile, join(layout.switcherDir, "profiles", first.id, "config.toml"));
     assert.deepEqual(
       (await store.list()).map((profile) => profile.id),
@@ -46,16 +60,16 @@ test("creates normalized profile IDs and deterministic collision suffixes", asyn
   });
 });
 
-test("writes raw TOML separately and redacts secret identifiers from the index", async () => {
+test("derives custom secret IDs after restart without persisting them", async () => {
   await withTemporaryLayout(async (layout) => {
     const store = new ProfileStore(layout, {
       now: () => "2026-08-24T00:00:00.000Z",
     });
     const profile = await store.create({
-      name: "Official",
-      kind: "official",
-      configText: 'model_provider = "openai"\n',
-      apiKeySecretId: "profile.official.secret",
+      name: "Research Proxy",
+      kind: "custom",
+      configText: 'model_provider = "research"\n',
+      apiKeySecretId: "supplied-but-not-persisted",
     });
 
     const indexPath = join(layout.switcherDir, "profiles", "index.json");
@@ -64,11 +78,38 @@ test("writes raw TOML separately and redacts secret identifiers from the index",
       profiles: Array<Record<string, unknown>>;
     };
 
-    assert.equal(await readFile(profile.configFile, "utf8"), 'model_provider = "openai"\n');
-    assert.equal(profile.apiKeySecretId, "profile.official.secret");
+    const expectedSecretId = "codex-provider-switcher.profile.research-proxy.api-key";
+    assert.equal(await readFile(profile.configFile, "utf8"), 'model_provider = "research"\n');
+    assert.equal(profile.apiKeySecretId, expectedSecretId);
     assert.equal(persistedProfile.profiles[0].apiKeySecretId, undefined);
-    assert.doesNotMatch(indexText, /profile\.official\.secret/);
-    assert.equal((await new ProfileStore(layout).get(profile.id))?.apiKeySecretId, undefined);
+    assert.doesNotMatch(indexText, /supplied-but-not-persisted/);
+    assert.doesNotMatch(indexText, new RegExp(expectedSecretId));
+    assert.equal((await new ProfileStore(layout).get(profile.id))?.apiKeySecretId, expectedSecretId);
+  });
+});
+
+test("rejects credential assignments before writing profile files", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const store = new ProfileStore(layout);
+    const configPath = join(
+      layout.switcherDir,
+      "profiles",
+      "credentialed-profile",
+      "config.toml",
+    );
+    const indexPath = join(layout.switcherDir, "profiles", "index.json");
+
+    await assert.rejects(
+      () =>
+        store.create({
+          name: "Credentialed Profile",
+          kind: "custom",
+          configText: 'model_providers.research.api_key = "fixture-secret-value"\n',
+        }),
+      ProfileStoreError,
+    );
+    await assert.rejects(() => readFile(configPath, "utf8"), { code: "ENOENT" });
+    await assert.rejects(() => readFile(indexPath, "utf8"), { code: "ENOENT" });
   });
 });
 
@@ -98,7 +139,71 @@ test("uses same-directory atomic renames and requests Linux 0600 file modes", as
   });
 });
 
-test("stores secret values only through verified remote SecretStorage", async () => {
+test("rolls back a visible config when index persistence fails", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const fileSystem = new FailingIndexProfileFileSystem();
+    const store = new ProfileStore(layout, { fileSystem });
+    const configPath = join(
+      layout.switcherDir,
+      "profiles",
+      "rollback-profile",
+      "config.toml",
+    );
+
+    await assert.rejects(
+      () =>
+        store.create({
+          name: "Rollback Profile",
+          kind: "official",
+          configText: 'model_provider = "openai"\n',
+        }),
+      ProfileStoreError,
+    );
+
+    await assert.rejects(() => readFile(configPath, "utf8"), { code: "ENOENT" });
+    assert.ok(fileSystem.unlinked.includes(configPath));
+  });
+});
+
+test("reports a config cleanup failure after index persistence fails", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const fileSystem = new FailingIndexProfileFileSystem({ failConfigCleanup: true });
+    const store = new ProfileStore(layout, { fileSystem });
+
+    await assert.rejects(
+      () =>
+        store.create({
+          name: "Cleanup Failure",
+          kind: "official",
+          configText: 'model_provider = "openai"\n',
+        }),
+      (error: unknown) =>
+        error instanceof ProfileStoreError && error.code === "rollback-failed",
+    );
+  });
+});
+
+test("reports a temporary cleanup failure after index persistence fails", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const fileSystem = new FailingIndexProfileFileSystem({
+      failTemporaryCleanup: true,
+    });
+    const store = new ProfileStore(layout, { fileSystem });
+
+    await assert.rejects(
+      () =>
+        store.create({
+          name: "Temporary Cleanup Failure",
+          kind: "official",
+          configText: 'model_provider = "openai"\n',
+        }),
+      (error: unknown) =>
+        error instanceof ProfileStoreError && error.code === "rollback-failed",
+    );
+  });
+});
+
+test("stores secret values through verified local or Remote SSH SecretStorage", async () => {
   const secrets = new FakeSecretStorage();
   const store = new SecretStore(secrets, verifiedRemoteStorage());
   const secretId = "profile.research-proxy.secret";
@@ -109,12 +214,16 @@ test("stores secret values only through verified remote SecretStorage", async ()
   await store.delete(secretId);
   assert.equal(await store.get(secretId), undefined);
 
+  const localStore = new SecretStore(secrets, verifiedLocalWindowsStorage());
+  await localStore.set(secretId, fixtureSecretValue);
+  assert.equal(await localStore.get(secretId), fixtureSecretValue);
+
+  const localLinuxStore = new SecretStore(secrets, verifiedLocalLinuxStorage());
+  await localLinuxStore.set(secretId, fixtureSecretValue);
+  assert.equal(await localLinuxStore.get(secretId), fixtureSecretValue);
+
   assert.throws(
-    () => new SecretStore(secrets, { ...verifiedRemoteStorage(), verified: false }),
-    UnsupportedSecretStorageError,
-  );
-  assert.throws(
-    () => new SecretStore(secrets, { ...verifiedRemoteStorage(), isRemote: false }),
+    () => new SecretStore(secrets, { platform: "win32" }),
     UnsupportedSecretStorageError,
   );
   assert.throws(
@@ -124,8 +233,45 @@ test("stores secret values only through verified remote SecretStorage", async ()
           scheme: "file",
           fsPath: "C:\\Users\\Ada\\AppData\\Roaming\\Code\\User\\globalStorage",
         },
-        isRemote: true,
-        verified: true,
+        platform: "linux",
+        remoteAuthority: "ssh-remote+research-host",
+      }),
+    UnsupportedSecretStorageError,
+  );
+  assert.throws(
+    () =>
+      new SecretStore(secrets, {
+        uri: {
+          scheme: "vscode-remote",
+          authority: "ssh-remote+research-host",
+          fsPath: "/home/remote-user/.vscode-server/data/User/globalStorage",
+        },
+        platform: "win32",
+        remoteAuthority: "ssh-remote+research-host",
+      }),
+    UnsupportedSecretStorageError,
+  );
+  assert.throws(
+    () =>
+      new SecretStore(secrets, {
+        uri: {
+          scheme: "file",
+          fsPath: "//fileserver/profiles/ada/globalStorage",
+        },
+        platform: "linux",
+      }),
+    UnsupportedSecretStorageError,
+  );
+  assert.throws(
+    () =>
+      new SecretStore(secrets, {
+        uri: {
+          scheme: "vscode-remote",
+          authority: "ssh-remote+other-host",
+          fsPath: "/home/remote-user/.vscode-server/data/User/globalStorage",
+        },
+        platform: "linux",
+        remoteAuthority: "ssh-remote+research-host",
       }),
     UnsupportedSecretStorageError,
   );
@@ -167,6 +313,7 @@ async function withTemporaryLayout(
 class RecordingProfileFileSystem implements ProfileFileSystem {
   readonly renames: Array<{ from: string; to: string }> = [];
   readonly chmods: Array<{ path: string; mode: number }> = [];
+  readonly unlinked: string[] = [];
 
   async mkdir(path: string): Promise<void> {
     await mkdir(path, { recursive: true });
@@ -188,6 +335,40 @@ class RecordingProfileFileSystem implements ProfileFileSystem {
   async chmod(path: string, mode: number): Promise<void> {
     this.chmods.push({ path, mode });
     await chmod(path, mode);
+  }
+
+  async unlink(path: string): Promise<void> {
+    this.unlinked.push(path);
+    await unlink(path);
+  }
+}
+
+class FailingIndexProfileFileSystem extends RecordingProfileFileSystem {
+  constructor(
+    private readonly options: {
+      failConfigCleanup?: boolean;
+      failTemporaryCleanup?: boolean;
+    } = {},
+  ) {
+    super();
+  }
+
+  override async rename(from: string, to: string): Promise<void> {
+    if (to.endsWith("index.json")) {
+      throw new Error("index persistence failed");
+    }
+    await super.rename(from, to);
+  }
+
+  override async unlink(path: string): Promise<void> {
+    this.unlinked.push(path);
+    if (this.options.failConfigCleanup && path.endsWith("config.toml")) {
+      throw new Error("config cleanup failed");
+    }
+    if (this.options.failTemporaryCleanup && path.includes(".index.json.tmp-")) {
+      throw new Error("temporary cleanup failed");
+    }
+    await unlink(path);
   }
 }
 
@@ -228,7 +409,27 @@ function verifiedRemoteStorage() {
       authority: "ssh-remote+research-host",
       fsPath: "/home/remote-user/.vscode-server/data/User/globalStorage",
     },
-    isRemote: true,
-    verified: true,
+    platform: "linux" as const,
+    remoteAuthority: "ssh-remote+research-host",
+  };
+}
+
+function verifiedLocalWindowsStorage() {
+  return {
+    uri: {
+      scheme: "file",
+      fsPath: "C:\\Users\\Ada\\AppData\\Roaming\\Code\\User\\globalStorage",
+    },
+    platform: "win32" as const,
+  };
+}
+
+function verifiedLocalLinuxStorage() {
+  return {
+    uri: {
+      scheme: "file",
+      fsPath: "/home/ada/.config/Code/User/globalStorage",
+    },
+    platform: "linux" as const,
   };
 }

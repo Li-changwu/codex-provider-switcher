@@ -29,6 +29,6 @@ export interface ExtensionHostStorageUri {
 
 export interface ResolvedExtensionHostStorageLocation {
   uri?: ExtensionHostStorageUri;
-  isRemote: boolean;
-  verified: boolean;
+  platform: NodeJS.Platform;
+  remoteAuthority?: string;
 }

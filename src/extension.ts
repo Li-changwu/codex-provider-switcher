@@ -1,28 +1,19 @@
 import * as vscode from "vscode";
 import { homedir } from "node:os";
 import { registerExtensionLifecycle } from "./activation";
-import { resolveCodexLayout } from "./core/codex-home";
-import { ProfileStore } from "./core/profiles";
-import type { CodexLayout } from "./core/types";
+import { createStartupProfilePrerequisites } from "./core/startup";
 
-export interface StartupProfilePrerequisites {
-  layout: CodexLayout;
-  profiles: ProfileStore;
-}
+export {
+  createStartupProfilePrerequisites,
+  type StartupProfilePrerequisites,
+} from "./core/startup";
 
 export function activate(context: vscode.ExtensionContext): void {
-  void createStartupProfilePrerequisites(context);
-  registerExtensionLifecycle(context, vscode);
-}
-
-export function createStartupProfilePrerequisites(
-  context: Pick<vscode.ExtensionContext, "globalStorageUri">,
-): StartupProfilePrerequisites {
-  const layout = resolveCodexLayout({
+  void createStartupProfilePrerequisites(context, {
     env: process.env,
     platform: process.platform,
     homeDir: homedir(),
-    extensionStorageUri: context.globalStorageUri,
+    remoteAuthority: vscode.env.remoteName,
   });
-  return { layout, profiles: new ProfileStore(layout) };
+  registerExtensionLifecycle(context, vscode);
 }

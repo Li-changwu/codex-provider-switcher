@@ -3,6 +3,7 @@ import {
   mkdir as nativeMkdir,
   readFile as nativeReadFile,
   rename as nativeRename,
+  unlink as nativeUnlink,
   writeFile as nativeWriteFile,
 } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
@@ -12,6 +13,7 @@ import type { CodexLayout, ProfileKind, ProfileRecord } from "./types";
 const profilesDirectoryName = "profiles";
 const indexFileName = "index.json";
 const linuxPrivateFileMode = 0o600;
+const profileSecretNamespace = "codex-provider-switcher.profile";
 
 export interface ProfileFileSystem {
   mkdir(path: string): Promise<void>;
@@ -19,6 +21,7 @@ export interface ProfileFileSystem {
   writeFile(path: string, contents: string): Promise<void>;
   rename(from: string, to: string): Promise<void>;
   chmod(path: string, mode: number): Promise<void>;
+  unlink(path: string): Promise<void>;
 }
 
 export interface CreateProfileInput {
@@ -35,8 +38,15 @@ export interface ProfileStoreOptions {
   platform?: NodeJS.Platform;
 }
 
+export type ProfileStoreErrorCode =
+  | "invalid-config"
+  | "index-read-failed"
+  | "index-invalid"
+  | "persistence-failed"
+  | "rollback-failed";
+
 export class ProfileStoreError extends Error {
-  constructor(message: string) {
+  constructor(readonly code: ProfileStoreErrorCode, message: string) {
     super(message);
     this.name = "ProfileStoreError";
   }
@@ -48,7 +58,6 @@ export class ProfileStore {
   private readonly now: () => string;
   private readonly platform: NodeJS.Platform;
   private readonly profilesDir: string;
-  private readonly runtimeSecretIds = new Map<string, string>();
 
   constructor(
     private readonly layout: CodexLayout,
@@ -62,6 +71,7 @@ export class ProfileStore {
   }
 
   async create(input: CreateProfileInput): Promise<ProfileRecord> {
+    assertNoCredentialAssignments(input.configText);
     const profiles = await this.readProfiles();
     const id = nextProfileId(input.name, profiles);
     const timestamp = this.now();
@@ -71,24 +81,35 @@ export class ProfileStore {
       kind: input.kind,
       configFile: join(this.profilesDir, id, "config.toml"),
       providerId: input.providerId,
-      apiKeySecretId: input.apiKeySecretId,
+      apiKeySecretId:
+        input.kind === "custom" ? profileApiKeySecretId(id) : undefined,
       createdAt: timestamp,
       updatedAt: timestamp,
     };
 
     await this.fileSystem.mkdir(dirname(profile.configFile));
     await this.writeAtomically(profile.configFile, input.configText);
-    await this.writeAtomically(
-      this.indexPath,
-      `${JSON.stringify(
-        { profiles: [...profiles, toPublicProfileRecord(profile)] },
-        undefined,
-        2,
-      )}\n`,
-    );
-
-    if (profile.apiKeySecretId) {
-      this.runtimeSecretIds.set(profile.id, profile.apiKeySecretId);
+    try {
+      await this.writeAtomically(
+        this.indexPath,
+        `${JSON.stringify(
+          { profiles: [...profiles, toPublicProfileRecord(profile)] },
+          undefined,
+          2,
+        )}\n`,
+      );
+    } catch (error: unknown) {
+      await this.rollbackConfig(profile.configFile);
+      if (
+        error instanceof ProfileStoreError &&
+        error.code === "rollback-failed"
+      ) {
+        throw error;
+      }
+      throw new ProfileStoreError(
+        "persistence-failed",
+        "Could not save the profile index.",
+      );
     }
     return profile;
   }
@@ -99,10 +120,7 @@ export class ProfileStore {
 
   async list(): Promise<ProfileRecord[]> {
     const profiles = await this.readProfiles();
-    return profiles.map((profile) => {
-      const apiKeySecretId = this.runtimeSecretIds.get(profile.id);
-      return apiKeySecretId ? { ...profile, apiKeySecretId } : profile;
-    });
+    return profiles.map(withDerivedSecretId);
   }
 
   private async readProfiles(): Promise<ProfileRecord[]> {
@@ -113,7 +131,10 @@ export class ProfileStore {
       if (isMissingFileError(error)) {
         return [];
       }
-      throw new ProfileStoreError("Could not read the profile index.");
+      throw new ProfileStoreError(
+        "index-read-failed",
+        "Could not read the profile index.",
+      );
     }
 
     try {
@@ -123,7 +144,7 @@ export class ProfileStore {
       }
       return parsed.profiles.map(parsePublicProfileRecord);
     } catch {
-      throw new ProfileStoreError("The profile index is not valid.");
+      throw new ProfileStoreError("index-invalid", "The profile index is not valid.");
     }
   }
 
@@ -133,12 +154,45 @@ export class ProfileStore {
       dirname(path),
       `.${basename(path)}.tmp-${randomUUID()}`,
     );
-    await this.fileSystem.writeFile(temporaryPath, contents);
-    if (this.platform === "linux") {
-      await this.fileSystem.chmod(temporaryPath, linuxPrivateFileMode);
+    try {
+      await this.fileSystem.writeFile(temporaryPath, contents);
+      if (this.platform === "linux") {
+        await this.fileSystem.chmod(temporaryPath, linuxPrivateFileMode);
+      }
+      await this.fileSystem.rename(temporaryPath, path);
+    } catch {
+      await this.removeTemporaryFile(temporaryPath);
+      throw new ProfileStoreError("persistence-failed", "Could not write profile data.");
     }
-    await this.fileSystem.rename(temporaryPath, path);
   }
+
+  private async rollbackConfig(configPath: string): Promise<void> {
+    try {
+      await this.fileSystem.unlink(configPath);
+    } catch {
+      throw new ProfileStoreError(
+        "rollback-failed",
+        "Could not recover the profile config after index persistence failed.",
+      );
+    }
+  }
+
+  private async removeTemporaryFile(path: string): Promise<void> {
+    try {
+      await this.fileSystem.unlink(path);
+    } catch (error: unknown) {
+      if (!isMissingFileError(error)) {
+        throw new ProfileStoreError(
+          "rollback-failed",
+          "Could not clean up temporary profile data.",
+        );
+      }
+    }
+  }
+}
+
+export function profileApiKeySecretId(profileId: string): string {
+  return `${profileSecretNamespace}.${profileId}.api-key`;
 }
 
 export function normalizeProfileId(name: string): string {
@@ -156,6 +210,25 @@ export function toPublicProfileRecord(
 ): Omit<ProfileRecord, "apiKeySecretId"> {
   const { apiKeySecretId: _apiKeySecretId, ...publicProfile } = profile;
   return publicProfile;
+}
+
+function withDerivedSecretId(profile: ProfileRecord): ProfileRecord {
+  return profile.kind === "custom"
+    ? { ...profile, apiKeySecretId: profileApiKeySecretId(profile.id) }
+    : profile;
+}
+
+function assertNoCredentialAssignments(configText: string): void {
+  if (
+    /(^|\r?\n)\s*(?:[a-z0-9_-]+\.)*(?:api[_-]?key|token|access[_-]?token|secret|credentials?)\s*=/i.test(
+      configText,
+    )
+  ) {
+    throw new ProfileStoreError(
+      "invalid-config",
+      "Profile configuration must not include credentials.",
+    );
+  }
 }
 
 function nextProfileId(name: string, profiles: readonly ProfileRecord[]): string {
@@ -212,4 +285,5 @@ const nativeProfileFileSystem: ProfileFileSystem = {
   },
   rename: nativeRename,
   chmod: nativeChmod,
+  unlink: nativeUnlink,
 };
