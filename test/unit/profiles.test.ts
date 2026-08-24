@@ -187,7 +187,7 @@ test("recovers a stale profile lock recovery guard owned by a known-dead process
   });
 });
 
-test("reclaims a recovery claim left by a crashed reclaimer", async () => {
+test("cleans up a recovery claim when claim validation read fails", async () => {
   await withTemporaryLayout(async (layout) => {
     const profilesDir = join(layout.switcherDir, "profiles");
     const lockPath = join(profilesDir, ".create.lock");
@@ -208,26 +208,104 @@ test("reclaims a recovery claim left by a crashed reclaimer", async () => {
       clock: () => 10_000,
       isProcessAlive: () => false,
       lockRetryMs: 1,
-      lockTimeoutMs: 10,
+      lockTimeoutMs: 0,
       staleLockMs: 1,
       fileSystem: lockFileSystem,
     };
-    const crashedStore = new ProfileStore(layout, { lockOptions });
+    const store = new ProfileStore(layout, { lockOptions });
 
     await assert.rejects(
       () =>
-        crashedStore.create({
-          name: "Crashed Reclaimer",
+        store.create({
+          name: "Claim Validation Failure",
           kind: "official",
           configText: 'model_provider = "openai"\n',
         }),
       (error: unknown) =>
         error instanceof ProfileStoreError && error.code === "persistence-failed",
     );
-    await readFile(recoveryClaimPath, "utf8");
+    await assert.rejects(() => readFile(recoveryClaimPath, "utf8"), {
+      code: "ENOENT",
+    });
+  });
+});
+
+test("reports both claim validation and cleanup failures", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const profilesDir = join(layout.switcherDir, "profiles");
+    const lockPath = join(profilesDir, ".create.lock");
+    const recoveryLockPath = join(profilesDir, ".create.lock.recovery");
+    const recoveryClaimPath = join(
+      profilesDir,
+      ".create.lock.recovery.claim",
+    );
+    const staleContents = JSON.stringify({ pid: 999999, createdAt: 0 });
+    await mkdir(profilesDir, { recursive: true });
+    await writeFile(lockPath, staleContents, "utf8");
+    await writeFile(recoveryLockPath, staleContents, "utf8");
+
+    const lockFileSystem = new FailingRecoveryClaimReadFileSystem(
+      recoveryClaimPath,
+      true,
+    );
+    const store = new ProfileStore(layout, {
+      lockOptions: {
+        clock: () => 10_000,
+        isProcessAlive: () => false,
+        lockTimeoutMs: 0,
+        staleLockMs: 1,
+        fileSystem: lockFileSystem,
+      },
+    });
+
+    await assert.rejects(
+      () =>
+        store.create({
+          name: "Claim Cleanup Failure",
+          kind: "official",
+          configText: 'model_provider = "openai"\n',
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof ProfileStoreError);
+        assert.equal(error.code, "rollback-failed");
+        assert.ok(error.cause instanceof AggregateError);
+        assert.equal(error.cause.errors.length, 2);
+        assert.ok(error.cause.errors[0] instanceof ProfileStoreError);
+        assert.ok(error.cause.errors[1] instanceof ProfileStoreError);
+        return true;
+      },
+    );
+    assert.equal(await readFile(recoveryClaimPath, "utf8"), JSON.stringify({
+      pid: process.pid,
+      createdAt: 10_000,
+    }));
+  });
+});
+
+test("reclaims a recovery claim left by a crashed reclaimer", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const profilesDir = join(layout.switcherDir, "profiles");
+    const lockPath = join(profilesDir, ".create.lock");
+    const recoveryLockPath = join(profilesDir, ".create.lock.recovery");
+    const recoveryClaimPath = join(
+      profilesDir,
+      ".create.lock.recovery.claim",
+    );
+    const staleContents = JSON.stringify({ pid: 999999, createdAt: 0 });
+    await mkdir(profilesDir, { recursive: true });
+    await writeFile(lockPath, staleContents, "utf8");
+    await writeFile(recoveryLockPath, staleContents, "utf8");
+    // A real crashed process cannot run its finally block; this is its orphaned lease.
+    await writeFile(recoveryClaimPath, staleContents, "utf8");
 
     const restartedStore = new ProfileStore(layout, {
-      lockOptions: { ...lockOptions, clock: () => 20_000 },
+      lockOptions: {
+        clock: () => 20_000,
+        isProcessAlive: () => false,
+        lockRetryMs: 1,
+        lockTimeoutMs: 10,
+        staleLockMs: 1,
+      },
     });
     const profile = await restartedStore.create({
       name: "Recovered After Crash",
@@ -1487,7 +1565,10 @@ class FailingRecoveryClaimReadFileSystem
   private claimCreated = false;
   private claimReadFailed = false;
 
-  constructor(private readonly recoveryClaimPath: string) {
+  constructor(
+    private readonly recoveryClaimPath: string,
+    private readonly failClaimCleanup = false,
+  ) {
     super();
   }
 
@@ -1520,6 +1601,13 @@ class FailingRecoveryClaimReadFileSystem
       throw createFileSystemError("EIO", "recovery claim read failed");
     }
     return super.readFile(path);
+  }
+
+  override async unlink(path: string): Promise<void> {
+    if (path === this.recoveryClaimPath && this.failClaimCleanup) {
+      throw createFileSystemError("EIO", "recovery claim cleanup failed");
+    }
+    await super.unlink(path);
   }
 
   async unlinkStaleLock(path: string, expectedContents: string): Promise<void> {

@@ -746,11 +746,26 @@ async function tryAcquireRecoveryClaim(
   try {
     claimContents = await fileSystem.readFile(recoveryClaimPath);
   } catch (error: unknown) {
-    throw new ProfileStoreError(
+    const verificationError = new ProfileStoreError(
       "persistence-failed",
       "Could not verify the profile recovery claim.",
       { cause: error },
     );
+    try {
+      await lease.release();
+    } catch (cleanupError: unknown) {
+      throw new ProfileStoreError(
+        "rollback-failed",
+        "Could not release the profile recovery claim after verification failed.",
+        {
+          cause: new AggregateError(
+            [verificationError, cleanupError],
+            "Could not verify and release the profile recovery claim.",
+          ),
+        },
+      );
+    }
+    throw verificationError;
   }
   if (claimContents !== lease.contents) {
     await lease.release();
