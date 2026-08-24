@@ -268,7 +268,10 @@ function containsCredentialKey(value: unknown): boolean {
 }
 
 function isCredentialKey(key: string): boolean {
-  return credentialKeyNames.has(normalizeConfigKey(key));
+  const normalizedKey = normalizeConfigKey(key);
+  return [...credentialKeyNames].some((credentialKeyName) =>
+    normalizedKey.endsWith(credentialKeyName),
+  );
 }
 
 function normalizeConfigKey(key: string): string {

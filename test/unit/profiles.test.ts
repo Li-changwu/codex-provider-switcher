@@ -139,6 +139,32 @@ test("rejects quoted TOML api_key assignments before writing profile files", asy
   });
 });
 
+test("rejects provider-prefixed TOML API key aliases before writing profile files", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const store = new ProfileStore(layout);
+    const configPath = join(
+      layout.switcherDir,
+      "profiles",
+      "openai-alias",
+      "config.toml",
+    );
+    const indexPath = join(layout.switcherDir, "profiles", "index.json");
+
+    await assert.rejects(
+      () =>
+        store.create({
+          name: "OpenAI Alias",
+          kind: "custom",
+          configText: '"OPENAI_API_KEY" = "fixture-secret-value"\n',
+        }),
+      (error: unknown) =>
+        error instanceof ProfileStoreError && error.code === "invalid-config",
+    );
+    await assert.rejects(() => readFile(configPath, "utf8"), { code: "ENOENT" });
+    await assert.rejects(() => readFile(indexPath, "utf8"), { code: "ENOENT" });
+  });
+});
+
 test("rejects nested TOML authorization assignments before writing profile files", async () => {
   await withTemporaryLayout(async (layout) => {
     const store = new ProfileStore(layout);
