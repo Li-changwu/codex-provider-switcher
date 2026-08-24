@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   chmod,
+  link,
   mkdir,
   mkdtemp,
   open,
@@ -158,7 +159,7 @@ test("recovers a stale profile lock recovery guard owned by a known-dead process
     const profilesDir = join(layout.switcherDir, "profiles");
     const lockPath = join(profilesDir, ".create.lock");
     const recoveryLockPath = join(profilesDir, ".create.lock.recovery");
-    const staleContents = JSON.stringify({ pid: 12345, createdAt: 0 });
+    const staleContents = JSON.stringify({ pid: 999999, createdAt: 0 });
     await mkdir(profilesDir, { recursive: true });
     await writeFile(lockPath, staleContents, "utf8");
     await writeFile(recoveryLockPath, staleContents, "utf8");
@@ -184,6 +185,71 @@ test("recovers a stale profile lock recovery guard owned by a known-dead process
     await assert.rejects(() => readFile(recoveryLockPath, "utf8"), {
       code: "ENOENT",
     });
+  });
+});
+
+test("does not let a stale guard reclaimer delete a live guard after losing the claim", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const profilesDir = join(layout.switcherDir, "profiles");
+    const lockPath = join(profilesDir, ".create.lock");
+    const recoveryLockPath = join(profilesDir, ".create.lock.recovery");
+    const staleContents = JSON.stringify({ pid: 999999, createdAt: 0 });
+    await mkdir(profilesDir, { recursive: true });
+    await writeFile(lockPath, staleContents, "utf8");
+    await writeFile(recoveryLockPath, staleContents, "utf8");
+
+    const raceCoordinator = new StaleRecoveryGuardRaceCoordinator();
+    const firstLockFileSystem = new ConcurrentStaleRecoveryGuardFileSystem(
+      recoveryLockPath,
+      staleContents,
+      raceCoordinator,
+    );
+    const secondLockFileSystem = new ConcurrentStaleRecoveryGuardFileSystem(
+      recoveryLockPath,
+      staleContents,
+      raceCoordinator,
+    );
+    const lockOptions: ProfileLockOptions = {
+      clock: () => 10_000,
+      isProcessAlive: (pid: number) => pid === process.pid,
+      lockRetryMs: 1,
+      lockTimeoutMs: 1_000,
+      staleLockMs: 1,
+    };
+    const firstStore = new ProfileStore(layout, {
+      lockOptions: { ...lockOptions, fileSystem: firstLockFileSystem },
+    });
+    const secondStore = new ProfileStore(layout, {
+      lockOptions: { ...lockOptions, fileSystem: secondLockFileSystem },
+    });
+    const firstCreate = firstStore.create({
+      name: "Guard Reclaimer One",
+      kind: "official",
+      configText: 'model_provider = "openai"\n',
+    });
+    const secondCreate = secondStore.create({
+      name: "Guard Reclaimer Two",
+      kind: "official",
+      configText: 'model_provider = "openai"\n',
+    });
+
+    try {
+      await raceCoordinator.waitForBothStaleGuardReads();
+      raceCoordinator.releaseStaleGuardReads();
+      const results = await Promise.allSettled([firstCreate, secondCreate]);
+
+      assert.equal(raceCoordinator.staleGuardReadCount, 2);
+      assert.equal(raceCoordinator.recoveryClaimCount, 2);
+      assert.ok(results.every((result) => result.status === "fulfilled"));
+      assert.equal(raceCoordinator.liveGuardClaimAttempts, 0);
+      assert.deepEqual(
+        (await firstStore.list()).map((profile) => profile.id).sort(),
+        ["guard-reclaimer-one", "guard-reclaimer-two"],
+      );
+    } finally {
+      raceCoordinator.releaseStaleGuardReads();
+      await Promise.allSettled([firstCreate, secondCreate]);
+    }
   });
 });
 
@@ -1115,6 +1181,145 @@ class InterleavingProfileLockFileSystem
       }
     }
     await super.unlink(path);
+  }
+}
+
+class StaleRecoveryGuardRaceCoordinator {
+  liveGuardClaimAttempts = 0;
+  recoveryClaimCount = 0;
+  staleGuardReadCount = 0;
+  private staleGuardReadsReleased = false;
+  private resolveBothStaleGuardReads!: () => void;
+  private releaseStaleGuardReadBarrier!: () => void;
+  private resolveLiveGuardCreated!: () => void;
+  private readonly bothStaleGuardReads = new Promise<void>((resolve) => {
+    this.resolveBothStaleGuardReads = resolve;
+  });
+  private readonly staleGuardReadBarrier = new Promise<void>((resolve) => {
+    this.releaseStaleGuardReadBarrier = resolve;
+  });
+  private readonly liveGuardCreated = new Promise<void>((resolve) => {
+    this.resolveLiveGuardCreated = resolve;
+  });
+
+  async waitForBothStaleGuardReads(): Promise<void> {
+    await withTimeout(this.bothStaleGuardReads, "both stale recovery guard reads");
+  }
+
+  releaseStaleGuardReads(): void {
+    if (!this.staleGuardReadsReleased) {
+      this.staleGuardReadsReleased = true;
+      this.releaseStaleGuardReadBarrier();
+    }
+  }
+
+  recordStaleGuardRead(): Promise<void> {
+    this.staleGuardReadCount += 1;
+    if (this.staleGuardReadCount === 2) {
+      this.resolveBothStaleGuardReads();
+      if (!this.staleGuardReadsReleased) {
+        return this.staleGuardReadBarrier;
+      }
+    }
+    return Promise.resolve();
+  }
+
+  async recordRecoveryRename(
+    from: string,
+    to: string,
+    staleContents: string,
+  ): Promise<void> {
+    this.recoveryClaimCount += 1;
+    if (this.recoveryClaimCount === 1) {
+      await rename(from, to);
+      return;
+    }
+    await withTimeout(this.liveGuardCreated, "winner recovery guard creation");
+    if ((await readFile(from, "utf8")) !== staleContents) {
+      this.liveGuardClaimAttempts += 1;
+    }
+    await rename(from, to);
+  }
+
+  async recordRecoveryLink(from: string, to: string): Promise<void> {
+    this.recoveryClaimCount += 1;
+    await link(from, to);
+  }
+
+  resolveLiveGuard(): void {
+    this.resolveLiveGuardCreated();
+  }
+}
+
+class ConcurrentStaleRecoveryGuardFileSystem
+  extends RecordingProfileFileSystem
+  implements ProfileLockFileSystem
+{
+  private staleGuardReadObserved = false;
+
+  constructor(
+    private readonly recoveryLockPath: string,
+    private readonly staleContents: string,
+    private readonly coordinator: StaleRecoveryGuardRaceCoordinator,
+  ) {
+    super();
+  }
+
+  async open(path: string, flags: "wx", mode: number) {
+    const handle = await open(path, flags, mode);
+    if (path !== this.recoveryLockPath) {
+      return handle;
+    }
+    const resolveLiveGuard = this.coordinator.resolveLiveGuard.bind(this.coordinator);
+    return {
+      async writeFile(contents: string, encoding: BufferEncoding): Promise<void> {
+        await handle.writeFile(contents, encoding);
+      },
+      async close(): Promise<void> {
+        await handle.close();
+        resolveLiveGuard();
+      },
+    };
+  }
+
+  override async readFile(path: string): Promise<string> {
+    const contents = await super.readFile(path);
+    if (
+      path === this.recoveryLockPath &&
+      contents === this.staleContents &&
+      !this.staleGuardReadObserved
+    ) {
+      this.staleGuardReadObserved = true;
+      await this.coordinator.recordStaleGuardRead();
+    }
+    return contents;
+  }
+
+  async rename(from: string, to: string): Promise<void> {
+    if (from === this.recoveryLockPath) {
+      await this.coordinator.recordRecoveryRename(
+        from,
+        to,
+        this.staleContents,
+      );
+      return;
+    }
+    await rename(from, to);
+  }
+
+  async link(existingPath: string, newPath: string): Promise<void> {
+    if (existingPath === this.recoveryLockPath) {
+      await this.coordinator.recordRecoveryLink(existingPath, newPath);
+      return;
+    }
+    await link(existingPath, newPath);
+  }
+
+  async unlinkStaleLock(path: string, expectedContents: string): Promise<void> {
+    if ((await readFile(path, "utf8")) !== expectedContents) {
+      return;
+    }
+    await this.unlink(path);
   }
 }
 

@@ -1,5 +1,6 @@
 import {
   chmod as nativeChmod,
+  link as nativeLink,
   mkdir as nativeMkdir,
   open as nativeOpen,
   readFile as nativeReadFile,
@@ -18,6 +19,7 @@ const linuxPrivateFileMode = 0o600;
 const profileSecretNamespace = "codex-provider-switcher.profile";
 const profileLockFileName = ".create.lock";
 const profileLockRecoveryFileName = ".create.lock.recovery";
+const profileLockRecoveryClaimFileName = ".create.lock.recovery.claim";
 const defaultLockRetryMs = 25;
 const defaultLockTimeoutMs = 1_000;
 const defaultStaleLockMs = 5 * 60_000;
@@ -114,8 +116,8 @@ export interface ProfileLockFileSystem {
     flags: "wx",
     mode: number,
   ): Promise<ProfileLockFileHandle>;
+  link(existingPath: string, newPath: string): Promise<void>;
   readFile(path: string): Promise<string>;
-  rename(from: string, to: string): Promise<void>;
   unlinkStaleLock(path: string, expectedContents: string): Promise<void>;
   unlink(path: string): Promise<void>;
 }
@@ -408,6 +410,14 @@ async function tryAcquireProfileFileLock(
     );
   }
 
+  return createProfileLockRelease(fileSystem, lockPath, contents);
+}
+
+function createProfileLockRelease(
+  fileSystem: ProfileLockFileSystem,
+  lockPath: string,
+  contents: string,
+): ProfileLockRelease {
   return async () => {
     try {
       if ((await fileSystem.readFile(lockPath)) !== contents) {
@@ -465,38 +475,64 @@ async function acquireRecoveryGuard(
   staleLockMs: number,
   isProcessAlive: (pid: number) => boolean | undefined,
 ): Promise<ProfileLockRelease | undefined> {
+  const recoveryClaimPath = join(
+    dirname(recoveryLockPath),
+    profileLockRecoveryClaimFileName,
+  );
   const acquired = await tryAcquireProfileFileLock(
     fileSystem,
     recoveryLockPath,
     createdAt,
   );
   if (acquired) {
+    try {
+      if (await profileLockFileExists(fileSystem, recoveryClaimPath)) {
+        await acquired();
+        return undefined;
+      }
+    } catch (error: unknown) {
+      try {
+        await acquired();
+      } catch (releaseError: unknown) {
+        throw releaseError;
+      }
+      throw error;
+    }
     return acquired;
   }
 
-  await recoverStaleRecoveryGuard(
+  const claimedContents = await recoverStaleRecoveryGuard(
     fileSystem,
     recoveryLockPath,
+    recoveryClaimPath,
     clock,
     staleLockMs,
     isProcessAlive,
   );
+  if (claimedContents !== undefined) {
+    return createProfileLockRelease(
+      fileSystem,
+      recoveryClaimPath,
+      claimedContents,
+    );
+  }
   return tryAcquireProfileFileLock(fileSystem, recoveryLockPath, clock());
 }
 
 async function recoverStaleRecoveryGuard(
   fileSystem: ProfileLockFileSystem,
   recoveryLockPath: string,
+  recoveryClaimPath: string,
   clock: () => number,
   staleLockMs: number,
   isProcessAlive: (pid: number) => boolean | undefined,
-): Promise<void> {
+): Promise<string | undefined> {
   let contents: string;
   try {
     contents = await fileSystem.readFile(recoveryLockPath);
   } catch (error: unknown) {
     if (isMissingFileError(error)) {
-      return;
+      return undefined;
     }
     throw new ProfileStoreError(
       "persistence-failed",
@@ -511,18 +547,14 @@ async function recoverStaleRecoveryGuard(
     clock() - record.createdAt < staleLockMs ||
     isProcessAlive(record.pid) !== false
   ) {
-    return;
+    return undefined;
   }
 
-  const staleRecoveryGuardPath = join(
-    dirname(recoveryLockPath),
-    `.${basename(recoveryLockPath)}.stale-${randomUUID()}`,
-  );
   try {
-    await fileSystem.rename(recoveryLockPath, staleRecoveryGuardPath);
+    await fileSystem.link(recoveryLockPath, recoveryClaimPath);
   } catch (error: unknown) {
-    if (isMissingFileError(error)) {
-      return;
+    if (isMissingFileError(error) || isExistingFileError(error)) {
+      return undefined;
     }
     throw new ProfileStoreError(
       "persistence-failed",
@@ -531,12 +563,68 @@ async function recoverStaleRecoveryGuard(
     );
   }
 
+  let claimedContents: string;
   try {
-    await fileSystem.unlink(staleRecoveryGuardPath);
+    claimedContents = await fileSystem.readFile(recoveryClaimPath);
   } catch (error: unknown) {
     throw new ProfileStoreError(
       "persistence-failed",
-      "Could not remove the stale profile recovery guard.",
+      "Could not verify the stale profile recovery claim.",
+      { cause: error },
+    );
+  }
+  if (claimedContents !== contents) {
+    try {
+      await fileSystem.unlink(recoveryClaimPath);
+    } catch (error: unknown) {
+      throw new ProfileStoreError(
+        "persistence-failed",
+        "Could not clean up the lost profile recovery claim.",
+        { cause: error },
+      );
+    }
+    return undefined;
+  }
+
+  try {
+    await fileSystem.unlinkStaleLock(recoveryLockPath, contents);
+  } catch (error: unknown) {
+    if (isMissingFileError(error)) {
+      return contents;
+    }
+    try {
+      await fileSystem.unlink(recoveryClaimPath);
+    } catch (cleanupError: unknown) {
+      throw new ProfileStoreError(
+        "persistence-failed",
+        "Could not clean up the profile recovery claim after a failed handoff.",
+        { cause: cleanupError },
+      );
+    }
+    throw new ProfileStoreError(
+      "persistence-failed",
+      "Could not complete the stale profile recovery claim.",
+      { cause: error },
+    );
+  }
+
+  return contents;
+}
+
+async function profileLockFileExists(
+  fileSystem: ProfileLockFileSystem,
+  lockPath: string,
+): Promise<boolean> {
+  try {
+    await fileSystem.readFile(lockPath);
+    return true;
+  } catch (error: unknown) {
+    if (isMissingFileError(error)) {
+      return false;
+    }
+    throw new ProfileStoreError(
+      "persistence-failed",
+      "Could not inspect the profile recovery claim.",
       { cause: error },
     );
   }
@@ -857,7 +945,7 @@ const nativeProfileLockFileSystem: ProfileLockFileSystem = {
   },
   open: nativeOpen,
   readFile: (path) => nativeReadFile(path, "utf8"),
-  rename: nativeRename,
+  link: nativeLink,
   async unlinkStaleLock(path, expectedContents) {
     if ((await nativeReadFile(path, "utf8")) !== expectedContents) {
       return;
