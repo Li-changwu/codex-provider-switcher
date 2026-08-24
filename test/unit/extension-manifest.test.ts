@@ -12,6 +12,7 @@ const packagePath = resolve(
 test("declares the VS Code extension manifest contract", async () => {
   const manifest = JSON.parse(await readFile(packagePath, "utf8")) as {
     publisher?: string;
+    extensionKind?: string[];
     engines?: { vscode?: string };
     main?: string;
     browser?: string;
@@ -25,6 +26,7 @@ test("declares the VS Code extension manifest contract", async () => {
   };
 
   assert.equal(manifest.publisher, "Li-changwu");
+  assert.deepEqual(manifest.extensionKind, ["workspace"]);
   assert.equal(manifest.engines?.vscode, "^1.92.0");
   assert.equal(manifest.main, "./dist/extension.js");
   assert.equal(manifest.browser, undefined);

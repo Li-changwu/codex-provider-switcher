@@ -3,6 +3,7 @@
 docs/**
 test/**
 src/**
+scripts/**
 esbuild.mjs
 tsconfig.json
 *.ts
