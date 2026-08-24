@@ -74,14 +74,79 @@ test("fails closed for an unknown schema without writing", async () => {
   });
 });
 
-test("rolls back provider changes when the transaction fails", async () => {
+test("rejects an unknown user table without writing", async () => {
   await withDatabase(async (layout, database) => {
-    await seedSupportedDatabase(database, [["one", "openai", "Keep title", "opaque"]]);
+    await seedSupportedDatabase(database, [["one", "openai", "Keep", null]]);
+    await run(database, "CREATE TABLE metadata (value TEXT)");
+    const before = await readFile(layout.sqlitePath);
+
+    await assert.rejects(
+      () => updateProviderMetadata(layout, "switched"),
+      (error: unknown) => error instanceof SqliteError && error.code === "unknown-table",
+    );
+
+    assert.deepEqual(await readThreads(database), [
+      { id: "one", provider: "openai", title: "Keep", encrypted: null },
+    ]);
+    assert.deepEqual(await readFile(layout.sqlitePath), before);
+  });
+});
+
+test("rejects an unknown threads column without writing", async () => {
+  await withDatabase(async (layout, database) => {
+    await createDatabase(
+      database,
+      5,
+      `CREATE TABLE threads (
+         id TEXT,
+         model_provider TEXT,
+         title TEXT,
+         encrypted_content TEXT,
+         api_key TEXT
+       )`,
+    );
     await run(
       database,
-      `CREATE TRIGGER fail_provider_update
-       BEFORE UPDATE OF model_provider ON threads
-       BEGIN SELECT RAISE(ABORT, 'injected update failure'); END`,
+      "INSERT INTO threads (id, model_provider, title, encrypted_content, api_key) VALUES (?, ?, ?, ?, ?)",
+      "one",
+      "openai",
+      "Keep",
+      null,
+      "secret-shaped fixture value",
+    );
+    const before = await readFile(layout.sqlitePath);
+
+    await assert.rejects(
+      () => updateProviderMetadata(layout, "switched"),
+      (error: unknown) => error instanceof SqliteError && error.code === "unknown-column",
+    );
+
+    assert.deepEqual(await readThreads(database), [
+      { id: "one", provider: "openai", title: "Keep", encrypted: null },
+    ]);
+    assert.deepEqual(await readFile(layout.sqlitePath), before);
+  });
+});
+
+test("rolls back provider changes when the transaction fails", async () => {
+  await withDatabase(async (layout, database) => {
+    await createDatabase(
+      database,
+      5,
+      `CREATE TABLE threads (
+         id TEXT,
+         model_provider TEXT CHECK(model_provider <> 'switched'),
+         title TEXT,
+         encrypted_content TEXT
+       )`,
+    );
+    await run(
+      database,
+      "INSERT INTO threads (id, model_provider, title, encrypted_content) VALUES (?, ?, ?, ?)",
+      "one",
+      "openai",
+      "Keep title",
+      "opaque",
     );
     const before = await readFile(layout.sqlitePath);
 
@@ -94,6 +159,54 @@ test("rolls back provider changes when the transaction fails", async () => {
       { id: "one", provider: "openai", title: "Keep title", encrypted: "opaque" },
     ]);
     assert.deepEqual(await readFile(layout.sqlitePath), before);
+  });
+});
+
+test("returns a typed cancellation before schema inspection", async () => {
+  await withDatabase(async (layout, database) => {
+    await seedSupportedDatabase(database, [["one", "openai", "Keep", null]]);
+    let reads = 0;
+    const signal = {
+      get aborted() {
+        reads += 1;
+        return reads >= 2;
+      },
+    } as AbortSignal;
+
+    const result = await updateProviderMetadata(layout, "switched", signal);
+
+    assert.deepEqual(result, {
+      status: "cancelled",
+      changedRowCount: 0,
+      encryptedContentCount: 0,
+      warnings: [
+        "SQLite provider metadata update was cancelled; no provider metadata was changed.",
+      ],
+    });
+    assert.deepEqual(await readThreads(database), [
+      { id: "one", provider: "openai", title: "Keep", encrypted: null },
+    ]);
+  });
+});
+
+test("returns a typed cancellation during schema inspection", async () => {
+  await withDatabase(async (layout, database) => {
+    await seedSupportedDatabase(database, [["one", "openai", "Keep", null]]);
+    let reads = 0;
+    const signal = {
+      get aborted() {
+        reads += 1;
+        return reads >= 3;
+      },
+    } as AbortSignal;
+
+    const result = await updateProviderMetadata(layout, "switched", signal);
+
+    assert.equal(result.status, "cancelled");
+    assert.equal(result.changedRowCount, 0);
+    assert.deepEqual(await readThreads(database), [
+      { id: "one", provider: "openai", title: "Keep", encrypted: null },
+    ]);
   });
 });
 
@@ -120,7 +233,7 @@ test("rolls back when cancellation is observed before commit", async () => {
     const signal = {
       get aborted() {
         reads += 1;
-        return reads >= 6;
+        return reads >= 12;
       },
     } as AbortSignal;
 

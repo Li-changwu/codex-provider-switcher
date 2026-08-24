@@ -3,9 +3,20 @@ import type { CodexLayout } from "./types";
 
 const supportedSchemaVersion = 5;
 const busyTimeoutMs = 250;
+const allowedThreadColumns = new Set([
+  "id",
+  "model_provider",
+  "title",
+  "created_at",
+  "updated_at",
+  "encrypted_content",
+]);
 
 export type SqliteErrorCode =
   | "unknown-schema"
+  | "unknown-table"
+  | "unknown-column"
+  | "unknown-schema-object"
   | "missing-table"
   | "missing-column"
   | "invalid-column-type"
@@ -132,7 +143,9 @@ export async function updateProviderMetadata(
     database.serialize();
     result = await updateOpenDatabase(database, targetProvider, signal);
   } catch (error: unknown) {
-    if (database && (isBusyError(error) || (error instanceof SqliteError && error.code === "locked"))) {
+    if (error instanceof CancellationRequested) {
+      result = cancelledResult();
+    } else if (database && (isBusyError(error) || (error instanceof SqliteError && error.code === "locked"))) {
       result = lockedResult();
     } else {
       primaryError =
@@ -186,7 +199,7 @@ async function updateOpenDatabase(
   signal?: AbortSignal,
 ): Promise<SqliteUpdateResult> {
   throwIfCancelled(signal);
-  const schema = await readSupportedSchema(database);
+  const schema = await readSupportedSchema(database, signal);
   throwIfCancelled(signal);
 
   try {
@@ -261,11 +274,14 @@ async function updateOpenDatabase(
 
 async function readSupportedSchema(
   database: sqlite3.Database,
+  signal?: AbortSignal,
 ): Promise<SupportedSchema> {
+  throwIfCancelled(signal);
   const versionRow = await getRow<{ user_version: number }>(
     database,
     "PRAGMA user_version",
   );
+  throwIfCancelled(signal);
   if (versionRow?.user_version !== supportedSchemaVersion) {
     throw new SqliteError(
       "unknown-schema",
@@ -273,9 +289,14 @@ async function readSupportedSchema(
     );
   }
 
-  const table = await getRow<{ type: string }>(
+  throwIfCancelled(signal);
+  const schemaObjects = await allRows<SchemaObject>(
     database,
-    "SELECT type FROM sqlite_master WHERE name = 'threads' AND type = 'table'",
+    "SELECT name, type FROM sqlite_master",
+  );
+  throwIfCancelled(signal);
+  const table = schemaObjects.find(
+    (object) => object.name === "threads" && object.type === "table",
   );
   if (!table) {
     throw new SqliteError(
@@ -283,11 +304,31 @@ async function readSupportedSchema(
       "The supported Codex state database must contain a threads table.",
     );
   }
+  const unknownObject = schemaObjects.find(
+    (object) =>
+      !isInternalSchemaObject(object.name) &&
+      !(object.name === "threads" && object.type === "table"),
+  );
+  if (unknownObject) {
+    throw new SqliteError(
+      unknownObject.type === "table" ? "unknown-table" : "unknown-schema-object",
+      `The state database contains an unsupported schema object: ${unknownObject.name}.`,
+    );
+  }
 
+  throwIfCancelled(signal);
   const columns = await allRows<TableInfoRow>(
     database,
     "PRAGMA table_info(threads)",
   );
+  throwIfCancelled(signal);
+  const unknownColumn = columns.find((column) => !allowedThreadColumns.has(column.name));
+  if (unknownColumn) {
+    throw new SqliteError(
+      "unknown-column",
+      `The threads table contains an unsupported column: ${unknownColumn.name}.`,
+    );
+  }
   const idColumn = columns.find((column) => column.name === "id");
   const providerColumn = columns.find((column) => column.name === "model_provider");
   if (!idColumn || !providerColumn) {
@@ -306,6 +347,15 @@ async function readSupportedSchema(
   return {
     hasEncryptedContent: columns.some((column) => column.name === "encrypted_content"),
   };
+}
+
+interface SchemaObject {
+  name: string;
+  type: string;
+}
+
+function isInternalSchemaObject(name: string): boolean {
+  return name.startsWith("sqlite_");
 }
 
 function isTextColumn(column: TableInfoRow): boolean {
