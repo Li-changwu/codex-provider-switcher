@@ -113,6 +113,106 @@ test("rejects credential assignments before writing profile files", async () => 
   });
 });
 
+test("rejects quoted TOML api_key assignments before writing profile files", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const store = new ProfileStore(layout);
+    const configPath = join(
+      layout.switcherDir,
+      "profiles",
+      "quoted-credential",
+      "config.toml",
+    );
+    const indexPath = join(layout.switcherDir, "profiles", "index.json");
+
+    await assert.rejects(
+      () =>
+        store.create({
+          name: "Quoted Credential",
+          kind: "custom",
+          configText: '"api_key" = "fixture-secret-value"\n',
+        }),
+      (error: unknown) =>
+        error instanceof ProfileStoreError && error.code === "invalid-config",
+    );
+    await assert.rejects(() => readFile(configPath, "utf8"), { code: "ENOENT" });
+    await assert.rejects(() => readFile(indexPath, "utf8"), { code: "ENOENT" });
+  });
+});
+
+test("rejects nested TOML authorization assignments before writing profile files", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const store = new ProfileStore(layout);
+    const configPath = join(
+      layout.switcherDir,
+      "profiles",
+      "authorization-header",
+      "config.toml",
+    );
+    const indexPath = join(layout.switcherDir, "profiles", "index.json");
+
+    await assert.rejects(
+      () =>
+        store.create({
+          name: "Authorization Header",
+          kind: "custom",
+          configText: '[headers]\nauthorization = "fixture-secret-value"\n',
+        }),
+      (error: unknown) =>
+        error instanceof ProfileStoreError && error.code === "invalid-config",
+    );
+    await assert.rejects(() => readFile(configPath, "utf8"), { code: "ENOENT" });
+    await assert.rejects(() => readFile(indexPath, "utf8"), { code: "ENOENT" });
+  });
+});
+
+test("rejects malformed TOML before writing profile files", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const store = new ProfileStore(layout);
+    const configPath = join(
+      layout.switcherDir,
+      "profiles",
+      "broken-toml",
+      "config.toml",
+    );
+    const indexPath = join(layout.switcherDir, "profiles", "index.json");
+
+    await assert.rejects(
+      () =>
+        store.create({
+          name: "Broken TOML",
+          kind: "official",
+          configText: 'model_provider = ["openai"\n',
+        }),
+      (error: unknown) =>
+        error instanceof ProfileStoreError && error.code === "invalid-config",
+    );
+    await assert.rejects(() => readFile(configPath, "utf8"), { code: "ENOENT" });
+    await assert.rejects(() => readFile(indexPath, "utf8"), { code: "ENOENT" });
+  });
+});
+
+test("preserves valid non-secret TOML text without reserialization", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const store = new ProfileStore(layout);
+    const configText = [
+      "# Retain comments and quoted keys exactly.",
+      '"model-provider" = "research"',
+      '[model_providers."research endpoint"]',
+      'base_url = "https://proxy.invalid/v1"',
+      "retry = { max_attempts = 3, enabled = true }",
+      "",
+    ].join("\n");
+
+    const profile = await store.create({
+      name: "Raw TOML",
+      kind: "official",
+      configText,
+    });
+
+    assert.equal(await readFile(profile.configFile, "utf8"), configText);
+  });
+});
+
 test("uses same-directory atomic renames and requests Linux 0600 file modes", async () => {
   await withTemporaryLayout(async (layout) => {
     const fileSystem = new RecordingProfileFileSystem();

@@ -8,12 +8,28 @@ import {
 } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { basename, dirname, join } from "node:path";
+import { parse as parseToml } from "@iarna/toml";
 import type { CodexLayout, ProfileKind, ProfileRecord } from "./types";
 
 const profilesDirectoryName = "profiles";
 const indexFileName = "index.json";
 const linuxPrivateFileMode = 0o600;
 const profileSecretNamespace = "codex-provider-switcher.profile";
+const credentialKeyNames = new Set([
+  "apikey",
+  "authorization",
+  "authtoken",
+  "accesstoken",
+  "refreshtoken",
+  "idtoken",
+  "token",
+  "secret",
+  "clientsecret",
+  "credential",
+  "credentials",
+  "password",
+  "passwd",
+]);
 
 export interface ProfileFileSystem {
   mkdir(path: string): Promise<void>;
@@ -219,16 +235,44 @@ function withDerivedSecretId(profile: ProfileRecord): ProfileRecord {
 }
 
 function assertNoCredentialAssignments(configText: string): void {
-  if (
-    /(^|\r?\n)\s*(?:[a-z0-9_-]+\.)*(?:api[_-]?key|token|access[_-]?token|secret|credentials?)\s*=/i.test(
-      configText,
-    )
-  ) {
+  let parsedConfig: Record<string, unknown>;
+  try {
+    parsedConfig = parseToml(configText);
+  } catch {
+    throw new ProfileStoreError(
+      "invalid-config",
+      "Profile configuration must be valid TOML and must not include credentials.",
+    );
+  }
+
+  if (containsCredentialKey(parsedConfig)) {
     throw new ProfileStoreError(
       "invalid-config",
       "Profile configuration must not include credentials.",
     );
   }
+}
+
+function containsCredentialKey(value: unknown): boolean {
+  if (Array.isArray(value)) {
+    return value.some(containsCredentialKey);
+  }
+  if (!value || typeof value !== "object" || value instanceof Date) {
+    return false;
+  }
+
+  return Object.entries(value).some(
+    ([key, nestedValue]) =>
+      isCredentialKey(key) || containsCredentialKey(nestedValue),
+  );
+}
+
+function isCredentialKey(key: string): boolean {
+  return credentialKeyNames.has(normalizeConfigKey(key));
+}
+
+function normalizeConfigKey(key: string): string {
+  return key.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
 function nextProfileId(name: string, profiles: readonly ProfileRecord[]): string {
