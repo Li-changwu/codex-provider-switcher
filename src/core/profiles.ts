@@ -505,7 +505,14 @@ async function acquireRecoveryGuard(
   );
   if (acquired) {
     try {
-      if (await profileLockFileExists(fileSystem, recoveryClaimPath)) {
+      const claimStatus = await recoverOrphanedRecoveryClaim(
+        fileSystem,
+        recoveryClaimPath,
+        clock,
+        staleLockMs,
+        isProcessAlive,
+      );
+      if (claimStatus === "live") {
         await acquired();
         return undefined;
       }
@@ -529,6 +536,54 @@ async function acquireRecoveryGuard(
     isProcessAlive,
   );
   return claimedContents;
+}
+
+type RecoveryClaimStatus = "missing" | "stale" | "live";
+
+async function recoverOrphanedRecoveryClaim(
+  fileSystem: ProfileLockFileSystem,
+  recoveryClaimPath: string,
+  clock: () => number,
+  staleLockMs: number,
+  isProcessAlive: (pid: number) => boolean | undefined,
+): Promise<RecoveryClaimStatus> {
+  let contents: string;
+  try {
+    contents = await fileSystem.readFile(recoveryClaimPath);
+  } catch (error: unknown) {
+    if (isMissingFileError(error)) {
+      return "missing";
+    }
+    throw new ProfileStoreError(
+      "persistence-failed",
+      "Could not inspect the profile recovery claim.",
+      { cause: error },
+    );
+  }
+
+  const record = parseProfileLockRecord(contents);
+  if (
+    !record ||
+    clock() - record.createdAt < staleLockMs ||
+    isProcessAlive(record.pid) !== false
+  ) {
+    return "live";
+  }
+
+  try {
+    await fileSystem.unlinkStaleLock(recoveryClaimPath, contents);
+  } catch (error: unknown) {
+    if (isMissingFileError(error)) {
+      return "missing";
+    }
+    throw new ProfileStoreError(
+      "persistence-failed",
+      "Could not reclaim the stale profile recovery claim.",
+      { cause: error },
+    );
+  }
+
+  return "stale";
 }
 
 async function recoverStaleRecoveryGuard(
@@ -703,25 +758,6 @@ async function tryAcquireRecoveryClaim(
   }
 
   return lease.release;
-}
-
-async function profileLockFileExists(
-  fileSystem: ProfileLockFileSystem,
-  lockPath: string,
-): Promise<boolean> {
-  try {
-    await fileSystem.readFile(lockPath);
-    return true;
-  } catch (error: unknown) {
-    if (isMissingFileError(error)) {
-      return false;
-    }
-    throw new ProfileStoreError(
-      "persistence-failed",
-      "Could not inspect the profile recovery claim.",
-      { cause: error },
-    );
-  }
 }
 
 async function recoverStaleProfileFileLockWhileGuarded(

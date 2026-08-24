@@ -246,6 +246,88 @@ test("reclaims a recovery claim left by a crashed reclaimer", async () => {
   });
 });
 
+test("reclaims a stale orphaned recovery claim when the guard is missing", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const profilesDir = join(layout.switcherDir, "profiles");
+    const lockPath = join(profilesDir, ".create.lock");
+    const recoveryClaimPath = join(
+      profilesDir,
+      ".create.lock.recovery.claim",
+    );
+    const staleContents = JSON.stringify({ pid: 999999, createdAt: 0 });
+    await mkdir(profilesDir, { recursive: true });
+    await writeFile(lockPath, staleContents, "utf8");
+    await writeFile(recoveryClaimPath, staleContents, "utf8");
+
+    const store = new ProfileStore(layout, {
+      lockOptions: {
+        clock: () => 10_000,
+        isProcessAlive: () => false,
+        lockRetryMs: 1,
+        lockTimeoutMs: 10,
+        staleLockMs: 1,
+      },
+    });
+
+    const profile = await store.create({
+      name: "Recovered Orphaned Claim",
+      kind: "official",
+      configText: 'model_provider = "openai"\n',
+    });
+
+    assert.equal(profile.id, "recovered-orphaned-claim");
+    await assert.rejects(() => readFile(lockPath, "utf8"), { code: "ENOENT" });
+    await assert.rejects(() => readFile(recoveryClaimPath, "utf8"), {
+      code: "ENOENT",
+    });
+  });
+});
+
+test("does not delete a live recovery claim when the guard is missing", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const profilesDir = join(layout.switcherDir, "profiles");
+    const lockPath = join(profilesDir, ".create.lock");
+    const recoveryGuardPath = join(profilesDir, ".create.lock.recovery");
+    const recoveryClaimPath = join(
+      profilesDir,
+      ".create.lock.recovery.claim",
+    );
+    const staleLockContents = JSON.stringify({ pid: 999999, createdAt: 0 });
+    const liveClaimContents = JSON.stringify({
+      pid: process.pid,
+      createdAt: 10_000,
+    });
+    await mkdir(profilesDir, { recursive: true });
+    await writeFile(lockPath, staleLockContents, "utf8");
+    await writeFile(recoveryClaimPath, liveClaimContents, "utf8");
+
+    const store = new ProfileStore(layout, {
+      lockOptions: {
+        clock: () => 10_000,
+        isProcessAlive: (pid: number) => pid === process.pid,
+        lockTimeoutMs: 0,
+        staleLockMs: 1,
+      },
+    });
+
+    await assert.rejects(
+      () =>
+        store.create({
+          name: "Blocked By Live Claim",
+          kind: "official",
+          configText: 'model_provider = "openai"\n',
+        }),
+      (error: unknown) =>
+        error instanceof ProfileStoreError && error.code === "persistence-failed",
+    );
+
+    assert.equal(await readFile(recoveryClaimPath, "utf8"), liveClaimContents);
+    await assert.rejects(() => readFile(recoveryGuardPath, "utf8"), {
+      code: "ENOENT",
+    });
+  });
+});
+
 test("does not let stale recovery reclaiming delete a live recovery guard", async () => {
   await withTemporaryLayout(async (layout) => {
     const profilesDir = join(layout.switcherDir, "profiles");
