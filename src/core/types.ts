@@ -1,5 +1,11 @@
 export type ProfileKind = "official" | "custom";
 
+export interface ValidatedConfig {
+  kind: ProfileKind;
+  text: string;
+  providerId?: string;
+}
+
 export interface ProfileRecord {
   id: string;
   name: string;
