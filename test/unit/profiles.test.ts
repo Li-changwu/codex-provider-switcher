@@ -60,6 +60,49 @@ test("creates normalized profile IDs and deterministic collision suffixes", asyn
   });
 });
 
+test("serializes concurrent profile creates for the same Codex Home", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const fileSystem = new FirstIndexReadBarrierProfileFileSystem();
+    const store = new ProfileStore(layout, {
+      fileSystem,
+      now: () => "2026-08-24T00:00:00.000Z",
+    });
+
+    const firstCreate = store.create({
+      name: "Concurrent Profile",
+      kind: "official",
+      configText: 'model_provider = "openai"\n',
+    });
+    await fileSystem.waitForFirstIndexRead();
+
+    const secondCreate = store.create({
+      name: "Concurrent Profile",
+      kind: "official",
+      configText: 'model_provider = "openai"\n',
+    });
+    fileSystem.releaseFirstIndexRead();
+
+    const [first, second] = await Promise.all([firstCreate, secondCreate]);
+
+    assert.deepEqual(
+      [first.id, second.id],
+      ["concurrent-profile", "concurrent-profile-2"],
+    );
+    assert.deepEqual(
+      (await store.list()).map((profile) => profile.id),
+      ["concurrent-profile", "concurrent-profile-2"],
+    );
+    assert.equal(
+      await readFile(first.configFile, "utf8"),
+      'model_provider = "openai"\n',
+    );
+    assert.equal(
+      await readFile(second.configFile, "utf8"),
+      'model_provider = "openai"\n',
+    );
+  });
+});
+
 test("derives custom secret IDs after restart without persisting them", async () => {
   await withTemporaryLayout(async (layout) => {
     const store = new ProfileStore(layout, {
@@ -165,6 +208,84 @@ test("rejects provider-prefixed TOML API key aliases before writing profile file
   });
 });
 
+test("rejects private and access key aliases before writing profile files", async () => {
+  for (const fixture of [
+    {
+      name: "Private Key",
+      id: "private-key",
+      configText: '"private_key" = "fixture-secret-value"\n',
+    },
+    {
+      name: "Access Key",
+      id: "access-key",
+      configText: '"access-key" = "fixture-secret-value"\n',
+    },
+  ]) {
+    await withTemporaryLayout(async (layout) => {
+      const store = new ProfileStore(layout);
+      const configPath = join(
+        layout.switcherDir,
+        "profiles",
+        fixture.id,
+        "config.toml",
+      );
+      const indexPath = join(layout.switcherDir, "profiles", "index.json");
+
+      await assert.rejects(
+        () =>
+          store.create({
+            name: fixture.name,
+            kind: "custom",
+            configText: fixture.configText,
+          }),
+        (error: unknown) =>
+          error instanceof ProfileStoreError && error.code === "invalid-config",
+      );
+      await assert.rejects(() => readFile(configPath, "utf8"), { code: "ENOENT" });
+      await assert.rejects(() => readFile(indexPath, "utf8"), { code: "ENOENT" });
+    });
+  }
+});
+
+test("rejects secret and authorization header aliases before writing profile files", async () => {
+  for (const fixture of [
+    {
+      name: "Secret Key",
+      id: "secret-key",
+      configText: '"secret_key" = "fixture-secret-value"\n',
+    },
+    {
+      name: "Authorization Header",
+      id: "authorization-header",
+      configText: '"authorization_header" = "fixture-secret-value"\n',
+    },
+  ]) {
+    await withTemporaryLayout(async (layout) => {
+      const store = new ProfileStore(layout);
+      const configPath = join(
+        layout.switcherDir,
+        "profiles",
+        fixture.id,
+        "config.toml",
+      );
+      const indexPath = join(layout.switcherDir, "profiles", "index.json");
+
+      await assert.rejects(
+        () =>
+          store.create({
+            name: fixture.name,
+            kind: "custom",
+            configText: fixture.configText,
+          }),
+        (error: unknown) =>
+          error instanceof ProfileStoreError && error.code === "invalid-config",
+      );
+      await assert.rejects(() => readFile(configPath, "utf8"), { code: "ENOENT" });
+      await assert.rejects(() => readFile(indexPath, "utf8"), { code: "ENOENT" });
+    });
+  }
+});
+
 test("rejects nested TOML authorization assignments before writing profile files", async () => {
   await withTemporaryLayout(async (layout) => {
     const store = new ProfileStore(layout);
@@ -265,6 +386,58 @@ test("uses same-directory atomic renames and requests Linux 0600 file modes", as
   });
 });
 
+test("wraps profile directory access errors without writing profile files", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const fileSystem = new FailingMkdirProfileFileSystem();
+    const store = new ProfileStore(layout, { fileSystem });
+    const configPath = join(
+      layout.switcherDir,
+      "profiles",
+      "directory-error",
+      "config.toml",
+    );
+    const indexPath = join(layout.switcherDir, "profiles", "index.json");
+
+    await assert.rejects(
+      () =>
+        store.create({
+          name: "Directory Error",
+          kind: "official",
+          configText: 'model_provider = "openai"\n',
+        }),
+      (error: unknown) => isPersistenceErrorWithCause(error, fileSystem.failure),
+    );
+    await assert.rejects(() => readFile(configPath, "utf8"), { code: "ENOENT" });
+    await assert.rejects(() => readFile(indexPath, "utf8"), { code: "ENOENT" });
+  });
+});
+
+test("wraps profile write I/O errors without writing profile files", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const fileSystem = new FailingWriteProfileFileSystem();
+    const store = new ProfileStore(layout, { fileSystem });
+    const configPath = join(
+      layout.switcherDir,
+      "profiles",
+      "write-error",
+      "config.toml",
+    );
+    const indexPath = join(layout.switcherDir, "profiles", "index.json");
+
+    await assert.rejects(
+      () =>
+        store.create({
+          name: "Write Error",
+          kind: "official",
+          configText: 'model_provider = "openai"\n',
+        }),
+      (error: unknown) => isPersistenceErrorWithCause(error, fileSystem.failure),
+    );
+    await assert.rejects(() => readFile(configPath, "utf8"), { code: "ENOENT" });
+    await assert.rejects(() => readFile(indexPath, "utf8"), { code: "ENOENT" });
+  });
+});
+
 test("rolls back a visible config when index persistence fails", async () => {
   await withTemporaryLayout(async (layout) => {
     const fileSystem = new FailingIndexProfileFileSystem();
@@ -360,7 +533,7 @@ test("stores secret values through verified local or Remote SSH SecretStorage", 
           fsPath: "C:\\Users\\Ada\\AppData\\Roaming\\Code\\User\\globalStorage",
         },
         platform: "linux",
-        remoteAuthority: "ssh-remote+research-host",
+        remoteName: "ssh-remote",
       }),
     UnsupportedSecretStorageError,
   );
@@ -373,7 +546,7 @@ test("stores secret values through verified local or Remote SSH SecretStorage", 
           fsPath: "/home/remote-user/.vscode-server/data/User/globalStorage",
         },
         platform: "win32",
-        remoteAuthority: "ssh-remote+research-host",
+        remoteName: "ssh-remote",
       }),
     UnsupportedSecretStorageError,
   );
@@ -393,11 +566,11 @@ test("stores secret values through verified local or Remote SSH SecretStorage", 
       new SecretStore(secrets, {
         uri: {
           scheme: "vscode-remote",
-          authority: "ssh-remote+other-host",
+          authority: "ssh-remote",
           fsPath: "/home/remote-user/.vscode-server/data/User/globalStorage",
         },
         platform: "linux",
-        remoteAuthority: "ssh-remote+research-host",
+        remoteName: "ssh-remote",
       }),
     UnsupportedSecretStorageError,
   );
@@ -469,6 +642,61 @@ class RecordingProfileFileSystem implements ProfileFileSystem {
   }
 }
 
+class FirstIndexReadBarrierProfileFileSystem extends RecordingProfileFileSystem {
+  private firstIndexReadStarted = false;
+  private indexReadReleased = false;
+  private releaseIndexReadBarrier!: () => void;
+  private resolveFirstIndexRead!: () => void;
+  private readonly firstIndexRead = new Promise<void>((resolve) => {
+    this.resolveFirstIndexRead = resolve;
+  });
+  private readonly indexReadBarrier = new Promise<void>((resolve) => {
+    this.releaseIndexReadBarrier = resolve;
+  });
+
+  async waitForFirstIndexRead(): Promise<void> {
+    await this.firstIndexRead;
+  }
+
+  releaseFirstIndexRead(): void {
+    this.indexReadReleased = true;
+    this.releaseIndexReadBarrier();
+  }
+
+  override async readFile(path: string): Promise<string> {
+    if (path.endsWith("index.json") && !this.indexReadReleased) {
+      if (!this.firstIndexReadStarted) {
+        this.firstIndexReadStarted = true;
+        this.resolveFirstIndexRead();
+        await this.indexReadBarrier;
+      }
+      const error = new Error("profile index is not available") as NodeJS.ErrnoException;
+      error.code = "ENOENT";
+      throw error;
+    }
+    return super.readFile(path);
+  }
+}
+
+class FailingMkdirProfileFileSystem extends RecordingProfileFileSystem {
+  readonly failure = createFileSystemError("EACCES", "profile directory denied");
+
+  override async mkdir(): Promise<void> {
+    throw this.failure;
+  }
+}
+
+class FailingWriteProfileFileSystem extends RecordingProfileFileSystem {
+  readonly failure = createFileSystemError("EIO", "profile write failed");
+
+  override async writeFile(path: string, contents: string): Promise<void> {
+    if (path.includes(".config.toml.tmp-")) {
+      throw this.failure;
+    }
+    await super.writeFile(path, contents);
+  }
+}
+
 class FailingIndexProfileFileSystem extends RecordingProfileFileSystem {
   constructor(
     private readonly options: {
@@ -536,7 +764,7 @@ function verifiedRemoteStorage() {
       fsPath: "/home/remote-user/.vscode-server/data/User/globalStorage",
     },
     platform: "linux" as const,
-    remoteAuthority: "ssh-remote+research-host",
+    remoteName: "ssh-remote",
   };
 }
 
@@ -558,4 +786,24 @@ function verifiedLocalLinuxStorage() {
     },
     platform: "linux" as const,
   };
+}
+
+function createFileSystemError(
+  code: string,
+  message: string,
+): NodeJS.ErrnoException {
+  const error = new Error(message) as NodeJS.ErrnoException;
+  error.code = code;
+  return error;
+}
+
+function isPersistenceErrorWithCause(
+  error: unknown,
+  cause: unknown,
+): boolean {
+  return (
+    error instanceof ProfileStoreError &&
+    error.code === "persistence-failed" &&
+    (error as Error & { cause?: unknown }).cause === cause
+  );
 }

@@ -10,7 +10,7 @@ export interface StartupExtensionContext {
 
 export interface StartupHostInputs
   extends Omit<ResolveCodexLayoutOptions, "extensionStorageUri"> {
-  remoteAuthority?: string;
+  remoteName?: string;
 }
 
 export interface StartupProfilePrerequisites {
@@ -33,7 +33,7 @@ export function createStartupProfilePrerequisites(
     secrets: new SecretStore(context.secrets, {
       uri: context.globalStorageUri,
       platform: host.platform,
-      remoteAuthority: host.remoteAuthority,
+      remoteName: host.remoteName,
     }),
   };
 }

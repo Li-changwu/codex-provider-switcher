@@ -17,7 +17,11 @@ const linuxPrivateFileMode = 0o600;
 const profileSecretNamespace = "codex-provider-switcher.profile";
 const credentialKeyNames = new Set([
   "apikey",
+  "accesskey",
+  "privatekey",
+  "secretkey",
   "authorization",
+  "authorizationheader",
   "authtoken",
   "accesstoken",
   "refreshtoken",
@@ -62,13 +66,18 @@ export type ProfileStoreErrorCode =
   | "rollback-failed";
 
 export class ProfileStoreError extends Error {
-  constructor(readonly code: ProfileStoreErrorCode, message: string) {
-    super(message);
+  constructor(
+    readonly code: ProfileStoreErrorCode,
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
     this.name = "ProfileStoreError";
   }
 }
 
 export class ProfileStore {
+  private static readonly createLocksByCodexHome = new Map<string, Promise<void>>();
   private readonly fileSystem: ProfileFileSystem;
   private readonly indexPath: string;
   private readonly now: () => string;
@@ -88,46 +97,48 @@ export class ProfileStore {
 
   async create(input: CreateProfileInput): Promise<ProfileRecord> {
     assertNoCredentialAssignments(input.configText);
-    const profiles = await this.readProfiles();
-    const id = nextProfileId(input.name, profiles);
-    const timestamp = this.now();
-    const profile: ProfileRecord = {
-      id,
-      name: input.name,
-      kind: input.kind,
-      configFile: join(this.profilesDir, id, "config.toml"),
-      providerId: input.providerId,
-      apiKeySecretId:
-        input.kind === "custom" ? profileApiKeySecretId(id) : undefined,
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    };
+    return this.withCreateLock(async () => {
+      const profiles = await this.readProfiles();
+      const id = nextProfileId(input.name, profiles);
+      const timestamp = this.now();
+      const profile: ProfileRecord = {
+        id,
+        name: input.name,
+        kind: input.kind,
+        configFile: join(this.profilesDir, id, "config.toml"),
+        providerId: input.providerId,
+        apiKeySecretId:
+          input.kind === "custom" ? profileApiKeySecretId(id) : undefined,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
 
-    await this.fileSystem.mkdir(dirname(profile.configFile));
-    await this.writeAtomically(profile.configFile, input.configText);
-    try {
-      await this.writeAtomically(
-        this.indexPath,
-        `${JSON.stringify(
-          { profiles: [...profiles, toPublicProfileRecord(profile)] },
-          undefined,
-          2,
-        )}\n`,
-      );
-    } catch (error: unknown) {
-      await this.rollbackConfig(profile.configFile);
-      if (
-        error instanceof ProfileStoreError &&
-        error.code === "rollback-failed"
-      ) {
-        throw error;
+      await this.writeAtomically(profile.configFile, input.configText);
+      try {
+        await this.writeAtomically(
+          this.indexPath,
+          `${JSON.stringify(
+            { profiles: [...profiles, toPublicProfileRecord(profile)] },
+            undefined,
+            2,
+          )}\n`,
+        );
+      } catch (error: unknown) {
+        await this.rollbackConfig(profile.configFile);
+        if (
+          error instanceof ProfileStoreError &&
+          error.code === "rollback-failed"
+        ) {
+          throw error;
+        }
+        throw new ProfileStoreError(
+          "persistence-failed",
+          "Could not save the profile index.",
+          { cause: error },
+        );
       }
-      throw new ProfileStoreError(
-        "persistence-failed",
-        "Could not save the profile index.",
-      );
-    }
-    return profile;
+      return profile;
+    });
   }
 
   async get(id: string): Promise<ProfileRecord | undefined> {
@@ -150,6 +161,7 @@ export class ProfileStore {
       throw new ProfileStoreError(
         "index-read-failed",
         "Could not read the profile index.",
+        { cause: error },
       );
     }
 
@@ -165,30 +177,35 @@ export class ProfileStore {
   }
 
   private async writeAtomically(path: string, contents: string): Promise<void> {
-    await this.fileSystem.mkdir(dirname(path));
     const temporaryPath = join(
       dirname(path),
       `.${basename(path)}.tmp-${randomUUID()}`,
     );
     try {
+      await this.fileSystem.mkdir(dirname(path));
       await this.fileSystem.writeFile(temporaryPath, contents);
       if (this.platform === "linux") {
         await this.fileSystem.chmod(temporaryPath, linuxPrivateFileMode);
       }
       await this.fileSystem.rename(temporaryPath, path);
-    } catch {
+    } catch (error: unknown) {
       await this.removeTemporaryFile(temporaryPath);
-      throw new ProfileStoreError("persistence-failed", "Could not write profile data.");
+      throw new ProfileStoreError(
+        "persistence-failed",
+        "Could not write profile data.",
+        { cause: error },
+      );
     }
   }
 
   private async rollbackConfig(configPath: string): Promise<void> {
     try {
       await this.fileSystem.unlink(configPath);
-    } catch {
+    } catch (error: unknown) {
       throw new ProfileStoreError(
         "rollback-failed",
         "Could not recover the profile config after index persistence failed.",
+        { cause: error },
       );
     }
   }
@@ -201,7 +218,39 @@ export class ProfileStore {
         throw new ProfileStoreError(
           "rollback-failed",
           "Could not clean up temporary profile data.",
+          { cause: error },
         );
+      }
+    }
+  }
+
+  private async withCreateLock<Result>(
+    operation: () => Promise<Result>,
+  ): Promise<Result> {
+    const previousLock = ProfileStore.createLocksByCodexHome.get(
+      this.layout.codexHome,
+    );
+    let releaseLock!: () => void;
+    const lock = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    const currentLock = previousLock
+      ? previousLock.then(() => lock)
+      : lock;
+    ProfileStore.createLocksByCodexHome.set(this.layout.codexHome, currentLock);
+
+    if (previousLock) {
+      await previousLock;
+    }
+    try {
+      return await operation();
+    } finally {
+      releaseLock();
+      if (
+        ProfileStore.createLocksByCodexHome.get(this.layout.codexHome) ===
+        currentLock
+      ) {
+        ProfileStore.createLocksByCodexHome.delete(this.layout.codexHome);
       }
     }
   }

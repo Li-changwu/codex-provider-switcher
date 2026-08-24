@@ -13,7 +13,7 @@ export function activate(context: vscode.ExtensionContext): void {
     env: process.env,
     platform: process.platform,
     homeDir: homedir(),
-    remoteAuthority: vscode.env.remoteName,
+    remoteName: vscode.env.remoteName,
   });
   registerExtensionLifecycle(context, vscode);
 }

@@ -70,12 +70,12 @@ function isVerifiedExtensionHostStorage(
   if (!uri) {
     return false;
   }
-  if (storageLocation.remoteAuthority) {
+  if (storageLocation.remoteName) {
     return (
       storageLocation.platform === "linux" &&
       uri.scheme === "vscode-remote" &&
-      uri.authority === storageLocation.remoteAuthority &&
-      uri.authority.startsWith("ssh-remote+") &&
+      storageLocation.remoteName === "ssh-remote" &&
+      isSshRemoteAuthority(uri.authority) &&
       isNativeLinuxPath(uri.fsPath)
     );
   }
@@ -83,6 +83,14 @@ function isVerifiedExtensionHostStorage(
     uri.scheme === "file" &&
     !uri.authority &&
     isNativeLocalPath(uri.fsPath, storageLocation.platform)
+  );
+}
+
+function isSshRemoteAuthority(authority: string | undefined): boolean {
+  return (
+    typeof authority === "string" &&
+    authority.startsWith("ssh-remote+") &&
+    authority.length > "ssh-remote+".length
   );
 }
 

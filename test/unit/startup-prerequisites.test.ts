@@ -30,6 +30,36 @@ test("constructs a SecretStore from ExtensionContext secrets and global storage"
   assert.equal(contextSecrets.storeCalls, 1);
 });
 
+test("constructs startup prerequisites for the real Remote SSH identifier pair", async () => {
+  const contextSecrets = new FakeSecretStorage();
+  const prerequisites = createStartupProfilePrerequisites(
+    {
+      secrets: contextSecrets,
+      globalStorageUri: {
+        scheme: "vscode-remote",
+        authority: "ssh-remote+research-host",
+        fsPath: "/home/remote-user/.vscode-server/data/User/globalStorage",
+      },
+    },
+    {
+      env: { CODEX_HOME: "/home/remote-user/.codex" },
+      platform: "linux",
+      homeDir: "/home/remote-user",
+      remoteName: "ssh-remote",
+    },
+  );
+
+  assert.equal(prerequisites.layout.codexHome, "/home/remote-user/.codex");
+  await prerequisites.secrets.set(
+    "profile.research-proxy.api-key",
+    "fixture-secret-value",
+  );
+  assert.equal(
+    await prerequisites.secrets.get("profile.research-proxy.api-key"),
+    "fixture-secret-value",
+  );
+});
+
 class FakeSecretStorage implements SecretStorageLike {
   private readonly values = new Map<string, string>();
   storeCalls = 0;
