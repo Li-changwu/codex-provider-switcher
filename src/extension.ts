@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { homedir } from "node:os";
-import { registerExtensionLifecycle } from "./activation";
+import { activateExtensionWithStartupPrerequisites } from "./activation";
 import { createStartupProfilePrerequisites } from "./core/startup";
 
 export {
@@ -9,11 +9,15 @@ export {
 } from "./core/startup";
 
 export function activate(context: vscode.ExtensionContext): void {
-  void createStartupProfilePrerequisites(context, {
-    env: process.env,
-    platform: process.platform,
-    homeDir: homedir(),
-    remoteName: vscode.env.remoteName,
-  });
-  registerExtensionLifecycle(context, vscode);
+  activateExtensionWithStartupPrerequisites(
+    context,
+    {
+      env: process.env,
+      platform: process.platform,
+      homeDir: homedir(),
+      remoteName: vscode.env.remoteName,
+    },
+    vscode,
+    createStartupProfilePrerequisites,
+  );
 }

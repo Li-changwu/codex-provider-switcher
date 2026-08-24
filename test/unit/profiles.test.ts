@@ -12,7 +12,7 @@ import {
 import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import type { CodexLayout } from "../../src/core/types";
+import type { CodexLayout, ProfileRecord } from "../../src/core/types";
 import {
   ProfileStore,
   ProfileStoreError,
@@ -60,46 +60,125 @@ test("creates normalized profile IDs and deterministic collision suffixes", asyn
   });
 });
 
-test("serializes concurrent profile creates for the same Codex Home", async () => {
+test("uses a filesystem lock to serialize independent profile stores", async () => {
   await withTemporaryLayout(async (layout) => {
     const fileSystem = new FirstIndexReadBarrierProfileFileSystem();
-    const store = new ProfileStore(layout, {
+    const firstStore = new ProfileStore(layout, {
+      fileSystem,
+      now: () => "2026-08-24T00:00:00.000Z",
+    });
+    const secondStore = new ProfileStore(layout, {
       fileSystem,
       now: () => "2026-08-24T00:00:00.000Z",
     });
 
-    const firstCreate = store.create({
+    const firstCreate = firstStore.create({
       name: "Concurrent Profile",
       kind: "official",
       configText: 'model_provider = "openai"\n',
     });
     await fileSystem.waitForFirstIndexRead();
+    let secondCreate: Promise<ProfileRecord> | undefined;
+    try {
+      const lockPath = join(layout.switcherDir, "profiles", ".create.lock");
+      const lockContents = JSON.parse(await readFile(lockPath, "utf8")) as {
+        pid?: unknown;
+        createdAt?: unknown;
+      };
+      assert.equal(lockContents.pid, process.pid);
+      assert.equal(typeof lockContents.createdAt, "number");
 
-    const secondCreate = store.create({
-      name: "Concurrent Profile",
+      secondCreate = secondStore.create({
+        name: "Concurrent Profile",
+        kind: "official",
+        configText: 'model_provider = "openai"\n',
+      });
+      fileSystem.releaseFirstIndexRead();
+
+      const [first, second] = await Promise.all([firstCreate, secondCreate]);
+
+      assert.deepEqual(
+        [first.id, second.id],
+        ["concurrent-profile", "concurrent-profile-2"],
+      );
+      assert.deepEqual(
+        (await firstStore.list()).map((profile) => profile.id),
+        ["concurrent-profile", "concurrent-profile-2"],
+      );
+      assert.equal(
+        await readFile(first.configFile, "utf8"),
+        'model_provider = "openai"\n',
+      );
+      assert.equal(
+        await readFile(second.configFile, "utf8"),
+        'model_provider = "openai"\n',
+      );
+      await assert.rejects(() => readFile(lockPath, "utf8"), { code: "ENOENT" });
+    } finally {
+      fileSystem.releaseFirstIndexRead();
+      await Promise.allSettled(
+        [firstCreate, secondCreate].filter(
+          (create): create is Promise<ProfileRecord> => create !== undefined,
+        ),
+      );
+    }
+  });
+});
+
+test("recovers a stale profile lock owned by a known-dead process", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const profilesDir = join(layout.switcherDir, "profiles");
+    const lockPath = join(profilesDir, ".create.lock");
+    await mkdir(profilesDir, { recursive: true });
+    await writeFile(lockPath, JSON.stringify({ pid: 12345, createdAt: 0 }), "utf8");
+    const store = new ProfileStore(layout, {
+      lockOptions: {
+        clock: () => 10_000,
+        staleLockMs: 1,
+        isProcessAlive: () => false,
+      },
+    });
+
+    const profile = await store.create({
+      name: "Recovered Lock",
       kind: "official",
       configText: 'model_provider = "openai"\n',
     });
-    fileSystem.releaseFirstIndexRead();
 
-    const [first, second] = await Promise.all([firstCreate, secondCreate]);
+    assert.equal(profile.id, "recovered-lock");
+    await assert.rejects(() => readFile(lockPath, "utf8"), { code: "ENOENT" });
+  });
+});
 
-    assert.deepEqual(
-      [first.id, second.id],
-      ["concurrent-profile", "concurrent-profile-2"],
+test("fails closed when a stale profile lock owner cannot be verified", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const profilesDir = join(layout.switcherDir, "profiles");
+    const lockPath = join(profilesDir, ".create.lock");
+    const configPath = join(profilesDir, "unverifiable-lock", "config.toml");
+    const indexPath = join(profilesDir, "index.json");
+    await mkdir(profilesDir, { recursive: true });
+    await writeFile(lockPath, JSON.stringify({ pid: 12345, createdAt: 0 }), "utf8");
+    const store = new ProfileStore(layout, {
+      lockOptions: {
+        clock: () => 10_000,
+        lockTimeoutMs: 0,
+        staleLockMs: 1,
+        isProcessAlive: () => undefined,
+      },
+    });
+
+    await assert.rejects(
+      () =>
+        store.create({
+          name: "Unverifiable Lock",
+          kind: "official",
+          configText: 'model_provider = "openai"\n',
+        }),
+      (error: unknown) =>
+        error instanceof ProfileStoreError && error.code === "persistence-failed",
     );
-    assert.deepEqual(
-      (await store.list()).map((profile) => profile.id),
-      ["concurrent-profile", "concurrent-profile-2"],
-    );
-    assert.equal(
-      await readFile(first.configFile, "utf8"),
-      'model_provider = "openai"\n',
-    );
-    assert.equal(
-      await readFile(second.configFile, "utf8"),
-      'model_provider = "openai"\n',
-    );
+    await assert.rejects(() => readFile(configPath, "utf8"), { code: "ENOENT" });
+    await assert.rejects(() => readFile(indexPath, "utf8"), { code: "ENOENT" });
   });
 });
 
@@ -284,6 +363,63 @@ test("rejects secret and authorization header aliases before writing profile fil
       await assert.rejects(() => readFile(indexPath, "utf8"), { code: "ENOENT" });
     });
   }
+});
+
+test("rejects auth fields before writing profile files", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const store = new ProfileStore(layout);
+    const configPath = join(
+      layout.switcherDir,
+      "profiles",
+      "auth-field",
+      "config.toml",
+    );
+    const indexPath = join(layout.switcherDir, "profiles", "index.json");
+
+    await assert.rejects(
+      () =>
+        store.create({
+          name: "Auth Field",
+          kind: "custom",
+          configText: 'auth = "Bearer fixture-secret-value"\n',
+        }),
+      (error: unknown) =>
+        error instanceof ProfileStoreError && error.code === "invalid-config",
+    );
+    await assert.rejects(() => readFile(configPath, "utf8"), { code: "ENOENT" });
+    await assert.rejects(() => readFile(indexPath, "utf8"), { code: "ENOENT" });
+  });
+});
+
+test("rejects nested provider header containers before writing profile files", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const store = new ProfileStore(layout);
+    const configPath = join(
+      layout.switcherDir,
+      "profiles",
+      "provider-headers",
+      "config.toml",
+    );
+    const indexPath = join(layout.switcherDir, "profiles", "index.json");
+
+    await assert.rejects(
+      () =>
+        store.create({
+          name: "Provider Headers",
+          kind: "custom",
+          configText: [
+            'model_provider = "research"',
+            "[model_providers.research.headers]",
+            'user_agent = "fixture-header-value"',
+            "",
+          ].join("\n"),
+        }),
+      (error: unknown) =>
+        error instanceof ProfileStoreError && error.code === "invalid-config",
+    );
+    await assert.rejects(() => readFile(configPath, "utf8"), { code: "ENOENT" });
+    await assert.rejects(() => readFile(indexPath, "utf8"), { code: "ENOENT" });
+  });
 });
 
 test("rejects nested TOML authorization assignments before writing profile files", async () => {

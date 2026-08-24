@@ -1,6 +1,7 @@
 import {
   chmod as nativeChmod,
   mkdir as nativeMkdir,
+  open as nativeOpen,
   readFile as nativeReadFile,
   rename as nativeRename,
   unlink as nativeUnlink,
@@ -15,24 +16,54 @@ const profilesDirectoryName = "profiles";
 const indexFileName = "index.json";
 const linuxPrivateFileMode = 0o600;
 const profileSecretNamespace = "codex-provider-switcher.profile";
+const profileLockFileName = ".create.lock";
+const defaultLockRetryMs = 25;
+const defaultLockTimeoutMs = 1_000;
+const defaultStaleLockMs = 5 * 60_000;
 const credentialKeyNames = new Set([
   "apikey",
   "accesskey",
+  "access",
   "privatekey",
+  "private",
   "secretkey",
+  "secret",
+  "secrets",
+  "auth",
+  "authentication",
   "authorization",
   "authorizationheader",
+  "header",
+  "headers",
+  "httpheaders",
   "authtoken",
   "accesstoken",
   "refreshtoken",
   "idtoken",
   "token",
-  "secret",
+  "tokens",
   "clientsecret",
   "credential",
   "credentials",
   "password",
   "passwd",
+]);
+const topLevelScalarConfigKeys = new Set([
+  "modelprovider",
+  "model",
+  "modelreasoningeffort",
+  "modelverbosity",
+  "approvalpolicy",
+  "sandboxmode",
+]);
+const topLevelNumericConfigKeys = new Set(["projectdocmaxbytes"]);
+const providerStringConfigKeys = new Set(["name", "baseurl", "wireapi"]);
+const providerNumericConfigKeys = new Set(["timeout", "retries"]);
+const retryConfigKeys = new Set([
+  "enabled",
+  "maxattempts",
+  "initialbackoffms",
+  "maxbackoffms",
 ]);
 
 export interface ProfileFileSystem {
@@ -56,6 +87,15 @@ export interface ProfileStoreOptions {
   fileSystem?: ProfileFileSystem;
   now?: () => string;
   platform?: NodeJS.Platform;
+  lockOptions?: ProfileLockOptions;
+}
+
+export interface ProfileLockOptions {
+  clock?: () => number;
+  isProcessAlive?: (pid: number) => boolean | undefined;
+  lockRetryMs?: number;
+  lockTimeoutMs?: number;
+  staleLockMs?: number;
 }
 
 export type ProfileStoreErrorCode =
@@ -77,12 +117,12 @@ export class ProfileStoreError extends Error {
 }
 
 export class ProfileStore {
-  private static readonly createLocksByCodexHome = new Map<string, Promise<void>>();
   private readonly fileSystem: ProfileFileSystem;
   private readonly indexPath: string;
   private readonly now: () => string;
   private readonly platform: NodeJS.Platform;
   private readonly profilesDir: string;
+  private readonly lockOptions: ProfileLockOptions;
 
   constructor(
     private readonly layout: CodexLayout,
@@ -91,6 +131,7 @@ export class ProfileStore {
     this.fileSystem = options.fileSystem ?? nativeProfileFileSystem;
     this.now = options.now ?? (() => new Date().toISOString());
     this.platform = options.platform ?? process.platform;
+    this.lockOptions = options.lockOptions ?? {};
     this.profilesDir = join(layout.switcherDir, profilesDirectoryName);
     this.indexPath = join(this.profilesDir, indexFileName);
   }
@@ -227,33 +268,210 @@ export class ProfileStore {
   private async withCreateLock<Result>(
     operation: () => Promise<Result>,
   ): Promise<Result> {
-    const previousLock = ProfileStore.createLocksByCodexHome.get(
-      this.layout.codexHome,
+    const releaseLock = await acquireProfileFileLock(
+      this.profilesDir,
+      this.lockOptions,
     );
-    let releaseLock!: () => void;
-    const lock = new Promise<void>((resolve) => {
-      releaseLock = resolve;
-    });
-    const currentLock = previousLock
-      ? previousLock.then(() => lock)
-      : lock;
-    ProfileStore.createLocksByCodexHome.set(this.layout.codexHome, currentLock);
-
-    if (previousLock) {
-      await previousLock;
-    }
     try {
       return await operation();
     } finally {
-      releaseLock();
-      if (
-        ProfileStore.createLocksByCodexHome.get(this.layout.codexHome) ===
-        currentLock
-      ) {
-        ProfileStore.createLocksByCodexHome.delete(this.layout.codexHome);
-      }
+      await releaseLock();
     }
   }
+}
+
+interface ProfileLockRecord {
+  pid: number;
+  createdAt: number;
+}
+
+type ProfileLockRelease = () => Promise<void>;
+
+async function acquireProfileFileLock(
+  profilesDir: string,
+  options: ProfileLockOptions,
+): Promise<ProfileLockRelease> {
+  const lockPath = join(profilesDir, profileLockFileName);
+  const clock = options.clock ?? Date.now;
+  const isProcessAlive = options.isProcessAlive ?? defaultIsProcessAlive;
+  const retryMs = Math.max(1, options.lockRetryMs ?? defaultLockRetryMs);
+  const timeoutMs = Math.max(0, options.lockTimeoutMs ?? defaultLockTimeoutMs);
+  const staleLockMs = Math.max(0, options.staleLockMs ?? defaultStaleLockMs);
+  const attempts = Math.max(1, Math.floor(timeoutMs / retryMs) + 1);
+
+  try {
+    await nativeMkdir(profilesDir, { recursive: true });
+  } catch (error: unknown) {
+    throw new ProfileStoreError(
+      "persistence-failed",
+      "Could not prepare the profile lock directory.",
+      { cause: error },
+    );
+  }
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const acquired = await tryAcquireProfileFileLock(lockPath, clock());
+    if (acquired) {
+      return acquired;
+    }
+
+    await recoverStaleProfileFileLock(
+      lockPath,
+      clock,
+      staleLockMs,
+      isProcessAlive,
+    );
+    if (attempt + 1 < attempts) {
+      await delay(retryMs);
+    }
+  }
+
+  throw new ProfileStoreError(
+    "persistence-failed",
+    "Could not acquire the profile lock.",
+  );
+}
+
+async function tryAcquireProfileFileLock(
+  lockPath: string,
+  createdAt: number,
+): Promise<ProfileLockRelease | undefined> {
+  let handle: Awaited<ReturnType<typeof nativeOpen>>;
+  try {
+    handle = await nativeOpen(lockPath, "wx", linuxPrivateFileMode);
+  } catch (error: unknown) {
+    if (isExistingFileError(error)) {
+      return undefined;
+    }
+    throw new ProfileStoreError(
+      "persistence-failed",
+      "Could not create the profile lock.",
+      { cause: error },
+    );
+  }
+
+  const contents = JSON.stringify({ pid: process.pid, createdAt });
+  let writeError: unknown;
+  try {
+    await handle.writeFile(contents, "utf8");
+  } catch (error: unknown) {
+    writeError = error;
+  }
+  try {
+    await handle.close();
+  } catch (error: unknown) {
+    writeError ??= error;
+  }
+  if (writeError !== undefined) {
+    try {
+      await nativeUnlink(lockPath);
+    } catch (cleanupError: unknown) {
+      throw new ProfileStoreError(
+        "rollback-failed",
+        "Could not remove an incomplete profile lock.",
+        { cause: cleanupError },
+      );
+    }
+    throw new ProfileStoreError(
+      "persistence-failed",
+      "Could not write the profile lock.",
+      { cause: writeError },
+    );
+  }
+
+  return async () => {
+    try {
+      if ((await nativeReadFile(lockPath, "utf8")) !== contents) {
+        throw new Error("Profile lock ownership changed.");
+      }
+      await nativeUnlink(lockPath);
+    } catch (error: unknown) {
+      throw new ProfileStoreError(
+        "persistence-failed",
+        "Could not release the profile lock.",
+        { cause: error },
+      );
+    }
+  };
+}
+
+async function recoverStaleProfileFileLock(
+  lockPath: string,
+  clock: () => number,
+  staleLockMs: number,
+  isProcessAlive: (pid: number) => boolean | undefined,
+): Promise<void> {
+  let contents: string;
+  try {
+    contents = await nativeReadFile(lockPath, "utf8");
+  } catch (error: unknown) {
+    if (isMissingFileError(error)) {
+      return;
+    }
+    throw new ProfileStoreError(
+      "persistence-failed",
+      "Could not inspect the profile lock.",
+      { cause: error },
+    );
+  }
+
+  const record = parseProfileLockRecord(contents);
+  if (
+    !record ||
+    clock() - record.createdAt < staleLockMs ||
+    isProcessAlive(record.pid) !== false
+  ) {
+    return;
+  }
+
+  try {
+    if ((await nativeReadFile(lockPath, "utf8")) !== contents) {
+      return;
+    }
+    await nativeUnlink(lockPath);
+  } catch (error: unknown) {
+    if (isMissingFileError(error)) {
+      return;
+    }
+    throw new ProfileStoreError(
+      "persistence-failed",
+      "Could not recover the stale profile lock.",
+      { cause: error },
+    );
+  }
+}
+
+function parseProfileLockRecord(contents: string): ProfileLockRecord | undefined {
+  try {
+    const parsed = JSON.parse(contents) as Record<string, unknown>;
+    if (
+      Number.isSafeInteger(parsed.pid) &&
+      (parsed.pid as number) > 0 &&
+      typeof parsed.createdAt === "number" &&
+      Number.isFinite(parsed.createdAt)
+    ) {
+      return {
+        pid: parsed.pid as number,
+        createdAt: parsed.createdAt,
+      };
+    }
+  } catch {
+    // An unverifiable lock remains in place until manually resolved.
+  }
+  return undefined;
+}
+
+function defaultIsProcessAlive(pid: number): boolean | undefined {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error: unknown) {
+    return isProcessNotFoundError(error) ? false : undefined;
+  }
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 export function profileApiKeySecretId(profileId: string): string {
@@ -300,6 +518,8 @@ function assertNoCredentialAssignments(configText: string): void {
       "Profile configuration must not include credentials.",
     );
   }
+
+  assertSupportedProfileConfig(parsedConfig);
 }
 
 function containsCredentialKey(value: unknown): boolean {
@@ -320,6 +540,109 @@ function isCredentialKey(key: string): boolean {
   const normalizedKey = normalizeConfigKey(key);
   return [...credentialKeyNames].some((credentialKeyName) =>
     normalizedKey.endsWith(credentialKeyName),
+  );
+}
+
+function assertSupportedProfileConfig(config: Record<string, unknown>): void {
+  for (const [key, value] of Object.entries(config)) {
+    const normalizedKey = normalizeConfigKey(key);
+    if (normalizedKey === "modelproviders") {
+      assertProviderConfigs(value);
+      continue;
+    }
+    if (topLevelScalarConfigKeys.has(normalizedKey) && typeof value === "string") {
+      continue;
+    }
+    if (topLevelNumericConfigKeys.has(normalizedKey) && typeof value === "number") {
+      continue;
+    }
+    throwInvalidProfileConfig();
+  }
+}
+
+function assertProviderConfigs(value: unknown): void {
+  if (!isConfigRecord(value)) {
+    throwInvalidProfileConfig();
+  }
+  for (const providerConfig of Object.values(value)) {
+    assertProviderConfig(providerConfig);
+  }
+}
+
+function assertProviderConfig(value: unknown): void {
+  if (!isConfigRecord(value)) {
+    throwInvalidProfileConfig();
+  }
+  for (const [key, fieldValue] of Object.entries(value)) {
+    const normalizedKey = normalizeConfigKey(key);
+    if (
+      providerStringConfigKeys.has(normalizedKey) &&
+      typeof fieldValue === "string"
+    ) {
+      continue;
+    }
+    if (
+      providerNumericConfigKeys.has(normalizedKey) &&
+      typeof fieldValue === "number"
+    ) {
+      continue;
+    }
+    if (normalizedKey === "retry") {
+      assertRetryConfig(fieldValue);
+      continue;
+    }
+    if (normalizedKey === "queryparams") {
+      assertScalarConfigMap(fieldValue);
+      continue;
+    }
+    throwInvalidProfileConfig();
+  }
+}
+
+function assertRetryConfig(value: unknown): void {
+  if (!isConfigRecord(value)) {
+    throwInvalidProfileConfig();
+  }
+  for (const [key, fieldValue] of Object.entries(value)) {
+    if (
+      !retryConfigKeys.has(normalizeConfigKey(key)) ||
+      !isConfigScalar(fieldValue)
+    ) {
+      throwInvalidProfileConfig();
+    }
+  }
+}
+
+function assertScalarConfigMap(value: unknown): void {
+  if (!isConfigRecord(value)) {
+    throwInvalidProfileConfig();
+  }
+  for (const fieldValue of Object.values(value)) {
+    if (
+      !isConfigScalar(fieldValue) &&
+      (!Array.isArray(fieldValue) || !fieldValue.every(isConfigScalar))
+    ) {
+      throwInvalidProfileConfig();
+    }
+  }
+}
+
+function isConfigRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isConfigScalar(value: unknown): value is string | number | boolean {
+  return (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  );
+}
+
+function throwInvalidProfileConfig(): never {
+  throw new ProfileStoreError(
+    "invalid-config",
+    "Profile configuration must use supported non-secret Codex/provider settings.",
   );
 }
 
@@ -369,6 +692,14 @@ function parsePublicProfileRecord(value: unknown): ProfileRecord {
 
 function isMissingFileError(error: unknown): error is NodeJS.ErrnoException {
   return typeof error === "object" && error !== null && (error as NodeJS.ErrnoException).code === "ENOENT";
+}
+
+function isExistingFileError(error: unknown): error is NodeJS.ErrnoException {
+  return typeof error === "object" && error !== null && (error as NodeJS.ErrnoException).code === "EEXIST";
+}
+
+function isProcessNotFoundError(error: unknown): error is NodeJS.ErrnoException {
+  return typeof error === "object" && error !== null && (error as NodeJS.ErrnoException).code === "ESRCH";
 }
 
 const nativeProfileFileSystem: ProfileFileSystem = {

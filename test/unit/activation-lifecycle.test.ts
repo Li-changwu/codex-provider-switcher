@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  activateExtensionWithStartupPrerequisites,
   commandIds,
+  getStartupProfilePrerequisites,
   registerExtensionLifecycle,
   type ExtensionHostApi,
 } from "../../src/activation";
+import { UnsupportedHostError } from "../../src/core/codex-home";
+import { UnsupportedSecretStorageError } from "../../src/core/secrets";
 
 test("registers commands and status bar disposal with the extension context", () => {
   const commandDisposables = commandIds.map((command) => ({
@@ -44,6 +48,67 @@ test("registers commands and status bar disposal with the extension context", ()
     assert.ok(subscriptions.includes(disposable));
   }
   assert.equal(statusBarDisposable.command, "codexProvider.switchProfile");
+});
+
+test("registers the lifecycle when typed startup prerequisites are unavailable", () => {
+  for (const startupError of [
+    new UnsupportedHostError("wsl", "WSL is unavailable."),
+    new UnsupportedSecretStorageError("SecretStorage is unavailable."),
+  ]) {
+    const subscriptions: Array<{ dispose(): unknown }> = [];
+    const registeredCommands: string[] = [];
+    const statusBarItem = {
+      dispose: () => undefined,
+      show: () => undefined,
+      text: "",
+      command: undefined as string | undefined,
+      tooltip: undefined as string | undefined,
+    };
+    const vscode = {
+      commands: {
+        registerCommand: (command: string) => {
+          registeredCommands.push(command);
+          return { dispose: () => undefined };
+        },
+      },
+      window: {
+        createStatusBarItem: () => statusBarItem,
+      },
+      StatusBarAlignment: {
+        Left: 1,
+      },
+    } as unknown as ExtensionHostApi;
+
+    assert.doesNotThrow(() =>
+      activateExtensionWithStartupPrerequisites(
+        {
+          subscriptions,
+          secrets: {
+            get: async () => undefined,
+            store: async () => undefined,
+            delete: async () => undefined,
+          },
+          globalStorageUri: {
+            scheme: "file",
+            fsPath: "C:\\Users\\Ada\\AppData\\Roaming\\Code\\User\\globalStorage",
+          },
+        },
+        {
+          env: {},
+          platform: "win32",
+          homeDir: "C:\\Users\\Ada",
+        },
+        vscode,
+        () => {
+          throw startupError;
+        },
+      ),
+    );
+    assert.deepEqual(registeredCommands, [...commandIds]);
+    assert.equal(subscriptions.length, commandIds.length + 1);
+    assert.equal(statusBarItem.command, "codexProvider.switchProfile");
+    assert.equal(getStartupProfilePrerequisites(), undefined);
+  }
 });
 
 test("disposes earlier registrations when a later command registration throws", () => {
