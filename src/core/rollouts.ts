@@ -11,6 +11,7 @@ import { basename, dirname, join } from "node:path";
 import type { CodexLayout } from "./types";
 
 const rolloutChangeProvenance = new WeakSet<object>();
+const rolloutChangeSnapshots = new WeakMap<object, RolloutChangeSnapshot>();
 type ProvenancedRolloutChange = RolloutChange;
 
 export interface RolloutReplacement {
@@ -160,6 +161,17 @@ interface ObservedRollout {
   change?: ProvenancedRolloutChange;
 }
 
+interface RolloutChangeSnapshot {
+  path: string;
+  sessionId: string;
+  beforeProvider: string | null;
+  afterProvider: string;
+  encryptedContent: boolean;
+  contentHash: string;
+  replacementsRef: readonly RolloutReplacement[];
+  replacements: readonly RolloutReplacement[];
+}
+
 interface JsonlLine {
   line: string;
   separator: "\n" | "\r\n" | "";
@@ -223,6 +235,7 @@ async function scanRolloutFile(
   const sessionIds = new Set<string>();
   let beforeProvider: string | null | undefined;
   let providerSeen = false;
+  let sessionMetaSeen = false;
   let encryptedContent = false;
   const replacements: RolloutReplacement[] = [];
 
@@ -236,6 +249,16 @@ async function scanRolloutFile(
         `Rollout uses unsupported root session/provider metadata: ${path}`,
       );
     }
+    const allowedModelProviderContainer =
+      record.type === "session_meta" && isRecord(record.payload)
+        ? record.payload
+        : undefined;
+    if (containsDisallowedModelProvider(record, allowedModelProviderContainer)) {
+      throw new RolloutValidationError(
+        "unsupported-layout",
+        `Rollout contains model_provider outside session_meta.payload: ${path}`,
+      );
+    }
     if (containsNestedProvider(record)) {
       throw new RolloutValidationError(
         "unsupported-layout",
@@ -244,6 +267,13 @@ async function scanRolloutFile(
     }
 
     if (record.type === "session_meta") {
+      if (sessionMetaSeen) {
+        throw new RolloutValidationError(
+          "unsupported-layout",
+          `Rollout contains duplicate session_meta records: ${path}`,
+        );
+      }
+      sessionMetaSeen = true;
       const payloadProperty = properties.find((property) => property.name === "payload");
       const payload = record.payload;
       if (!payloadProperty || !isRecord(payload)) {
@@ -333,11 +363,27 @@ async function scanRolloutFile(
 }
 
 function brandChange(change: RolloutChange): ProvenancedRolloutChange {
+  const exposedReplacements = Object.freeze(
+    change.replacements.map((replacement) => ({ ...replacement })),
+  );
+  const snapshotReplacements = Object.freeze(
+    exposedReplacements.map((replacement) => Object.freeze({ ...replacement })),
+  );
   const branded = {
     ...change,
-    replacements: Object.freeze([...change.replacements]),
+    replacements: exposedReplacements,
   } as ProvenancedRolloutChange;
   rolloutChangeProvenance.add(branded);
+  rolloutChangeSnapshots.set(branded, {
+    path: branded.path,
+    sessionId: branded.sessionId,
+    beforeProvider: branded.beforeProvider,
+    afterProvider: branded.afterProvider,
+    encryptedContent: branded.encryptedContent,
+    contentHash: branded.contentHash,
+    replacementsRef: exposedReplacements,
+    replacements: snapshotReplacements,
+  });
   return Object.freeze(branded);
 }
 
@@ -355,6 +401,7 @@ function validateChangeList(changes: readonly RolloutChange[]): void {
       );
     }
     const change = candidate;
+    assertChangeSnapshot(change);
     if (seenPaths.has(change.path)) {
       throw new RolloutValidationError(
         "change-mismatch",
@@ -373,6 +420,41 @@ function validateChangeList(changes: readonly RolloutChange[]): void {
       throw new RolloutValidationError(
         "change-mismatch",
         `Rollout change has no provider replacement: ${change.path}`,
+      );
+    }
+  }
+}
+
+function assertChangeSnapshot(change: ProvenancedRolloutChange): void {
+  const snapshot = rolloutChangeSnapshots.get(change);
+  if (
+    !snapshot ||
+    change.path !== snapshot.path ||
+    change.sessionId !== snapshot.sessionId ||
+    change.beforeProvider !== snapshot.beforeProvider ||
+    change.afterProvider !== snapshot.afterProvider ||
+    change.encryptedContent !== snapshot.encryptedContent ||
+    change.contentHash !== snapshot.contentHash ||
+    change.replacements !== snapshot.replacementsRef ||
+    change.replacements.length !== snapshot.replacements.length
+  ) {
+    throw new RolloutValidationError(
+      "change-mismatch",
+      `Rollout change was modified after scanning: ${change.path}`,
+    );
+  }
+  for (let index = 0; index < snapshot.replacements.length; index += 1) {
+    const current = change.replacements[index];
+    const expected = snapshot.replacements[index];
+    if (
+      current.line !== expected.line ||
+      current.start !== expected.start ||
+      current.end !== expected.end ||
+      current.value !== expected.value
+    ) {
+      throw new RolloutValidationError(
+        "change-mismatch",
+        `Rollout replacement was modified after scanning: ${change.path}`,
       );
     }
   }
@@ -637,6 +719,27 @@ function containsNestedProvider(value: unknown, depth = 0): boolean {
       return true;
     }
     if (containsNestedProvider(child, depth + 1)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function containsDisallowedModelProvider(
+  value: unknown,
+  allowedContainer: Record<string, unknown> | undefined,
+): boolean {
+  if (Array.isArray(value)) {
+    return value.some((item) => containsDisallowedModelProvider(item, allowedContainer));
+  }
+  if (!isRecord(value)) {
+    return false;
+  }
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "model_provider" && value !== allowedContainer) {
+      return true;
+    }
+    if (containsDisallowedModelProvider(child, allowedContainer)) {
       return true;
     }
   }

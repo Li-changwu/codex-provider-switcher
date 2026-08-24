@@ -98,6 +98,21 @@ test("fails closed for multiple session IDs in one rollout", async () => {
   });
 });
 
+test("fails closed for duplicate session_meta records with the same session ID", async () => {
+  await withLayout(async (layout) => {
+    const path = join(layout.sessionsDir, "duplicate-session-meta.jsonl");
+    const before = `${sessionMetaLine("duplicate", "openai")}\n${sessionMetaLine("duplicate", "openai")}\n`;
+    await writeFile(path, before, "utf8");
+
+    await assert.rejects(
+      () => collectRolloutChanges(layout, "custom"),
+      (error: unknown) =>
+        error instanceof RolloutValidationError && error.code === "unsupported-layout",
+    );
+    assert.equal(await readFile(path, "utf8"), before);
+  });
+});
+
 test("rejects duplicate session IDs across active and archived rollouts before writing", async () => {
   await withLayout(async (layout) => {
     const activePath = join(layout.sessionsDir, "same-active.jsonl");
@@ -135,6 +150,38 @@ test("rejects provider metadata nested outside session_meta.payload.model_provid
   });
 });
 
+test("rejects model_provider at every path except session_meta.payload.model_provider", async () => {
+  const invalidLines = [
+    [
+      "message-payload.jsonl",
+      JSON.stringify({ type: "response_item", payload: { model_provider: "openai" } }),
+    ],
+    [
+      "root.jsonl",
+      JSON.stringify({ type: "response_item", model_provider: "openai" }),
+    ],
+    [
+      "nested.jsonl",
+      JSON.stringify({ type: "response_item", data: { payload: { model_provider: "openai" } } }),
+    ],
+  ] as const;
+
+  for (const [fileName, invalidLine] of invalidLines) {
+    await withLayout(async (layout) => {
+      const path = join(layout.sessionsDir, fileName);
+      const before = `${sessionMetaLine("valid", "openai")}\n${invalidLine}\n`;
+      await writeFile(path, before, "utf8");
+
+      await assert.rejects(
+        () => collectRolloutChanges(layout, "custom"),
+        (error: unknown) =>
+          error instanceof RolloutValidationError && error.code === "unsupported-layout",
+      );
+      assert.equal(await readFile(path, "utf8"), before);
+    });
+  }
+});
+
 test("leaves a rollout with the target provider completely untouched", async () => {
   await withLayout(async (layout) => {
     const path = join(layout.sessionsDir, "unchanged.jsonl");
@@ -159,6 +206,24 @@ test("rejects a forged change without scan provenance and leaves the file unchan
 
     await assert.rejects(
       () => applyRolloutChanges([forged]),
+      (error: unknown) =>
+        error instanceof RolloutValidationError && error.code === "change-mismatch",
+    );
+    assert.equal(await readFile(path, "utf8"), before);
+  });
+});
+
+test("rejects a scan change after its replacement value is modified", async () => {
+  await withLayout(async (layout) => {
+    const path = join(layout.sessionsDir, "mutated-replacement.jsonl");
+    const before = `${sessionMetaLine("mutated", "openai")}\n`;
+    await writeFile(path, before, "utf8");
+    const changes = await collectRolloutChanges(layout, "custom");
+    assert.equal(changes.length, 1);
+    changes[0].replacements[0].value = JSON.stringify("forged");
+
+    await assert.rejects(
+      () => applyRolloutChanges(changes),
       (error: unknown) =>
         error instanceof RolloutValidationError && error.code === "change-mismatch",
     );
