@@ -4,11 +4,15 @@
   "version": "0.1.0",
   "private": true,
   "publisher": "Li-changwu",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Li-changwu/codex-provider-switcher.git"
+  },
   "extensionKind": [
     "workspace"
   ],
   "engines": {
-    "vscode": "^1.92.0"
+    "vscode": "^1.98.0"
   },
   "main": "./dist/extension.js",
   "activationEvents": [
@@ -52,21 +56,25 @@
     "check": "tsc --noEmit",
     "test": "tsx --test test/unit/*.test.ts",
     "test:integration": "tsx --test test/integration/*.test.ts",
-    "package": "npm run check && npm run build && npx @vscode/vsce package",
+    "package": "node scripts/package-extension.mjs",
+    "package:win32-x64": "node scripts/package-extension.mjs win32-x64",
+    "package:linux-x64": "node scripts/package-extension.mjs linux-x64",
+    "verify:binding": "node scripts/verify-sqlite-binding.mjs",
     "verify:package": "node scripts/verify-vsix.mjs"
   },
   "dependencies": {
     "@iarna/toml": "^3.0.0",
-    "@vscode/sqlite3": "5.1.14-vscode"
+    "sqlite3": "^6.0.1"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
-    "@types/vscode": "^1.92.0",
+    "@types/vscode": "^1.98.0",
     "@vscode/test-electron": "^2.4.1",
     "@vscode/vsce": "^2.26.1",
     "esbuild": "^0.24.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
-    "yauzl": "^2.10.0"
+    "yauzl": "^2.10.0",
+    "yazl": "^2.5.1"
   }
 }

@@ -27,7 +27,7 @@ test("declares the VS Code extension manifest contract", async () => {
 
   assert.equal(manifest.publisher, "Li-changwu");
   assert.deepEqual(manifest.extensionKind, ["workspace"]);
-  assert.equal(manifest.engines?.vscode, "^1.92.0");
+  assert.equal(manifest.engines?.vscode, "^1.98.0");
   assert.equal(manifest.main, "./dist/extension.js");
   assert.equal(manifest.browser, undefined);
   assert.deepEqual(manifest.activationEvents, ["onStartupFinished"]);
