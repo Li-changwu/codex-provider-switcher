@@ -105,6 +105,61 @@ test("rejects an unknown profile kind", () => {
   );
 });
 
+test("rejects credentials in official and custom TOML without exposing their values", () => {
+  const invalidConfigs: Array<[string, string, "official" | "custom"]> = [
+    ["official API key", 'api_key = "LEAK"', "official"],
+    ["official OAuth token", '[oauth]\naccess_token = "LEAK"', "official"],
+    [
+      "custom provider-prefixed API key",
+      `${validCustomConfig}openai_api_key = "LEAK"\n`,
+      "custom",
+    ],
+    [
+      "nested authorization header",
+      `${validCustomConfig}[model_providers.research.headers]\nauthorization = "LEAK"\n`,
+      "custom",
+    ],
+    [
+      "private and access key aliases",
+      `${validCustomConfig}private_key = "LEAK"\naccess_key = "LEAK"\n`,
+      "custom",
+    ],
+  ];
+
+  for (const [description, input, kind] of invalidConfigs) {
+    assert.throws(
+      () => validateProfileConfig(input, kind),
+      (error: unknown) => {
+        assert.doesNotMatch(String(error), /LEAK/);
+        assert.match(String(error), /credentials|auth|secret|invalid|supported/i);
+        return true;
+      },
+      description,
+    );
+  }
+});
+
+test("rejects unknown top-level and provider fields", () => {
+  assert.throws(
+    () => validateProfileConfig("garbage = true\n", "official"),
+    /supported/i,
+  );
+  assert.throws(
+    () =>
+      validateProfileConfig(
+        `${validCustomConfig}timeout = 30\n`,
+        "custom",
+      ),
+    /supported/i,
+  );
+});
+
+test("accepts documented non-sensitive provider fields", () => {
+  const documentedConfig = `${validCustomConfig}name = "Research"\nrequest_max_retries = 2\nstream_max_retries = 3\nstream_idle_timeout_ms = 5000\nrequires_openai_auth = true\nsupports_websockets = false\nquery_params = { region = "test", attempt = 1 }\n`;
+
+  assert.doesNotThrow(() => validateProfileConfig(documentedConfig, "custom"));
+});
+
 test("serializes custom auth with only OPENAI_API_KEY", () => {
   assert.equal(
     serializeActiveAuth("secret-value"),
@@ -134,6 +189,31 @@ test("writes the original config and custom auth through the active layout", asy
       assert.equal((await stat(layout.configPath)).mode & 0o777, 0o600);
       assert.equal((await stat(layout.authPath)).mode & 0o777, 0o600);
     }
+  });
+});
+
+test("rejects malformed active config before creating a file", async () => {
+  await withTemporaryLayout(async (layout) => {
+    await assert.rejects(
+      () => writeActiveConfig(layout, 'model_provider = "research"\n['),
+      /valid TOML/i,
+    );
+
+    assert.deepEqual(await readdir(layout.codexHome), []);
+  });
+});
+
+test("rejects credential-bearing active config before writing and does not expose the key", async () => {
+  await withTemporaryLayout(async (layout) => {
+    await assert.rejects(
+      () => writeActiveConfig(layout, 'api_key = "LEAK"\n'),
+      (error: unknown) => {
+        assert.doesNotMatch(String(error), /LEAK/);
+        return true;
+      },
+    );
+
+    assert.deepEqual(await readdir(layout.codexHome), []);
   });
 });
 

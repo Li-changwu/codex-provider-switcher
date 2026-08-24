@@ -15,13 +15,62 @@ import type {
 } from "./types";
 
 const linuxPrivateFileMode = 0o600;
+const credentialKeyNames = new Set([
+  "apikey",
+  "accesskey",
+  "access",
+  "privatekey",
+  "private",
+  "secretkey",
+  "secret",
+  "secrets",
+  "auth",
+  "authentication",
+  "authorization",
+  "authorizationheader",
+  "header",
+  "headers",
+  "httpheaders",
+  "authtoken",
+  "accesstoken",
+  "refreshtoken",
+  "idtoken",
+  "token",
+  "tokens",
+  "clientsecret",
+  "credential",
+  "credentials",
+  "password",
+  "passwd",
+]);
+const topLevelScalarConfigKeys = new Set([
+  "modelprovider",
+  "model",
+  "modelreasoningeffort",
+  "modelverbosity",
+  "approvalpolicy",
+  "sandboxmode",
+]);
+const topLevelNumericConfigKeys = new Set(["projectdocmaxbytes"]);
+const providerStringConfigKeys = new Set(["name", "baseurl", "wireapi"]);
+const providerNumericConfigKeys = new Set([
+  "requestmaxretries",
+  "streammaxretries",
+  "streamidletimeoutms",
+]);
+const providerBooleanConfigKeys = new Set([
+  "requiresopenaiauth",
+  "supportswebsockets",
+]);
 
 export type ConfigValidationErrorCode =
   | "malformed-toml"
   | "unknown-profile-kind"
   | "missing-field"
   | "unsupported-wire-api"
-  | "empty-api-key";
+  | "empty-api-key"
+  | "credential-field"
+  | "unsupported-field";
 
 export class ConfigValidationError extends Error {
   constructor(
@@ -48,15 +97,8 @@ export function validateProfileConfig(
 ): ValidatedConfig {
   assertKnownProfileKind(kind);
 
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = parseToml(input) as Record<string, unknown>;
-  } catch {
-    throw new ConfigValidationError(
-      "malformed-toml",
-      "Profile configuration must be valid TOML.",
-    );
-  }
+  const parsed = parseProfileConfig(input);
+  assertSafeProfileConfig(parsed);
 
   if (kind === "official") {
     return {
@@ -105,6 +147,7 @@ export async function writeActiveConfig(
   layout: CodexLayout,
   text: string,
 ): Promise<void> {
+  assertSafeProfileConfig(parseProfileConfig(text));
   await writeAtomically(layout.configPath, text);
 }
 
@@ -137,6 +180,142 @@ function assertKnownProfileKind(kind: ProfileKind): void {
       "Profile configuration has an unknown profile kind.",
     );
   }
+}
+
+function parseProfileConfig(input: string): Record<string, unknown> {
+  try {
+    return parseToml(input) as Record<string, unknown>;
+  } catch {
+    throw new ConfigValidationError(
+      "malformed-toml",
+      "Profile configuration must be valid TOML.",
+    );
+  }
+}
+
+function assertSafeProfileConfig(config: Record<string, unknown>): void {
+  if (containsCredentialKey(config)) {
+    throw new ConfigValidationError(
+      "credential-field",
+      "Profile configuration must not include credentials.",
+    );
+  }
+  assertSupportedProfileConfig(config);
+}
+
+function containsCredentialKey(value: unknown): boolean {
+  if (Array.isArray(value)) {
+    return value.some(containsCredentialKey);
+  }
+  if (!value || typeof value !== "object" || value instanceof Date) {
+    return false;
+  }
+
+  return Object.entries(value).some(
+    ([key, nestedValue]) =>
+      isCredentialKey(key) || containsCredentialKey(nestedValue),
+  );
+}
+
+function isCredentialKey(key: string): boolean {
+  const normalizedKey = normalizeConfigKey(key);
+  if (normalizedKey === "requiresopenaiauth") {
+    return false;
+  }
+  return [...credentialKeyNames].some((credentialKeyName) =>
+    normalizedKey.endsWith(credentialKeyName),
+  );
+}
+
+function assertSupportedProfileConfig(config: Record<string, unknown>): void {
+  for (const [key, value] of Object.entries(config)) {
+    const normalizedKey = normalizeConfigKey(key);
+    if (normalizedKey === "modelproviders") {
+      assertProviderConfigs(value);
+      continue;
+    }
+    if (topLevelScalarConfigKeys.has(normalizedKey) && typeof value === "string") {
+      continue;
+    }
+    if (topLevelNumericConfigKeys.has(normalizedKey) && typeof value === "number") {
+      continue;
+    }
+    throwInvalidProfileConfig();
+  }
+}
+
+function assertProviderConfigs(value: unknown): void {
+  if (!isRecord(value)) {
+    throwInvalidProfileConfig();
+  }
+  for (const providerConfig of Object.values(value)) {
+    assertProviderConfig(providerConfig);
+  }
+}
+
+function assertProviderConfig(value: unknown): void {
+  if (!isRecord(value)) {
+    throwInvalidProfileConfig();
+  }
+  for (const [key, fieldValue] of Object.entries(value)) {
+    const normalizedKey = normalizeConfigKey(key);
+    if (
+      providerStringConfigKeys.has(normalizedKey) &&
+      typeof fieldValue === "string"
+    ) {
+      continue;
+    }
+    if (
+      providerNumericConfigKeys.has(normalizedKey) &&
+      typeof fieldValue === "number"
+    ) {
+      continue;
+    }
+    if (
+      providerBooleanConfigKeys.has(normalizedKey) &&
+      typeof fieldValue === "boolean"
+    ) {
+      continue;
+    }
+    if (normalizedKey === "queryparams") {
+      assertScalarConfigMap(fieldValue);
+      continue;
+    }
+    throwInvalidProfileConfig();
+  }
+}
+
+function assertScalarConfigMap(value: unknown): void {
+  if (!isRecord(value)) {
+    throwInvalidProfileConfig();
+  }
+  for (const fieldValue of Object.values(value)) {
+    if (
+      !isConfigScalar(fieldValue) &&
+      (!Array.isArray(fieldValue) || !fieldValue.every(isConfigScalar))
+    ) {
+      throwInvalidProfileConfig();
+    }
+  }
+}
+
+function isConfigScalar(value: unknown): value is string | number | boolean {
+  return (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  );
+}
+
+function throwInvalidProfileConfig(): never {
+  throw new ConfigValidationError(
+    "unsupported-field",
+    "Profile configuration must use supported non-secret Codex/provider settings.",
+  );
+}
+
+function normalizeConfigKey(key: string): string {
+  return key.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
 function requiredString(value: unknown, fieldName: string): string {
