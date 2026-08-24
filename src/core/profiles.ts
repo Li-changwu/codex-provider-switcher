@@ -9,7 +9,10 @@ import {
 } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { basename, dirname, join } from "node:path";
-import { parse as parseToml } from "@iarna/toml";
+import {
+  parseAndValidateProfileConfig,
+  ProfileConfigPolicyError,
+} from "./config-policy";
 import type { CodexLayout, ProfileKind, ProfileRecord } from "./types";
 
 const profilesDirectoryName = "profiles";
@@ -22,53 +25,6 @@ const profileLockRecoveryClaimFileName = ".create.lock.recovery.claim";
 const defaultLockRetryMs = 25;
 const defaultLockTimeoutMs = 1_000;
 const defaultStaleLockMs = 5 * 60_000;
-const credentialKeyNames = new Set([
-  "apikey",
-  "accesskey",
-  "access",
-  "privatekey",
-  "private",
-  "secretkey",
-  "secret",
-  "secrets",
-  "auth",
-  "authentication",
-  "authorization",
-  "authorizationheader",
-  "header",
-  "headers",
-  "httpheaders",
-  "authtoken",
-  "accesstoken",
-  "refreshtoken",
-  "idtoken",
-  "token",
-  "tokens",
-  "clientsecret",
-  "credential",
-  "credentials",
-  "password",
-  "passwd",
-]);
-const topLevelScalarConfigKeys = new Set([
-  "modelprovider",
-  "model",
-  "modelreasoningeffort",
-  "modelverbosity",
-  "approvalpolicy",
-  "sandboxmode",
-]);
-const topLevelNumericConfigKeys = new Set(["projectdocmaxbytes"]);
-const providerStringConfigKeys = new Set(["name", "baseurl", "wireapi"]);
-const providerNumericConfigKeys = new Set([
-  "requestmaxretries",
-  "streammaxretries",
-  "streamidletimeoutms",
-]);
-const providerBooleanConfigKeys = new Set([
-  "requiresopenaiauth",
-  "supportswebsockets",
-]);
 
 export interface ProfileFileSystem {
   mkdir(path: string): Promise<void>;
@@ -252,7 +208,24 @@ export class ProfileStore {
       }
       await this.fileSystem.rename(temporaryPath, path);
     } catch (error: unknown) {
-      await this.removeTemporaryFile(temporaryPath);
+      let cleanupError: unknown;
+      try {
+        await this.removeTemporaryFile(temporaryPath);
+      } catch (error: unknown) {
+        cleanupError = error;
+      }
+      if (cleanupError !== undefined) {
+        throw new ProfileStoreError(
+          "rollback-failed",
+          "Could not clean up temporary profile data.",
+          {
+            cause: new AggregateError(
+              [error, cleanupError],
+              "Profile data write and cleanup both failed.",
+            ),
+          },
+        );
+      }
       throw new ProfileStoreError(
         "persistence-failed",
         "Could not write profile data.",
@@ -278,11 +251,7 @@ export class ProfileStore {
       await this.fileSystem.unlink(path);
     } catch (error: unknown) {
       if (!isMissingFileError(error)) {
-        throw new ProfileStoreError(
-          "rollback-failed",
-          "Could not clean up temporary profile data.",
-          { cause: error },
-        );
+        throw error;
       }
     }
   }
@@ -880,143 +849,19 @@ function withDerivedSecretId(profile: ProfileRecord): ProfileRecord {
 }
 
 function assertNoCredentialAssignments(configText: string): void {
-  let parsedConfig: Record<string, unknown>;
   try {
-    parsedConfig = parseToml(configText);
-  } catch {
-    throw new ProfileStoreError(
-      "invalid-config",
-      "Profile configuration must be valid TOML and must not include credentials.",
-    );
-  }
-
-  if (containsCredentialKey(parsedConfig)) {
-    throw new ProfileStoreError(
-      "invalid-config",
-      "Profile configuration must not include credentials.",
-    );
-  }
-
-  assertSupportedProfileConfig(parsedConfig);
-}
-
-function containsCredentialKey(value: unknown): boolean {
-  if (Array.isArray(value)) {
-    return value.some(containsCredentialKey);
-  }
-  if (!value || typeof value !== "object" || value instanceof Date) {
-    return false;
-  }
-
-  return Object.entries(value).some(
-    ([key, nestedValue]) =>
-      isCredentialKey(key) || containsCredentialKey(nestedValue),
-  );
-}
-
-function isCredentialKey(key: string): boolean {
-  const normalizedKey = normalizeConfigKey(key);
-  if (normalizedKey === "requiresopenaiauth") {
-    return false;
-  }
-  return [...credentialKeyNames].some((credentialKeyName) =>
-    normalizedKey.endsWith(credentialKeyName),
-  );
-}
-
-function assertSupportedProfileConfig(config: Record<string, unknown>): void {
-  for (const [key, value] of Object.entries(config)) {
-    const normalizedKey = normalizeConfigKey(key);
-    if (normalizedKey === "modelproviders") {
-      assertProviderConfigs(value);
-      continue;
+    parseAndValidateProfileConfig(configText);
+  } catch (error: unknown) {
+    if (error instanceof ProfileConfigPolicyError) {
+      throw new ProfileStoreError(
+        "invalid-config",
+        error.code === "malformed-toml"
+          ? "Profile configuration must be valid TOML and must not include credentials."
+          : error.message,
+      );
     }
-    if (topLevelScalarConfigKeys.has(normalizedKey) && typeof value === "string") {
-      continue;
-    }
-    if (topLevelNumericConfigKeys.has(normalizedKey) && typeof value === "number") {
-      continue;
-    }
-    throwInvalidProfileConfig();
+    throw error;
   }
-}
-
-function assertProviderConfigs(value: unknown): void {
-  if (!isConfigRecord(value)) {
-    throwInvalidProfileConfig();
-  }
-  for (const providerConfig of Object.values(value)) {
-    assertProviderConfig(providerConfig);
-  }
-}
-
-function assertProviderConfig(value: unknown): void {
-  if (!isConfigRecord(value)) {
-    throwInvalidProfileConfig();
-  }
-  for (const [key, fieldValue] of Object.entries(value)) {
-    const normalizedKey = normalizeConfigKey(key);
-    if (
-      providerStringConfigKeys.has(normalizedKey) &&
-      typeof fieldValue === "string"
-    ) {
-      continue;
-    }
-    if (
-      providerNumericConfigKeys.has(normalizedKey) &&
-      typeof fieldValue === "number"
-    ) {
-      continue;
-    }
-    if (
-      providerBooleanConfigKeys.has(normalizedKey) &&
-      typeof fieldValue === "boolean"
-    ) {
-      continue;
-    }
-    if (normalizedKey === "queryparams") {
-      assertScalarConfigMap(fieldValue);
-      continue;
-    }
-    throwInvalidProfileConfig();
-  }
-}
-
-function assertScalarConfigMap(value: unknown): void {
-  if (!isConfigRecord(value)) {
-    throwInvalidProfileConfig();
-  }
-  for (const fieldValue of Object.values(value)) {
-    if (
-      !isConfigScalar(fieldValue) &&
-      (!Array.isArray(fieldValue) || !fieldValue.every(isConfigScalar))
-    ) {
-      throwInvalidProfileConfig();
-    }
-  }
-}
-
-function isConfigRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function isConfigScalar(value: unknown): value is string | number | boolean {
-  return (
-    typeof value === "string" ||
-    typeof value === "number" ||
-    typeof value === "boolean"
-  );
-}
-
-function throwInvalidProfileConfig(): never {
-  throw new ProfileStoreError(
-    "invalid-config",
-    "Profile configuration must use supported non-secret Codex/provider settings.",
-  );
-}
-
-function normalizeConfigKey(key: string): string {
-  return key.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
 function nextProfileId(name: string, profiles: readonly ProfileRecord[]): string {

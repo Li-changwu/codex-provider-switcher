@@ -1096,6 +1096,32 @@ test("wraps profile write I/O errors without writing profile files", async () =>
   });
 });
 
+test("preserves both profile write and temporary cleanup failures", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const fileSystem = new FailingWriteAndTemporaryCleanupProfileFileSystem();
+    const store = new ProfileStore(layout, { fileSystem });
+
+    await assert.rejects(
+      () =>
+        store.create({
+          name: "Write And Cleanup Error",
+          kind: "official",
+          configText: 'model_provider = "openai"\n',
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof ProfileStoreError);
+        assert.equal(error.code, "rollback-failed");
+        assert.ok(error.cause instanceof AggregateError);
+        assert.deepEqual(error.cause.errors, [
+          fileSystem.writeFailure,
+          fileSystem.cleanupFailure,
+        ]);
+        return true;
+      },
+    );
+  });
+});
+
 test("rolls back a visible config when index persistence fails", async () => {
   await withTemporaryLayout(async (layout) => {
     const fileSystem = new FailingIndexProfileFileSystem();
@@ -1658,6 +1684,28 @@ class FailingWriteProfileFileSystem extends RecordingProfileFileSystem {
       throw this.failure;
     }
     await super.writeFile(path, contents);
+  }
+}
+
+class FailingWriteAndTemporaryCleanupProfileFileSystem extends RecordingProfileFileSystem {
+  readonly writeFailure = createFileSystemError("EIO", "profile write failed");
+  readonly cleanupFailure = createFileSystemError(
+    "EIO",
+    "temporary profile cleanup failed",
+  );
+
+  override async writeFile(path: string, contents: string): Promise<void> {
+    if (path.includes(".config.toml.tmp-")) {
+      throw this.writeFailure;
+    }
+    await super.writeFile(path, contents);
+  }
+
+  override async unlink(path: string): Promise<void> {
+    if (path.includes(".config.toml.tmp-")) {
+      throw this.cleanupFailure;
+    }
+    await super.unlink(path);
   }
 }
 

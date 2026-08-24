@@ -18,6 +18,7 @@ import {
   writeActiveConfig,
   writeActiveCustomAuth,
 } from "../../src/core/config";
+import { ProfileStore, ProfileStoreError } from "../../src/core/profiles";
 import type { CodexLayout } from "../../src/core/types";
 
 const validCustomConfig =
@@ -61,10 +62,14 @@ test("rejects custom TOML when the selected provider table is missing", () => {
   assert.throws(
     () =>
       validateProfileConfig(
-        'model_provider = "research"\n[model_providers.other]\nbase_url = "https://example.test"\nwire_api = "responses"\n',
+        'model_provider = "sk-secret-value"\n[model_providers.other]\nbase_url = "https://example.test"\nwire_api = "responses"\n',
         "custom",
       ),
-    /model_providers\.research/i,
+    (error: unknown) => {
+      assert.match(String(error), /selected model_providers table/i);
+      assert.doesNotMatch(String(error), /sk-secret-value/);
+      return true;
+    },
   );
 });
 
@@ -124,6 +129,11 @@ test("rejects credentials in official and custom TOML without exposing their val
       `${validCustomConfig}private_key = "LEAK"\naccess_key = "LEAK"\n`,
       "custom",
     ],
+    [
+      "embedded API key alias in query params",
+      `${validCustomConfig}query_params = { api_key_value = "LEAK" }\n`,
+      "custom",
+    ],
   ];
 
   for (const [description, input, kind] of invalidConfigs) {
@@ -155,9 +165,63 @@ test("rejects unknown top-level and provider fields", () => {
 });
 
 test("accepts documented non-sensitive provider fields", () => {
-  const documentedConfig = `${validCustomConfig}name = "Research"\nrequest_max_retries = 2\nstream_max_retries = 3\nstream_idle_timeout_ms = 5000\nrequires_openai_auth = true\nsupports_websockets = false\nquery_params = { region = "test", attempt = 1 }\n`;
+  const documentedConfig = `${validCustomConfig}name = "Research"\nrequest_max_retries = 2\nstream_max_retries = 3\nstream_idle_timeout_ms = 5000\nrequires_openai_auth = true\nsupports_websockets = false\nquery_params = { region = "test", attempt = 1, api_version = "v1" }\n`;
 
   assert.doesNotThrow(() => validateProfileConfig(documentedConfig, "custom"));
+});
+
+test("rejects unknown or secret-shaped query parameters", () => {
+  for (const queryParams of [
+    '{ provider_hint = "sk-secret-value" }',
+    '{ region = "sk-secret-value" }',
+  ]) {
+    assert.throws(
+      () =>
+        validateProfileConfig(
+          `${validCustomConfig}query_params = ${queryParams}\n`,
+          "custom",
+        ),
+      (error: unknown) => {
+        assert.doesNotMatch(String(error), /sk-secret-value/);
+        return true;
+      },
+    );
+  }
+});
+
+test("rejects TOML datetimes where a table or scalar map is required", () => {
+  assert.throws(() =>
+    validateProfileConfig(
+      `${validCustomConfig}query_params = 2026-08-25T00:00:00Z\n`,
+      "custom",
+    ),
+  );
+  assert.throws(() =>
+    validateProfileConfig(
+      'model_providers = 2026-08-25T00:00:00Z\n',
+      "official",
+    ),
+  );
+});
+
+test("uses the same safe policy for profile creation and active config writes", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const unsafeConfig = `${validCustomConfig}query_params = { provider_hint = "sk-secret-value" }\n`;
+    const store = new ProfileStore(layout);
+
+    await assert.rejects(
+      () =>
+        store.create({
+          name: "Unsafe Query Parameter",
+          kind: "custom",
+          configText: unsafeConfig,
+        }),
+      (error: unknown) =>
+        error instanceof ProfileStoreError && error.code === "invalid-config",
+    );
+    await assert.rejects(() => writeActiveConfig(layout, unsafeConfig));
+    assert.deepEqual(await readdir(layout.codexHome), []);
+  });
 });
 
 test("serializes custom auth with only OPENAI_API_KEY", () => {
@@ -200,6 +264,17 @@ test("rejects malformed active config before creating a file", async () => {
     );
 
     assert.deepEqual(await readdir(layout.codexHome), []);
+  });
+});
+
+test("keeps the existing active config when validation fails", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const originalConfig = 'model_provider = "openai"\n';
+    await writeFile(layout.configPath, originalConfig, "utf8");
+
+    await assert.rejects(() => writeActiveConfig(layout, 'api_key_value = "LEAK"\n'));
+
+    assert.equal(await readFile(layout.configPath, "utf8"), originalConfig);
   });
 });
 

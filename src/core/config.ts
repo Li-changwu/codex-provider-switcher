@@ -7,7 +7,11 @@ import {
 } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { basename, dirname, join } from "node:path";
-import { parse as parseToml } from "@iarna/toml";
+import {
+  isPlainRecord,
+  parseAndValidateProfileConfig,
+  ProfileConfigPolicyError,
+} from "./config-policy";
 import type {
   CodexLayout,
   ProfileKind,
@@ -15,53 +19,6 @@ import type {
 } from "./types";
 
 const linuxPrivateFileMode = 0o600;
-const credentialKeyNames = new Set([
-  "apikey",
-  "accesskey",
-  "access",
-  "privatekey",
-  "private",
-  "secretkey",
-  "secret",
-  "secrets",
-  "auth",
-  "authentication",
-  "authorization",
-  "authorizationheader",
-  "header",
-  "headers",
-  "httpheaders",
-  "authtoken",
-  "accesstoken",
-  "refreshtoken",
-  "idtoken",
-  "token",
-  "tokens",
-  "clientsecret",
-  "credential",
-  "credentials",
-  "password",
-  "passwd",
-]);
-const topLevelScalarConfigKeys = new Set([
-  "modelprovider",
-  "model",
-  "modelreasoningeffort",
-  "modelverbosity",
-  "approvalpolicy",
-  "sandboxmode",
-]);
-const topLevelNumericConfigKeys = new Set(["projectdocmaxbytes"]);
-const providerStringConfigKeys = new Set(["name", "baseurl", "wireapi"]);
-const providerNumericConfigKeys = new Set([
-  "requestmaxretries",
-  "streammaxretries",
-  "streamidletimeoutms",
-]);
-const providerBooleanConfigKeys = new Set([
-  "requiresopenaiauth",
-  "supportswebsockets",
-]);
 
 export type ConfigValidationErrorCode =
   | "malformed-toml"
@@ -98,7 +55,6 @@ export function validateProfileConfig(
   assertKnownProfileKind(kind);
 
   const parsed = parseProfileConfig(input);
-  assertSafeProfileConfig(parsed);
 
   if (kind === "official") {
     return {
@@ -113,10 +69,10 @@ export function validateProfileConfig(
     "model_provider",
   );
   const providers = parsed.model_providers;
-  if (!isRecord(providers) || !isRecord(providers[providerId])) {
+  if (!isPlainRecord(providers) || !isPlainRecord(providers[providerId])) {
     throw new ConfigValidationError(
       "missing-field",
-      `Profile configuration requires the selected model_providers.${providerId} table.`,
+      "Profile configuration requires the selected model_providers table.",
     );
   }
 
@@ -147,7 +103,7 @@ export async function writeActiveConfig(
   layout: CodexLayout,
   text: string,
 ): Promise<void> {
-  assertSafeProfileConfig(parseProfileConfig(text));
+  parseProfileConfig(text);
   await writeAtomically(layout.configPath, text);
 }
 
@@ -184,138 +140,13 @@ function assertKnownProfileKind(kind: ProfileKind): void {
 
 function parseProfileConfig(input: string): Record<string, unknown> {
   try {
-    return parseToml(input) as Record<string, unknown>;
-  } catch {
-    throw new ConfigValidationError(
-      "malformed-toml",
-      "Profile configuration must be valid TOML.",
-    );
-  }
-}
-
-function assertSafeProfileConfig(config: Record<string, unknown>): void {
-  if (containsCredentialKey(config)) {
-    throw new ConfigValidationError(
-      "credential-field",
-      "Profile configuration must not include credentials.",
-    );
-  }
-  assertSupportedProfileConfig(config);
-}
-
-function containsCredentialKey(value: unknown): boolean {
-  if (Array.isArray(value)) {
-    return value.some(containsCredentialKey);
-  }
-  if (!value || typeof value !== "object" || value instanceof Date) {
-    return false;
-  }
-
-  return Object.entries(value).some(
-    ([key, nestedValue]) =>
-      isCredentialKey(key) || containsCredentialKey(nestedValue),
-  );
-}
-
-function isCredentialKey(key: string): boolean {
-  const normalizedKey = normalizeConfigKey(key);
-  if (normalizedKey === "requiresopenaiauth") {
-    return false;
-  }
-  return [...credentialKeyNames].some((credentialKeyName) =>
-    normalizedKey.endsWith(credentialKeyName),
-  );
-}
-
-function assertSupportedProfileConfig(config: Record<string, unknown>): void {
-  for (const [key, value] of Object.entries(config)) {
-    const normalizedKey = normalizeConfigKey(key);
-    if (normalizedKey === "modelproviders") {
-      assertProviderConfigs(value);
-      continue;
+    return parseAndValidateProfileConfig(input);
+  } catch (error: unknown) {
+    if (error instanceof ProfileConfigPolicyError) {
+      throw new ConfigValidationError(error.code, error.message);
     }
-    if (topLevelScalarConfigKeys.has(normalizedKey) && typeof value === "string") {
-      continue;
-    }
-    if (topLevelNumericConfigKeys.has(normalizedKey) && typeof value === "number") {
-      continue;
-    }
-    throwInvalidProfileConfig();
+    throw error;
   }
-}
-
-function assertProviderConfigs(value: unknown): void {
-  if (!isRecord(value)) {
-    throwInvalidProfileConfig();
-  }
-  for (const providerConfig of Object.values(value)) {
-    assertProviderConfig(providerConfig);
-  }
-}
-
-function assertProviderConfig(value: unknown): void {
-  if (!isRecord(value)) {
-    throwInvalidProfileConfig();
-  }
-  for (const [key, fieldValue] of Object.entries(value)) {
-    const normalizedKey = normalizeConfigKey(key);
-    if (
-      providerStringConfigKeys.has(normalizedKey) &&
-      typeof fieldValue === "string"
-    ) {
-      continue;
-    }
-    if (
-      providerNumericConfigKeys.has(normalizedKey) &&
-      typeof fieldValue === "number"
-    ) {
-      continue;
-    }
-    if (
-      providerBooleanConfigKeys.has(normalizedKey) &&
-      typeof fieldValue === "boolean"
-    ) {
-      continue;
-    }
-    if (normalizedKey === "queryparams") {
-      assertScalarConfigMap(fieldValue);
-      continue;
-    }
-    throwInvalidProfileConfig();
-  }
-}
-
-function assertScalarConfigMap(value: unknown): void {
-  if (!isRecord(value)) {
-    throwInvalidProfileConfig();
-  }
-  for (const fieldValue of Object.values(value)) {
-    if (
-      !isConfigScalar(fieldValue) &&
-      (!Array.isArray(fieldValue) || !fieldValue.every(isConfigScalar))
-    ) {
-      throwInvalidProfileConfig();
-    }
-  }
-}
-
-function isConfigScalar(value: unknown): value is string | number | boolean {
-  return (
-    typeof value === "string" ||
-    typeof value === "number" ||
-    typeof value === "boolean"
-  );
-}
-
-function throwInvalidProfileConfig(): never {
-  throw new ConfigValidationError(
-    "unsupported-field",
-    "Profile configuration must use supported non-secret Codex/provider settings.",
-  );
-}
-
-function normalizeConfigKey(key: string): string {
-  return key.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
 function requiredString(value: unknown, fieldName: string): string {
@@ -341,10 +172,6 @@ function assertApiKey(apiKey: string): void {
   }
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
 async function writeAtomically(path: string, text: string): Promise<void> {
   const temporaryPath = join(
     dirname(path),
@@ -360,8 +187,24 @@ async function writeAtomically(path: string, text: string): Promise<void> {
     await nativeRename(temporaryPath, path);
     renamed = true;
   } catch (error: unknown) {
+    let cleanupError: unknown;
     if (!renamed) {
-      await removeTemporaryFile(temporaryPath);
+      try {
+        await removeTemporaryFile(temporaryPath);
+      } catch (error: unknown) {
+        cleanupError = error;
+      }
+    }
+    if (cleanupError !== undefined) {
+      throw new ConfigPersistenceError(
+        "Could not write active Codex configuration.",
+        {
+          cause: new AggregateError(
+            [error, cleanupError],
+            "Active Codex configuration write and cleanup both failed.",
+          ),
+        },
+      );
     }
     throw new ConfigPersistenceError(
       "Could not write active Codex configuration.",
@@ -375,10 +218,7 @@ async function removeTemporaryFile(path: string): Promise<void> {
     await nativeUnlink(path);
   } catch (error: unknown) {
     if (!isMissingFileError(error)) {
-      throw new ConfigPersistenceError(
-        "Could not clean up temporary active Codex configuration.",
-        { cause: error },
-      );
+      throw error;
     }
   }
 }
