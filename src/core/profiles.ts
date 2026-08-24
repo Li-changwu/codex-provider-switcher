@@ -1,6 +1,5 @@
 import {
   chmod as nativeChmod,
-  link as nativeLink,
   mkdir as nativeMkdir,
   open as nativeOpen,
   readFile as nativeReadFile,
@@ -116,7 +115,6 @@ export interface ProfileLockFileSystem {
     flags: "wx",
     mode: number,
   ): Promise<ProfileLockFileHandle>;
-  link(existingPath: string, newPath: string): Promise<void>;
   readFile(path: string): Promise<string>;
   unlinkStaleLock(path: string, expectedContents: string): Promise<void>;
   unlink(path: string): Promise<void>;
@@ -311,6 +309,11 @@ interface ProfileLockRecord {
 
 type ProfileLockRelease = () => Promise<void>;
 
+interface ProfileLockLease {
+  contents: string;
+  release: ProfileLockRelease;
+}
+
 async function acquireProfileFileLock(
   profilesDir: string,
   options: ProfileLockOptions,
@@ -367,6 +370,19 @@ async function tryAcquireProfileFileLock(
   lockPath: string,
   createdAt: number,
 ): Promise<ProfileLockRelease | undefined> {
+  const lease = await tryAcquireProfileLockLease(
+    fileSystem,
+    lockPath,
+    createdAt,
+  );
+  return lease?.release;
+}
+
+async function tryAcquireProfileLockLease(
+  fileSystem: ProfileLockFileSystem,
+  lockPath: string,
+  createdAt: number,
+): Promise<ProfileLockLease | undefined> {
   let handle: ProfileLockFileHandle;
   try {
     handle = await fileSystem.open(lockPath, "wx", linuxPrivateFileMode);
@@ -410,7 +426,10 @@ async function tryAcquireProfileFileLock(
     );
   }
 
-  return createProfileLockRelease(fileSystem, lockPath, contents);
+  return {
+    contents,
+    release: createProfileLockRelease(fileSystem, lockPath, contents),
+  };
 }
 
 function createProfileLockRelease(
@@ -509,14 +528,7 @@ async function acquireRecoveryGuard(
     staleLockMs,
     isProcessAlive,
   );
-  if (claimedContents !== undefined) {
-    return createProfileLockRelease(
-      fileSystem,
-      recoveryClaimPath,
-      claimedContents,
-    );
-  }
-  return tryAcquireProfileFileLock(fileSystem, recoveryLockPath, clock());
+  return claimedContents;
 }
 
 async function recoverStaleRecoveryGuard(
@@ -526,7 +538,7 @@ async function recoverStaleRecoveryGuard(
   clock: () => number,
   staleLockMs: number,
   isProcessAlive: (pid: number) => boolean | undefined,
-): Promise<string | undefined> {
+): Promise<ProfileLockRelease | undefined> {
   let contents: string;
   try {
     contents = await fileSystem.readFile(recoveryLockPath);
@@ -550,39 +562,43 @@ async function recoverStaleRecoveryGuard(
     return undefined;
   }
 
+  const releaseClaim = await acquireRecoveryClaim(
+    fileSystem,
+    recoveryClaimPath,
+    clock,
+    staleLockMs,
+    isProcessAlive,
+  );
+  if (!releaseClaim) {
+    return undefined;
+  }
+
+  let currentContents: string;
   try {
-    await fileSystem.link(recoveryLockPath, recoveryClaimPath);
+    currentContents = await fileSystem.readFile(recoveryLockPath);
   } catch (error: unknown) {
-    if (isMissingFileError(error) || isExistingFileError(error)) {
+    if (isMissingFileError(error)) {
+      await releaseClaim();
       return undefined;
+    }
+    try {
+      await releaseClaim();
+    } catch (cleanupError: unknown) {
+      throw new ProfileStoreError(
+        "persistence-failed",
+        "Could not release the profile recovery claim after inspection failed.",
+        { cause: cleanupError },
+      );
     }
     throw new ProfileStoreError(
       "persistence-failed",
-      "Could not claim the stale profile recovery guard.",
+      "Could not inspect the profile recovery guard after claiming it.",
       { cause: error },
     );
   }
 
-  let claimedContents: string;
-  try {
-    claimedContents = await fileSystem.readFile(recoveryClaimPath);
-  } catch (error: unknown) {
-    throw new ProfileStoreError(
-      "persistence-failed",
-      "Could not verify the stale profile recovery claim.",
-      { cause: error },
-    );
-  }
-  if (claimedContents !== contents) {
-    try {
-      await fileSystem.unlink(recoveryClaimPath);
-    } catch (error: unknown) {
-      throw new ProfileStoreError(
-        "persistence-failed",
-        "Could not clean up the lost profile recovery claim.",
-        { cause: error },
-      );
-    }
+  if (currentContents !== contents) {
+    await releaseClaim();
     return undefined;
   }
 
@@ -590,14 +606,14 @@ async function recoverStaleRecoveryGuard(
     await fileSystem.unlinkStaleLock(recoveryLockPath, contents);
   } catch (error: unknown) {
     if (isMissingFileError(error)) {
-      return contents;
+      return releaseClaim;
     }
     try {
-      await fileSystem.unlink(recoveryClaimPath);
+      await releaseClaim();
     } catch (cleanupError: unknown) {
       throw new ProfileStoreError(
         "persistence-failed",
-        "Could not clean up the profile recovery claim after a failed handoff.",
+        "Could not release the profile recovery claim after a failed handoff.",
         { cause: cleanupError },
       );
     }
@@ -608,7 +624,85 @@ async function recoverStaleRecoveryGuard(
     );
   }
 
-  return contents;
+  return releaseClaim;
+}
+
+async function acquireRecoveryClaim(
+  fileSystem: ProfileLockFileSystem,
+  recoveryClaimPath: string,
+  clock: () => number,
+  staleLockMs: number,
+  isProcessAlive: (pid: number) => boolean | undefined,
+): Promise<ProfileLockRelease | undefined> {
+  let contents: string;
+  try {
+    contents = await fileSystem.readFile(recoveryClaimPath);
+  } catch (error: unknown) {
+    if (isMissingFileError(error)) {
+      return tryAcquireRecoveryClaim(fileSystem, recoveryClaimPath, clock);
+    }
+    throw new ProfileStoreError(
+      "persistence-failed",
+      "Could not inspect the profile recovery claim.",
+      { cause: error },
+    );
+  }
+
+  const record = parseProfileLockRecord(contents);
+  if (
+    !record ||
+    clock() - record.createdAt < staleLockMs ||
+    isProcessAlive(record.pid) !== false
+  ) {
+    return undefined;
+  }
+
+  try {
+    await fileSystem.unlinkStaleLock(recoveryClaimPath, contents);
+  } catch (error: unknown) {
+    if (isMissingFileError(error)) {
+      return undefined;
+    }
+    throw new ProfileStoreError(
+      "persistence-failed",
+      "Could not reclaim the stale profile recovery claim.",
+      { cause: error },
+    );
+  }
+
+  return tryAcquireRecoveryClaim(fileSystem, recoveryClaimPath, clock);
+}
+
+async function tryAcquireRecoveryClaim(
+  fileSystem: ProfileLockFileSystem,
+  recoveryClaimPath: string,
+  clock: () => number,
+): Promise<ProfileLockRelease | undefined> {
+  const lease = await tryAcquireProfileLockLease(
+    fileSystem,
+    recoveryClaimPath,
+    clock(),
+  );
+  if (!lease) {
+    return undefined;
+  }
+
+  let claimContents: string;
+  try {
+    claimContents = await fileSystem.readFile(recoveryClaimPath);
+  } catch (error: unknown) {
+    throw new ProfileStoreError(
+      "persistence-failed",
+      "Could not verify the profile recovery claim.",
+      { cause: error },
+    );
+  }
+  if (claimContents !== lease.contents) {
+    await lease.release();
+    return undefined;
+  }
+
+  return lease.release;
 }
 
 async function profileLockFileExists(
@@ -945,7 +1039,6 @@ const nativeProfileLockFileSystem: ProfileLockFileSystem = {
   },
   open: nativeOpen,
   readFile: (path) => nativeReadFile(path, "utf8"),
-  link: nativeLink,
   async unlinkStaleLock(path, expectedContents) {
     if ((await nativeReadFile(path, "utf8")) !== expectedContents) {
       return;
