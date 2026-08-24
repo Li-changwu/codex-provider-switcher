@@ -104,10 +104,20 @@ function containsCredentialKey(value: unknown): boolean {
     return false;
   }
 
-  return Object.entries(value).some(
-    ([key, nestedValue]) =>
-      isCredentialKey(key) || containsCredentialKey(nestedValue),
-  );
+  return Object.entries(value).some(([key, nestedValue]) => {
+    const normalizedKey = normalizeConfigKey(key);
+    if (normalizedKey === "modelproviders") {
+      return containsProviderCredentialKey(nestedValue);
+    }
+    return isCredentialKey(key) || containsCredentialKey(nestedValue);
+  });
+}
+
+function containsProviderCredentialKey(value: unknown): boolean {
+  if (!isPlainRecord(value)) {
+    return containsCredentialKey(value);
+  }
+  return Object.values(value).some(containsCredentialKey);
 }
 
 function isCredentialKey(key: string): boolean {

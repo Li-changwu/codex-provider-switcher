@@ -31,6 +31,30 @@ test("validates custom TOML and returns its provider id without rewriting the in
   assert.equal(validated.text, validCustomConfig);
 });
 
+test("accepts credential-looking provider IDs and saves their raw custom profiles", async () => {
+  for (const providerId of ["token-proxy", "secret-proxy", "access-gateway"]) {
+    await withTemporaryLayout(async (layout) => {
+      const configText = [
+        `model_provider = "${providerId}"`,
+        `[model_providers."${providerId}"]`,
+        'base_url = "https://proxy.invalid/v1"',
+        'wire_api = "responses"',
+        "",
+      ].join("\n");
+
+      const validated = validateProfileConfig(configText, "custom");
+      assert.equal(validated.providerId, providerId);
+
+      const profile = await new ProfileStore(layout).create({
+        name: providerId,
+        kind: "custom",
+        configText,
+      });
+      assert.equal(await readFile(profile.configFile, "utf8"), configText);
+    });
+  }
+});
+
 test("accepts an official TOML baseline without requiring custom provider fields", () => {
   const officialConfig = "# official baseline\napproval_policy = \"on-request\"\n";
 
