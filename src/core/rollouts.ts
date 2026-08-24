@@ -8,10 +8,12 @@ import {
   unlink,
 } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
+import { TextDecoder } from "node:util";
 import type { CodexLayout } from "./types";
 
 const rolloutChangeProvenance = new WeakSet<object>();
 const rolloutChangeSnapshots = new WeakMap<object, RolloutChangeSnapshot>();
+const rolloutChangeMutationAttempts = new WeakSet<object>();
 type ProvenancedRolloutChange = RolloutChange;
 
 export interface RolloutReplacement {
@@ -50,6 +52,7 @@ export interface RolloutApplyOptions {
 export type RolloutValidationErrorCode =
   | "unsupported-layout"
   | "malformed-jsonl"
+  | "invalid-utf8"
   | "missing-session-id"
   | "unsupported-provider-metadata"
   | "change-mismatch";
@@ -173,8 +176,9 @@ interface RolloutChangeSnapshot {
 }
 
 interface JsonlLine {
+  bytes: Buffer;
   line: string;
-  separator: "\n" | "\r\n" | "";
+  separator: Buffer;
 }
 
 interface RootProperty {
@@ -239,7 +243,7 @@ async function scanRolloutFile(
   let encryptedContent = false;
   const replacements: RolloutReplacement[] = [];
 
-  for await (const entry of readJsonlLines(path, (chunk) => hash.update(chunk, "utf8"))) {
+  for await (const entry of readJsonlLines(path, (chunk) => hash.update(chunk))) {
     const record = parseJsonLine(path, lineNumber, entry.line);
     const properties = scanRootProperties(path, lineNumber, entry.line);
     assertUniqueRootKeys(path, lineNumber, properties);
@@ -363,11 +367,11 @@ async function scanRolloutFile(
 }
 
 function brandChange(change: RolloutChange): ProvenancedRolloutChange {
-  const exposedReplacements = Object.freeze(
-    change.replacements.map((replacement) => ({ ...replacement })),
-  );
   const snapshotReplacements = Object.freeze(
-    exposedReplacements.map((replacement) => Object.freeze({ ...replacement })),
+    change.replacements.map((replacement) => Object.freeze({ ...replacement })),
+  );
+  const exposedReplacements = Object.freeze(
+    snapshotReplacements.map((replacement) => createFrozenReplacement(replacement)),
   );
   const branded = {
     ...change,
@@ -385,6 +389,22 @@ function brandChange(change: RolloutChange): ProvenancedRolloutChange {
     replacements: snapshotReplacements,
   });
   return Object.freeze(branded);
+}
+
+function createFrozenReplacement(replacement: RolloutReplacement): RolloutReplacement {
+  const target = Object.freeze({ ...replacement });
+  let proxy: RolloutReplacement;
+  proxy = new Proxy(target, {
+    deleteProperty() {
+      rolloutChangeMutationAttempts.add(proxy);
+      throw new TypeError("Rollout replacements are immutable.");
+    },
+    set() {
+      rolloutChangeMutationAttempts.add(proxy);
+      throw new TypeError("Rollout replacements are immutable.");
+    },
+  });
+  return proxy;
 }
 
 function isProvenancedChange(value: unknown): value is ProvenancedRolloutChange {
@@ -447,6 +467,7 @@ function assertChangeSnapshot(change: ProvenancedRolloutChange): void {
     const current = change.replacements[index];
     const expected = snapshot.replacements[index];
     if (
+      rolloutChangeMutationAttempts.has(current) ||
       current.line !== expected.line ||
       current.start !== expected.start ||
       current.end !== expected.end ||
@@ -481,25 +502,35 @@ async function rewriteRollout(
     let replacementIndex = 0;
     let lineNumber = 0;
 
-    for await (const entry of readJsonlLines(change.path, (chunk) => hash.update(chunk, "utf8"))) {
-      let output = entry.line;
+    for await (const entry of readJsonlLines(change.path, (chunk) => hash.update(chunk))) {
+      let output = entry.bytes;
+      const lineReplacements: Buffer[] = [];
+      let sourceCursor = 0;
       while (replacementIndex < replacements.length && replacements[replacementIndex].line === lineNumber) {
         const replacement = replacements[replacementIndex];
         if (
           replacement.start < 0 ||
           replacement.end < replacement.start ||
-          replacement.end > output.length
+          replacement.end > entry.line.length
         ) {
           throw new RolloutValidationError(
             "change-mismatch",
             `Rollout replacement range is invalid: ${change.path}`,
           );
         }
-        output = `${output.slice(0, replacement.start)}${replacement.value}${output.slice(replacement.end)}`;
+        lineReplacements.push(
+          Buffer.from(entry.line.slice(sourceCursor, replacement.start), "utf8"),
+          Buffer.from(replacement.value, "utf8"),
+        );
+        sourceCursor = replacement.end;
         replacementIndex += 1;
       }
+      if (lineReplacements.length > 0) {
+        lineReplacements.push(Buffer.from(entry.line.slice(sourceCursor), "utf8"));
+        output = Buffer.concat(lineReplacements);
+      }
       throwIfAborted(signal);
-      await handle.write(`${output}${entry.separator}`, undefined, "utf8");
+      await handle.write(Buffer.concat([output, entry.separator]));
       lineNumber += 1;
     }
 
@@ -774,31 +805,53 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 
 async function* readJsonlLines(
   path: string,
-  onChunk?: (chunk: string) => void,
+  onChunk?: (chunk: Buffer) => void,
 ): AsyncGenerator<JsonlLine> {
-  const input = createReadStream(path, { encoding: "utf8" });
-  let pending = "";
+  const input = createReadStream(path);
+  let pending = Buffer.alloc(0);
+  let lineNumber = 0;
   try {
-    for await (const chunk of input as AsyncIterable<string>) {
-      onChunk?.(chunk);
-      pending += chunk;
-      let newlineIndex = pending.indexOf("\n");
+    for await (const chunk of input as AsyncIterable<Buffer>) {
+      const rawChunk = Buffer.from(chunk);
+      onChunk?.(rawChunk);
+      pending = pending.length === 0 ? rawChunk : Buffer.concat([pending, rawChunk]);
+      let newlineIndex = pending.indexOf(0x0a);
       while (newlineIndex >= 0) {
-        const rawLine = pending.slice(0, newlineIndex);
-        pending = pending.slice(newlineIndex + 1);
-        if (rawLine.endsWith("\r")) {
-          yield { line: rawLine.slice(0, -1), separator: "\r\n" };
-        } else {
-          yield { line: rawLine, separator: "\n" };
-        }
-        newlineIndex = pending.indexOf("\n");
+        const rawLine = Buffer.from(pending.subarray(0, newlineIndex));
+        pending = Buffer.from(pending.subarray(newlineIndex + 1));
+        const isCarriageReturn = rawLine.at(-1) === 0x0d;
+        const bytes = isCarriageReturn ? rawLine.subarray(0, -1) : rawLine;
+        yield {
+          bytes,
+          line: decodeJsonlLine(path, lineNumber, bytes),
+          separator: Buffer.from(isCarriageReturn ? "\r\n" : "\n", "ascii"),
+        };
+        lineNumber += 1;
+        newlineIndex = pending.indexOf(0x0a);
       }
     }
     if (pending.length > 0) {
-      yield { line: pending, separator: "" };
+      const bytes = Buffer.from(pending);
+      yield {
+        bytes,
+        line: decodeJsonlLine(path, lineNumber, bytes),
+        separator: Buffer.alloc(0),
+      };
     }
   } finally {
     input.destroy();
+  }
+}
+
+function decodeJsonlLine(path: string, lineNumber: number, bytes: Buffer): string {
+  try {
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch (error: unknown) {
+    throw new RolloutValidationError(
+      "invalid-utf8",
+      `Rollout contains invalid UTF-8 at line ${lineNumber + 1}: ${path}`,
+      { cause: error },
+    );
   }
 }
 

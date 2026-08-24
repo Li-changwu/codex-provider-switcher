@@ -60,6 +60,26 @@ test("updates actual session_meta provider metadata and preserves every other by
   });
 });
 
+test("rejects invalid UTF-8 before writing a rollout or changing its bytes", async () => {
+  await withLayout(async (layout) => {
+    const path = join(layout.sessionsDir, "invalid-utf8.jsonl");
+    const before = Buffer.concat([
+      Buffer.from(`${sessionMetaLine("invalid-bytes", "openai")}\n`, "utf8"),
+      Buffer.from('{"type":"message","raw":"', "utf8"),
+      Buffer.from([0xc3, 0x28]),
+      Buffer.from('"}\n', "utf8"),
+    ]);
+    await writeFile(path, before);
+
+    await assert.rejects(
+      () => collectRolloutChanges(layout, "custom"),
+      (error: unknown) =>
+        error instanceof RolloutValidationError && error.code === "invalid-utf8",
+    );
+    assert.deepEqual(await readFile(path), before);
+  });
+});
+
 test("rejects malformed JSONL during preflight before writing any file", async () => {
   await withLayout(async (layout) => {
     const validPath = join(layout.sessionsDir, "valid.jsonl");
@@ -220,7 +240,15 @@ test("rejects a scan change after its replacement value is modified", async () =
     await writeFile(path, before, "utf8");
     const changes = await collectRolloutChanges(layout, "custom");
     assert.equal(changes.length, 1);
-    changes[0].replacements[0].value = JSON.stringify("forged");
+    assert.equal(Object.isFrozen(changes[0]), true);
+    assert.equal(Object.isFrozen(changes[0].replacements), true);
+    assert.equal(Object.isFrozen(changes[0].replacements[0]), true);
+    assert.throws(
+      () => {
+        changes[0].replacements[0].value = JSON.stringify("forged");
+      },
+      TypeError,
+    );
 
     await assert.rejects(
       () => applyRolloutChanges(changes),
