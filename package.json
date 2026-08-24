@@ -3,6 +3,7 @@
   "displayName": "Codex Provider Switcher",
   "version": "0.1.0",
   "private": true,
+  "publisher": "Li-changwu",
   "engines": {
     "vscode": "^1.92.0"
   },
@@ -32,7 +33,16 @@
         "command": "codexProvider.restoreBackup",
         "title": "Codex: Restore Backup"
       }
-    ]
+    ],
+    "menus": {
+      "statusBar": [
+        {
+          "command": "codexProvider.switchProfile",
+          "when": "true",
+          "group": "navigation"
+        }
+      ]
+    }
   },
   "scripts": {
     "build": "node esbuild.mjs",

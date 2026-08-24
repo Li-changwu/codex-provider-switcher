@@ -11,15 +11,20 @@ const packagePath = resolve(
 
 test("declares the VS Code extension manifest contract", async () => {
   const manifest = JSON.parse(await readFile(packagePath, "utf8")) as {
+    publisher?: string;
     engines?: { vscode?: string };
     main?: string;
     browser?: string;
     activationEvents?: string[];
     contributes?: {
       commands?: Array<{ command?: string }>;
+      menus?: {
+        statusBar?: Array<{ command?: string }>;
+      };
     };
   };
 
+  assert.equal(manifest.publisher, "Li-changwu");
   assert.equal(manifest.engines?.vscode, "^1.92.0");
   assert.equal(manifest.main, "./dist/extension.js");
   assert.equal(manifest.browser, undefined);
@@ -37,5 +42,11 @@ test("declares the VS Code extension manifest contract", async () => {
       "codexProvider.syncSessions",
       "codexProvider.switchProfile",
     ].sort(),
+  );
+
+  assert.ok(
+    manifest.contributes?.menus?.statusBar?.some(
+      (entry) => entry.command === "codexProvider.switchProfile",
+    ),
   );
 });
