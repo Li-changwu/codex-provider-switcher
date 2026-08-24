@@ -60,6 +60,7 @@ export interface SqliteUpdateResult {
 interface TableInfoRow {
   name: string;
   type: string;
+  hidden: number;
 }
 
 interface SupportedSchema {
@@ -319,14 +320,16 @@ async function readSupportedSchema(
   throwIfCancelled(signal);
   const columns = await allRows<TableInfoRow>(
     database,
-    "PRAGMA table_info(threads)",
+    "PRAGMA table_xinfo(threads)",
   );
   throwIfCancelled(signal);
-  const unknownColumn = columns.find((column) => !allowedThreadColumns.has(column.name));
-  if (unknownColumn) {
+  const unsupportedColumn = columns.find(
+    (column) => !allowedThreadColumns.has(column.name) || column.hidden !== 0,
+  );
+  if (unsupportedColumn) {
     throw new SqliteError(
       "unknown-column",
-      `The threads table contains an unsupported column: ${unknownColumn.name}.`,
+      `The threads table contains an unsupported or hidden column: ${unsupportedColumn.name}.`,
     );
   }
   const idColumn = columns.find((column) => column.name === "id");

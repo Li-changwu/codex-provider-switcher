@@ -128,6 +128,41 @@ test("rejects an unknown threads column without writing", async () => {
   });
 });
 
+test("rejects a generated threads column without writing", async () => {
+  await withDatabase(async (layout, database) => {
+    await createDatabase(
+      database,
+      5,
+      `CREATE TABLE threads (
+         id TEXT,
+         model_provider TEXT,
+         title TEXT,
+         encrypted_content TEXT,
+         secret TEXT GENERATED ALWAYS AS (title) STORED
+       )`,
+    );
+    await run(
+      database,
+      "INSERT INTO threads (id, model_provider, title, encrypted_content) VALUES (?, ?, ?, ?)",
+      "one",
+      "openai",
+      "Keep",
+      null,
+    );
+    const before = await readFile(layout.sqlitePath);
+
+    await assert.rejects(
+      () => updateProviderMetadata(layout, "switched"),
+      (error: unknown) => error instanceof SqliteError && error.code === "unknown-column",
+    );
+
+    assert.deepEqual(await readThreads(database), [
+      { id: "one", provider: "openai", title: "Keep", encrypted: null },
+    ]);
+    assert.deepEqual(await readFile(layout.sqlitePath), before);
+  });
+});
+
 test("rolls back provider changes when the transaction fails", async () => {
   await withDatabase(async (layout, database) => {
     await createDatabase(
