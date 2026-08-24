@@ -153,6 +153,40 @@ test("recovers a stale profile lock owned by a known-dead process", async () => 
   });
 });
 
+test("recovers a stale profile lock recovery guard owned by a known-dead process", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const profilesDir = join(layout.switcherDir, "profiles");
+    const lockPath = join(profilesDir, ".create.lock");
+    const recoveryLockPath = join(profilesDir, ".create.lock.recovery");
+    const staleContents = JSON.stringify({ pid: 12345, createdAt: 0 });
+    await mkdir(profilesDir, { recursive: true });
+    await writeFile(lockPath, staleContents, "utf8");
+    await writeFile(recoveryLockPath, staleContents, "utf8");
+
+    const store = new ProfileStore(layout, {
+      lockOptions: {
+        clock: () => 10_000,
+        isProcessAlive: () => false,
+        lockRetryMs: 1,
+        lockTimeoutMs: 10,
+        staleLockMs: 1,
+      },
+    });
+
+    const profile = await store.create({
+      name: "Recovered Guard",
+      kind: "official",
+      configText: 'model_provider = "openai"\n',
+    });
+
+    assert.equal(profile.id, "recovered-guard");
+    await assert.rejects(() => readFile(lockPath, "utf8"), { code: "ENOENT" });
+    await assert.rejects(() => readFile(recoveryLockPath, "utf8"), {
+      code: "ENOENT",
+    });
+  });
+});
+
 test("serializes interleaved stale lock recovery without unlinking a live lock", async () => {
   await withTemporaryLayout(async (layout) => {
     const profilesDir = join(layout.switcherDir, "profiles");
