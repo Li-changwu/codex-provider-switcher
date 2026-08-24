@@ -3,6 +3,7 @@ import {
   chmod,
   mkdir,
   mkdtemp,
+  open,
   readFile,
   rename,
   rm,
@@ -17,6 +18,8 @@ import {
   ProfileStore,
   ProfileStoreError,
   type ProfileFileSystem,
+  type ProfileLockFileSystem,
+  type ProfileLockOptions,
 } from "../../src/core/profiles";
 import {
   SecretStore,
@@ -147,6 +150,110 @@ test("recovers a stale profile lock owned by a known-dead process", async () => 
 
     assert.equal(profile.id, "recovered-lock");
     await assert.rejects(() => readFile(lockPath, "utf8"), { code: "ENOENT" });
+  });
+});
+
+test("serializes interleaved stale lock recovery without unlinking a live lock", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const profilesDir = join(layout.switcherDir, "profiles");
+    const lockPath = join(profilesDir, ".create.lock");
+    const recoveryLockPath = join(profilesDir, ".create.lock.recovery");
+    const staleContents = JSON.stringify({ pid: 12345, createdAt: 0 });
+    await mkdir(profilesDir, { recursive: true });
+    await writeFile(lockPath, staleContents, "utf8");
+
+    const lockFileSystem = new InterleavingProfileLockFileSystem(
+      lockPath,
+      recoveryLockPath,
+      staleContents,
+    );
+    const lockOptions: ProfileLockOptions = {
+      clock: () => 10_000,
+      isProcessAlive: (pid: number) => pid === process.pid,
+      lockRetryMs: 1,
+      lockTimeoutMs: 1_000,
+      staleLockMs: 1,
+      fileSystem: lockFileSystem,
+    };
+    const firstStore = new ProfileStore(layout, { lockOptions });
+    const secondStore = new ProfileStore(layout, { lockOptions });
+    const firstCreate = firstStore.create({
+      name: "First Reclaimer",
+      kind: "official",
+      configText: 'model_provider = "openai"\n',
+    });
+    let secondCreate: Promise<ProfileRecord> | undefined;
+
+    try {
+      await lockFileSystem.waitForFirstReclaimerValidation();
+      secondCreate = secondStore.create({
+        name: "Second Reclaimer",
+        kind: "official",
+        configText: 'model_provider = "openai"\n',
+      });
+      await lockFileSystem.waitForRecoveryGuardContention();
+      lockFileSystem.releaseFirstReclaimer();
+
+      const [first, second] = await Promise.all([firstCreate, secondCreate]);
+      assert.deepEqual(
+        [first.id, second.id].sort(),
+        ["first-reclaimer", "second-reclaimer"],
+      );
+      assert.equal(lockFileSystem.liveLockUnlinkAttempts, 0);
+      assert.deepEqual(
+        (await firstStore.list()).map((profile) => profile.id).sort(),
+        ["first-reclaimer", "second-reclaimer"],
+      );
+    } finally {
+      lockFileSystem.releaseFirstReclaimer();
+      await Promise.allSettled(
+        [firstCreate, secondCreate].filter(
+          (create): create is Promise<ProfileRecord> => create !== undefined,
+        ),
+      );
+    }
+  });
+});
+
+test("fails closed when recovery guard cleanup fails", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const profilesDir = join(layout.switcherDir, "profiles");
+    const lockPath = join(profilesDir, ".create.lock");
+    const recoveryLockPath = join(profilesDir, ".create.lock.recovery");
+    await mkdir(profilesDir, { recursive: true });
+    await writeFile(lockPath, JSON.stringify({ pid: 12345, createdAt: 0 }), "utf8");
+
+    const lockFileSystem = new FailingRecoveryGuardCleanupLockFileSystem(
+      recoveryLockPath,
+    );
+    const store = new ProfileStore(layout, {
+      lockOptions: {
+        clock: () => 10_000,
+        isProcessAlive: () => false,
+        lockRetryMs: 1,
+        lockTimeoutMs: 10,
+        staleLockMs: 1,
+        fileSystem: lockFileSystem,
+      },
+    });
+
+    await assert.rejects(
+      () =>
+        store.create({
+          name: "Recovery Cleanup Failure",
+          kind: "official",
+          configText: 'model_provider = "openai"\n',
+        }),
+      (error: unknown) =>
+        error instanceof ProfileStoreError && error.code === "persistence-failed",
+    );
+    await assert.rejects(
+      () => readFile(join(profilesDir, "recovery-cleanup-failure", "config.toml"), "utf8"),
+      { code: "ENOENT" },
+    );
+    await assert.rejects(() => readFile(join(profilesDir, "index.json"), "utf8"), {
+      code: "ENOENT",
+    });
   });
 });
 
@@ -482,7 +589,7 @@ test("preserves valid non-secret TOML text without reserialization", async () =>
       '"model-provider" = "research"',
       '[model_providers."research endpoint"]',
       'base_url = "https://proxy.invalid/v1"',
-      "retry = { max_attempts = 3, enabled = true }",
+      "request_max_retries = 3",
       "",
     ].join("\n");
 
@@ -494,6 +601,81 @@ test("preserves valid non-secret TOML text without reserialization", async () =>
 
     assert.equal(await readFile(profile.configFile, "utf8"), configText);
   });
+});
+
+test("accepts documented non-secret provider configuration fields", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const store = new ProfileStore(layout);
+    const configText = [
+      'model_provider = "research"',
+      'model = "research-model"',
+      'model_reasoning_effort = "high"',
+      'model_verbosity = "low"',
+      'approval_policy = "never"',
+      'sandbox_mode = "workspace-write"',
+      "project_doc_max_bytes = 4096",
+      "[model_providers.research]",
+      'name = "Research Proxy"',
+      'base_url = "https://proxy.invalid/v1"',
+      'wire_api = "responses"',
+      "request_max_retries = 3",
+      "stream_max_retries = 4",
+      "stream_idle_timeout_ms = 30000",
+      "requires_openai_auth = false",
+      "supports_websockets = true",
+      'query_params = { api_version = "v1" }',
+      "",
+    ].join("\n");
+
+    const profile = await store.create({
+      name: "Documented Provider",
+      kind: "official",
+      configText,
+    });
+
+    assert.equal(await readFile(profile.configFile, "utf8"), configText);
+  });
+});
+
+test("rejects undocumented generic provider retry and timeout fields", async () => {
+  for (const [name, configText] of [
+    [
+      "Generic Timeout",
+      '[model_providers.research]\ntimeout = 1000\n',
+    ],
+    [
+      "Generic Retries",
+      '[model_providers.research]\nretries = 3\n',
+    ],
+    [
+      "Generic Retry Table",
+      '[model_providers.research.retry]\nmax_attempts = 3\n',
+    ],
+  ]) {
+    await withTemporaryLayout(async (layout) => {
+      const store = new ProfileStore(layout);
+      const id = name.toLowerCase().replace(/ /g, "-");
+      const profilesDir = join(layout.switcherDir, "profiles");
+
+      await assert.rejects(
+        () =>
+          store.create({
+            name,
+            kind: "official",
+            configText,
+          }),
+        (error: unknown) =>
+          error instanceof ProfileStoreError && error.code === "invalid-config",
+      );
+      await assert.rejects(
+        () => readFile(join(profilesDir, id, "config.toml"), "utf8"),
+        { code: "ENOENT" },
+      );
+      await assert.rejects(() => readFile(join(profilesDir, "index.json"), "utf8"), {
+        code: "ENOENT",
+      });
+    });
+  }
 });
 
 test("uses same-directory atomic renames and requests Linux 0600 file modes", async () => {
@@ -814,6 +996,118 @@ class FirstIndexReadBarrierProfileFileSystem extends RecordingProfileFileSystem 
   }
 }
 
+class InterleavingProfileLockFileSystem
+  extends RecordingProfileFileSystem
+  implements ProfileLockFileSystem
+{
+  liveLockUnlinkAttempts = 0;
+  private firstValidationReleased = false;
+  private firstStaleReadCount = 0;
+  private recoveryGuardContentionResolved = false;
+  private releaseFirstValidationBarrier!: () => void;
+  private resolveFirstValidation!: () => void;
+  private resolveRecoveryGuardContention!: () => void;
+  private readonly firstValidation = new Promise<void>((resolve) => {
+    this.resolveFirstValidation = resolve;
+  });
+  private readonly firstValidationBarrier = new Promise<void>((resolve) => {
+    this.releaseFirstValidationBarrier = resolve;
+  });
+  private readonly recoveryGuardContention = new Promise<void>((resolve) => {
+    this.resolveRecoveryGuardContention = resolve;
+  });
+
+  constructor(
+    private readonly profileLockPath: string,
+    private readonly recoveryLockPath: string,
+    private readonly staleContents: string,
+  ) {
+    super();
+  }
+
+  async waitForFirstReclaimerValidation(): Promise<void> {
+    await withTimeout(this.firstValidation, "first stale lock validation");
+  }
+
+  async waitForRecoveryGuardContention(): Promise<void> {
+    await withTimeout(this.recoveryGuardContention, "recovery guard contention");
+  }
+
+  releaseFirstReclaimer(): void {
+    if (!this.firstValidationReleased) {
+      this.firstValidationReleased = true;
+      this.releaseFirstValidationBarrier();
+    }
+  }
+
+  async open(path: string, flags: "wx", mode: number) {
+    try {
+      return await open(path, flags, mode);
+    } catch (error: unknown) {
+      if (
+        path === this.recoveryLockPath &&
+        (error as NodeJS.ErrnoException).code === "EEXIST" &&
+        !this.recoveryGuardContentionResolved
+      ) {
+        this.recoveryGuardContentionResolved = true;
+        this.resolveRecoveryGuardContention();
+      }
+      throw error;
+    }
+  }
+
+  override async readFile(path: string): Promise<string> {
+    const contents = await super.readFile(path);
+    if (path === this.profileLockPath && contents === this.staleContents) {
+      this.firstStaleReadCount += 1;
+      if (this.firstStaleReadCount === 1 && !this.firstValidationReleased) {
+        this.resolveFirstValidation();
+        await this.firstValidationBarrier;
+      }
+    }
+    return contents;
+  }
+
+  override async unlink(path: string): Promise<void> {
+    await super.unlink(path);
+  }
+
+  async unlinkStaleLock(path: string, expectedContents: string): Promise<void> {
+    if (path === this.profileLockPath) {
+      const contents = await readFile(path, "utf8");
+      if (contents !== expectedContents || contents !== this.staleContents) {
+        this.liveLockUnlinkAttempts += 1;
+        throw createFileSystemError("EPERM", "attempted to remove a live profile lock");
+      }
+    }
+    await super.unlink(path);
+  }
+}
+
+class FailingRecoveryGuardCleanupLockFileSystem
+  extends RecordingProfileFileSystem
+  implements ProfileLockFileSystem
+{
+  constructor(private readonly recoveryLockPath: string) {
+    super();
+  }
+
+  async open(path: string, flags: "wx", mode: number) {
+    return open(path, flags, mode);
+  }
+
+  override async unlink(path: string): Promise<void> {
+    if (path === this.recoveryLockPath) {
+      throw createFileSystemError("EIO", "recovery guard cleanup failed");
+    }
+    await super.unlink(path);
+  }
+
+  async unlinkStaleLock(path: string): Promise<void> {
+    await this.unlink(path);
+  }
+}
+
 class FailingMkdirProfileFileSystem extends RecordingProfileFileSystem {
   readonly failure = createFileSystemError("EACCES", "profile directory denied");
 
@@ -942,4 +1236,23 @@ function isPersistenceErrorWithCause(
     error.code === "persistence-failed" &&
     (error as Error & { cause?: unknown }).cause === cause
   );
+}
+
+async function withTimeout<T>(promise: Promise<T>, description: string): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timeoutId = setTimeout(
+          () => reject(new Error(`Timed out waiting for ${description}.`)),
+          500,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId);
+    }
+  }
 }

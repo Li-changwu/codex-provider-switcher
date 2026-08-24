@@ -17,6 +17,7 @@ const indexFileName = "index.json";
 const linuxPrivateFileMode = 0o600;
 const profileSecretNamespace = "codex-provider-switcher.profile";
 const profileLockFileName = ".create.lock";
+const profileLockRecoveryFileName = ".create.lock.recovery";
 const defaultLockRetryMs = 25;
 const defaultLockTimeoutMs = 1_000;
 const defaultStaleLockMs = 5 * 60_000;
@@ -58,12 +59,14 @@ const topLevelScalarConfigKeys = new Set([
 ]);
 const topLevelNumericConfigKeys = new Set(["projectdocmaxbytes"]);
 const providerStringConfigKeys = new Set(["name", "baseurl", "wireapi"]);
-const providerNumericConfigKeys = new Set(["timeout", "retries"]);
-const retryConfigKeys = new Set([
-  "enabled",
-  "maxattempts",
-  "initialbackoffms",
-  "maxbackoffms",
+const providerNumericConfigKeys = new Set([
+  "requestmaxretries",
+  "streammaxretries",
+  "streamidletimeoutms",
+]);
+const providerBooleanConfigKeys = new Set([
+  "requiresopenaiauth",
+  "supportswebsockets",
 ]);
 
 export interface ProfileFileSystem {
@@ -92,10 +95,28 @@ export interface ProfileStoreOptions {
 
 export interface ProfileLockOptions {
   clock?: () => number;
+  fileSystem?: ProfileLockFileSystem;
   isProcessAlive?: (pid: number) => boolean | undefined;
   lockRetryMs?: number;
   lockTimeoutMs?: number;
   staleLockMs?: number;
+}
+
+export interface ProfileLockFileHandle {
+  writeFile(contents: string, encoding: BufferEncoding): Promise<void>;
+  close(): Promise<void>;
+}
+
+export interface ProfileLockFileSystem {
+  mkdir(path: string): Promise<void>;
+  open(
+    path: string,
+    flags: "wx",
+    mode: number,
+  ): Promise<ProfileLockFileHandle>;
+  readFile(path: string): Promise<string>;
+  unlinkStaleLock(path: string, expectedContents: string): Promise<void>;
+  unlink(path: string): Promise<void>;
 }
 
 export type ProfileStoreErrorCode =
@@ -292,6 +313,7 @@ async function acquireProfileFileLock(
   options: ProfileLockOptions,
 ): Promise<ProfileLockRelease> {
   const lockPath = join(profilesDir, profileLockFileName);
+  const fileSystem = options.fileSystem ?? nativeProfileLockFileSystem;
   const clock = options.clock ?? Date.now;
   const isProcessAlive = options.isProcessAlive ?? defaultIsProcessAlive;
   const retryMs = Math.max(1, options.lockRetryMs ?? defaultLockRetryMs);
@@ -300,7 +322,7 @@ async function acquireProfileFileLock(
   const attempts = Math.max(1, Math.floor(timeoutMs / retryMs) + 1);
 
   try {
-    await nativeMkdir(profilesDir, { recursive: true });
+    await fileSystem.mkdir(profilesDir);
   } catch (error: unknown) {
     throw new ProfileStoreError(
       "persistence-failed",
@@ -310,12 +332,17 @@ async function acquireProfileFileLock(
   }
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const acquired = await tryAcquireProfileFileLock(lockPath, clock());
+    const acquired = await tryAcquireProfileFileLock(
+      fileSystem,
+      lockPath,
+      clock(),
+    );
     if (acquired) {
       return acquired;
     }
 
     await recoverStaleProfileFileLock(
+      fileSystem,
       lockPath,
       clock,
       staleLockMs,
@@ -333,12 +360,13 @@ async function acquireProfileFileLock(
 }
 
 async function tryAcquireProfileFileLock(
+  fileSystem: ProfileLockFileSystem,
   lockPath: string,
   createdAt: number,
 ): Promise<ProfileLockRelease | undefined> {
-  let handle: Awaited<ReturnType<typeof nativeOpen>>;
+  let handle: ProfileLockFileHandle;
   try {
-    handle = await nativeOpen(lockPath, "wx", linuxPrivateFileMode);
+    handle = await fileSystem.open(lockPath, "wx", linuxPrivateFileMode);
   } catch (error: unknown) {
     if (isExistingFileError(error)) {
       return undefined;
@@ -364,7 +392,7 @@ async function tryAcquireProfileFileLock(
   }
   if (writeError !== undefined) {
     try {
-      await nativeUnlink(lockPath);
+      await fileSystem.unlink(lockPath);
     } catch (cleanupError: unknown) {
       throw new ProfileStoreError(
         "rollback-failed",
@@ -381,10 +409,10 @@ async function tryAcquireProfileFileLock(
 
   return async () => {
     try {
-      if ((await nativeReadFile(lockPath, "utf8")) !== contents) {
+      if ((await fileSystem.readFile(lockPath)) !== contents) {
         throw new Error("Profile lock ownership changed.");
       }
-      await nativeUnlink(lockPath);
+      await fileSystem.unlink(lockPath);
     } catch (error: unknown) {
       throw new ProfileStoreError(
         "persistence-failed",
@@ -396,6 +424,37 @@ async function tryAcquireProfileFileLock(
 }
 
 async function recoverStaleProfileFileLock(
+  fileSystem: ProfileLockFileSystem,
+  lockPath: string,
+  clock: () => number,
+  staleLockMs: number,
+  isProcessAlive: (pid: number) => boolean | undefined,
+): Promise<void> {
+  const recoveryLockPath = join(dirname(lockPath), profileLockRecoveryFileName);
+  const releaseRecoveryGuard = await tryAcquireProfileFileLock(
+    fileSystem,
+    recoveryLockPath,
+    clock(),
+  );
+  if (!releaseRecoveryGuard) {
+    return;
+  }
+
+  try {
+    await recoverStaleProfileFileLockWhileGuarded(
+      fileSystem,
+      lockPath,
+      clock,
+      staleLockMs,
+      isProcessAlive,
+    );
+  } finally {
+    await releaseRecoveryGuard();
+  }
+}
+
+async function recoverStaleProfileFileLockWhileGuarded(
+  fileSystem: ProfileLockFileSystem,
   lockPath: string,
   clock: () => number,
   staleLockMs: number,
@@ -403,7 +462,7 @@ async function recoverStaleProfileFileLock(
 ): Promise<void> {
   let contents: string;
   try {
-    contents = await nativeReadFile(lockPath, "utf8");
+    contents = await fileSystem.readFile(lockPath);
   } catch (error: unknown) {
     if (isMissingFileError(error)) {
       return;
@@ -425,10 +484,7 @@ async function recoverStaleProfileFileLock(
   }
 
   try {
-    if ((await nativeReadFile(lockPath, "utf8")) !== contents) {
-      return;
-    }
-    await nativeUnlink(lockPath);
+    await fileSystem.unlinkStaleLock(lockPath, contents);
   } catch (error: unknown) {
     if (isMissingFileError(error)) {
       return;
@@ -538,6 +594,9 @@ function containsCredentialKey(value: unknown): boolean {
 
 function isCredentialKey(key: string): boolean {
   const normalizedKey = normalizeConfigKey(key);
+  if (normalizedKey === "requiresopenaiauth") {
+    return false;
+  }
   return [...credentialKeyNames].some((credentialKeyName) =>
     normalizedKey.endsWith(credentialKeyName),
   );
@@ -587,8 +646,10 @@ function assertProviderConfig(value: unknown): void {
     ) {
       continue;
     }
-    if (normalizedKey === "retry") {
-      assertRetryConfig(fieldValue);
+    if (
+      providerBooleanConfigKeys.has(normalizedKey) &&
+      typeof fieldValue === "boolean"
+    ) {
       continue;
     }
     if (normalizedKey === "queryparams") {
@@ -596,20 +657,6 @@ function assertProviderConfig(value: unknown): void {
       continue;
     }
     throwInvalidProfileConfig();
-  }
-}
-
-function assertRetryConfig(value: unknown): void {
-  if (!isConfigRecord(value)) {
-    throwInvalidProfileConfig();
-  }
-  for (const [key, fieldValue] of Object.entries(value)) {
-    if (
-      !retryConfigKeys.has(normalizeConfigKey(key)) ||
-      !isConfigScalar(fieldValue)
-    ) {
-      throwInvalidProfileConfig();
-    }
   }
 }
 
@@ -712,5 +759,20 @@ const nativeProfileFileSystem: ProfileFileSystem = {
   },
   rename: nativeRename,
   chmod: nativeChmod,
+  unlink: nativeUnlink,
+};
+
+const nativeProfileLockFileSystem: ProfileLockFileSystem = {
+  async mkdir(path) {
+    await nativeMkdir(path, { recursive: true });
+  },
+  open: nativeOpen,
+  readFile: (path) => nativeReadFile(path, "utf8"),
+  async unlinkStaleLock(path, expectedContents) {
+    if ((await nativeReadFile(path, "utf8")) !== expectedContents) {
+      return;
+    }
+    await nativeUnlink(path);
+  },
   unlink: nativeUnlink,
 };
