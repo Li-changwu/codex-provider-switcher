@@ -8,10 +8,11 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import {
+  ConfigPersistenceError,
   removeActiveCustomAuth,
   serializeActiveAuth,
   validateProfileConfig,
@@ -341,6 +342,123 @@ test("cleans up an active custom auth file and tolerates a missing one", async (
   });
 });
 
+test("durably publishes and removes active custom auth before returning", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const events: string[] = [];
+    await writeActiveCustomAuth(layout, "synthetic-secret", {
+      async syncFile(path: string) {
+        assert.notEqual(path, layout.authPath);
+        assert.equal(await readFile(path, "utf8"), '{"OPENAI_API_KEY":"synthetic-secret"}');
+        events.push("file");
+      },
+      async syncDirectory(path: string) {
+        assert.equal(path, dirname(layout.authPath));
+        assert.equal(await readFile(layout.authPath, "utf8"), '{"OPENAI_API_KEY":"synthetic-secret"}');
+        events.push("write-parent");
+      },
+    } as never);
+    assert.deepEqual(events, ["file", "write-parent"]);
+
+    await removeActiveCustomAuth(layout, {
+      async syncDirectory(path: string) {
+        assert.equal(path, dirname(layout.authPath));
+        await assert.rejects(() => readFile(layout.authPath, "utf8"), { code: "ENOENT" });
+        events.push("remove-parent");
+      },
+    } as never);
+    assert.deepEqual(events, ["file", "write-parent", "remove-parent"]);
+  });
+});
+
+test("fails closed and redacts active auth durability sync failures", async (t) => {
+  await t.test("write parent", async () => {
+    await withTemporaryLayout(async (layout) => {
+      const credential = "sk-synthetic-write-credential";
+      const transcript = "synthetic write transcript with request and response bodies";
+      const syncError = new AggregateError(
+        [
+          new Error(`write failed while handling ${credential}`),
+          new Error(`captured transcript: ${transcript}`),
+        ],
+        "synthetic auth write parent sync failure",
+      );
+      await assert.rejects(
+        () => writeActiveCustomAuth(layout, credential, {
+          async syncDirectory() {
+            throw syncError;
+          },
+        } as never),
+        (error: unknown) => assertSecureAuthPersistenceError(
+          error,
+          syncError,
+          "Could not write active Codex configuration.",
+          [credential, transcript],
+        ),
+      );
+    });
+  });
+
+  await t.test("remove parent ENOENT", async () => {
+    await withTemporaryLayout(async (layout) => {
+      const credential = "sk-synthetic-remove-credential";
+      const transcript = "synthetic remove transcript with request and response bodies";
+      await writeActiveCustomAuth(layout, credential);
+      const syncError = Object.assign(
+        new Error(`remove failed for ${credential}; transcript: ${transcript}`),
+        { code: "ENOENT" },
+      );
+      await assert.rejects(
+        () => removeActiveCustomAuth(layout, {
+          async syncDirectory() {
+            throw syncError;
+          },
+        } as never),
+        (error: unknown) => assertSecureAuthPersistenceError(
+          error,
+          syncError,
+          "Could not remove the active custom authentication file.",
+          [credential, transcript],
+        ),
+      );
+      await assert.rejects(() => readFile(layout.authPath, "utf8"), { code: "ENOENT" });
+    });
+  });
+});
+
+test("keeps active auth unchanged and redacts temporary auth-file sync failures", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const originalAuth = '{"OPENAI_API_KEY":"existing-active-value"}';
+    const credential = "sk-synthetic-temporary-sync-credential";
+    const transcript = "synthetic temporary sync transcript marker";
+    const syncError = new AggregateError(
+      [
+        new Error(`temporary sync failed for ${credential}`),
+        new Error(`captured transcript: ${transcript}`),
+      ],
+      "synthetic temporary auth-file sync failure",
+    );
+    await writeFile(layout.authPath, originalAuth, "utf8");
+
+    await assert.rejects(
+      () => writeActiveCustomAuth(layout, credential, {
+        async syncFile(path: string) {
+          assert.notEqual(path, layout.authPath);
+          throw syncError;
+        },
+      }),
+      (error: unknown) => assertSecureAuthPersistenceError(
+        error,
+        syncError,
+        "Could not write active Codex configuration.",
+        [credential, transcript],
+      ),
+    );
+
+    assert.equal(await readFile(layout.authPath, "utf8"), originalAuth);
+    assert.deepEqual(await readdir(layout.codexHome), ["auth.json"]);
+  });
+});
+
 test("cleans a failed temporary config write without changing the active file", async () => {
   await withTemporaryLayout(async (layout) => {
     await mkdir(layout.configPath, { recursive: true });
@@ -350,6 +468,62 @@ test("cleans a failed temporary config write without changing the active file", 
     assert.deepEqual(await readdir(layout.codexHome), ["config.toml"]);
   });
 });
+
+function assertSecureAuthPersistenceError(
+  error: unknown,
+  rawError: Error,
+  expectedMessage: string,
+  sensitiveValues: readonly string[],
+): true {
+  assert.ok(error instanceof ConfigPersistenceError);
+  assert.equal(error.message, expectedMessage);
+
+  const reachable = collectReachableErrorDetails(error);
+  for (const sensitiveValue of sensitiveValues) {
+    assert.equal(reachable.text.includes(sensitiveValue), false);
+  }
+  assert.ok(reachable.count <= 2);
+  assert.notEqual(error.cause, rawError);
+  assert.ok(error.cause instanceof Error);
+  assert.equal(
+    error.cause.message,
+    "Authentication persistence failure details are redacted.",
+  );
+  assert.equal(error.cause.cause, undefined);
+  return true;
+}
+
+function collectReachableErrorDetails(error: unknown): {
+  count: number;
+  text: string;
+} {
+  const pending: unknown[] = [error];
+  const seen = new Set<unknown>();
+  const details: string[] = [];
+
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (current === undefined || seen.has(current)) {
+      continue;
+    }
+    seen.add(current);
+
+    if (!(current instanceof Error)) {
+      details.push(String(current));
+      continue;
+    }
+
+    details.push([current.name, current.message, current.stack ?? ""].join("\n"));
+    if (current.cause !== undefined) {
+      pending.push(current.cause);
+    }
+    if (current instanceof AggregateError) {
+      pending.push(...current.errors);
+    }
+  }
+
+  return { count: seen.size, text: details.join("\n") };
+}
 
 async function withTemporaryLayout(
   operation: (layout: CodexLayout) => Promise<void>,

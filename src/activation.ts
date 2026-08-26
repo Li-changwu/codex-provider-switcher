@@ -1,11 +1,20 @@
 import type * as vscode from "vscode";
 import { UnsupportedHostError } from "./core/codex-home";
+import {
+  removeActiveCustomAuth,
+  writeActiveCustomAuth,
+} from "./core/config";
+import { profileApiKeySecretId } from "./core/profiles";
 import { UnsupportedSecretStorageError } from "./core/secrets";
 import type {
   StartupExtensionContext,
   StartupHostInputs,
   StartupProfilePrerequisites,
 } from "./core/startup";
+import type {
+  RecoveryDependencies,
+  RecoveryResult,
+} from "./core/transaction";
 
 export const commandIds = [
   "codexProvider.createProfile",
@@ -29,20 +38,45 @@ export type StartupPrerequisiteFactory = (
   host: StartupHostInputs,
 ) => StartupProfilePrerequisites;
 
+export type StartupRecovery = (
+  layout: StartupProfilePrerequisites["layout"],
+  dependencies: RecoveryDependencies,
+) => Promise<Pick<RecoveryResult, "recoveryRequiredOperationIds">>;
+
+const startupRecoveryWarning =
+  "Codex Provider Switcher could not safely complete startup recovery. Provider switching commands are disabled.";
+
 let startupProfilePrerequisites: StartupProfilePrerequisites | undefined;
 
-export function activateExtensionWithStartupPrerequisites(
+export async function activateExtensionWithStartupPrerequisites(
   context: ExtensionActivationContext,
   host: StartupHostInputs,
   api: ExtensionHostApi,
   createPrerequisites: StartupPrerequisiteFactory,
-): void {
+  recover: StartupRecovery,
+): Promise<void> {
   startupProfilePrerequisites = undefined;
   try {
     startupProfilePrerequisites = createPrerequisites(context, host);
   } catch (error: unknown) {
     if (!isExpectedStartupPrerequisiteError(error)) {
       throw error;
+    }
+  }
+  if (startupProfilePrerequisites) {
+    try {
+      const recovery = await recover(startupProfilePrerequisites.layout, {
+        restoreAuthMode: createStartupAuthModeRestorer(
+          startupProfilePrerequisites,
+        ),
+      });
+      if (recovery.recoveryRequiredOperationIds.length > 0) {
+        await api.window.showWarningMessage(startupRecoveryWarning);
+        return;
+      }
+    } catch {
+      await api.window.showWarningMessage(startupRecoveryWarning);
+      return;
     }
   }
   registerExtensionLifecycle(context, api);
@@ -90,4 +124,30 @@ function isExpectedStartupPrerequisiteError(error: unknown): boolean {
     error instanceof UnsupportedHostError ||
     error instanceof UnsupportedSecretStorageError
   );
+}
+
+function createStartupAuthModeRestorer(
+  prerequisites: StartupProfilePrerequisites,
+): NonNullable<RecoveryDependencies["restoreAuthMode"]> {
+  return async (target) => {
+    if (target.previousMode === "official") {
+      await removeActiveCustomAuth(prerequisites.layout);
+      return;
+    }
+
+    if (!target.customProfileId) {
+      throw new Error("The previous custom authentication is unavailable.");
+    }
+    const profile = await prerequisites.profiles.get(target.customProfileId);
+    if (!profile || profile.kind !== "custom") {
+      throw new Error("The previous custom authentication is unavailable.");
+    }
+    const secretId =
+      profile.apiKeySecretId ?? profileApiKeySecretId(profile.id);
+    const apiKey = await prerequisites.secrets.get(secretId);
+    if (apiKey === undefined) {
+      throw new Error("The previous custom authentication is unavailable.");
+    }
+    await writeActiveCustomAuth(prerequisites.layout, apiKey);
+  };
 }

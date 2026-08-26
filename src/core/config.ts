@@ -1,10 +1,12 @@
 import {
   chmod as nativeChmod,
   mkdir as nativeMkdir,
+  open as nativeOpen,
   rename as nativeRename,
   unlink as nativeUnlink,
   writeFile as nativeWriteFile,
 } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { basename, dirname, join } from "node:path";
 import {
@@ -46,6 +48,11 @@ export class ConfigPersistenceError extends Error {
     super(message, options);
     this.name = "ConfigPersistenceError";
   }
+}
+
+export interface ConfigIo {
+  syncFile?(path: string): Promise<void>;
+  syncDirectory?(path: string): Promise<void>;
 }
 
 export function validateProfileConfig(
@@ -110,23 +117,46 @@ export async function writeActiveConfig(
 export async function writeActiveCustomAuth(
   layout: CodexLayout,
   apiKey: string,
+  io: ConfigIo = {},
 ): Promise<void> {
   const serializedAuth = serializeActiveAuth(apiKey);
-  await writeAtomically(layout.authPath, serializedAuth);
+  try {
+    await writeAtomically(layout.authPath, serializedAuth, io);
+  } catch {
+    throw activeAuthPersistenceError(
+      "Could not write active Codex configuration.",
+    );
+  }
 }
 
-export async function removeActiveCustomAuth(layout: CodexLayout): Promise<void> {
+export async function removeActiveCustomAuth(
+  layout: CodexLayout,
+  io: ConfigIo = {},
+): Promise<void> {
   try {
     await nativeUnlink(layout.authPath);
   } catch (error: unknown) {
     if (isMissingFileError(error)) {
       return;
     }
-    throw new ConfigPersistenceError(
+    throw activeAuthPersistenceError(
       "Could not remove the active custom authentication file.",
-      { cause: error },
     );
   }
+
+  try {
+    await syncParentDirectory(layout.authPath, io);
+  } catch {
+    throw activeAuthPersistenceError(
+      "Could not remove the active custom authentication file.",
+    );
+  }
+}
+
+function activeAuthPersistenceError(message: string): ConfigPersistenceError {
+  return new ConfigPersistenceError(message, {
+    cause: new Error("Authentication persistence failure details are redacted."),
+  });
 }
 
 function assertKnownProfileKind(kind: ProfileKind): void {
@@ -172,7 +202,11 @@ function assertApiKey(apiKey: string): void {
   }
 }
 
-async function writeAtomically(path: string, text: string): Promise<void> {
+async function writeAtomically(
+  path: string,
+  text: string,
+  io?: ConfigIo,
+): Promise<void> {
   const temporaryPath = join(
     dirname(path),
     `.${basename(path)}.tmp-${randomUUID()}`,
@@ -184,8 +218,14 @@ async function writeAtomically(path: string, text: string): Promise<void> {
     if (process.platform === "linux") {
       await nativeChmod(temporaryPath, linuxPrivateFileMode);
     }
+    if (io) {
+      await (io.syncFile ?? syncFile)(temporaryPath);
+    }
     await nativeRename(temporaryPath, path);
     renamed = true;
+    if (io) {
+      await syncParentDirectory(path, io);
+    }
   } catch (error: unknown) {
     let cleanupError: unknown;
     if (!renamed) {
@@ -210,6 +250,46 @@ async function writeAtomically(path: string, text: string): Promise<void> {
       "Could not write active Codex configuration.",
       { cause: error },
     );
+  }
+}
+
+async function syncFile(path: string): Promise<void> {
+  const handle = await nativeOpen(path, "r+");
+  await syncAndClose(handle, "Authentication file sync and close both failed.");
+}
+
+async function syncParentDirectory(path: string, io: ConfigIo): Promise<void> {
+  const directory = dirname(path);
+  if (io.syncDirectory) {
+    await io.syncDirectory(directory);
+    return;
+  }
+  if (process.platform === "win32") {
+    return;
+  }
+  const handle = await nativeOpen(directory, "r");
+  await syncAndClose(handle, "Authentication directory sync and close both failed.");
+}
+
+async function syncAndClose(
+  handle: FileHandle,
+  aggregateMessage: string,
+): Promise<void> {
+  let primaryError: unknown;
+  try {
+    await handle.sync();
+  } catch (error: unknown) {
+    primaryError = error;
+  }
+  try {
+    await handle.close();
+  } catch (closeError: unknown) {
+    primaryError = primaryError === undefined
+      ? closeError
+      : new AggregateError([primaryError, closeError], aggregateMessage);
+  }
+  if (primaryError !== undefined) {
+    throw primaryError;
   }
 }
 
