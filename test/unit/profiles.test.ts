@@ -205,7 +205,7 @@ test("rejects credential-bearing profile edits before changing an existing profi
   });
 });
 
-test("restores the previous config and index when an edit cannot publish its index", async () => {
+test("preserves the just-written config when an edit cannot publish its index", async () => {
   await withTemporaryLayout(async (layout) => {
     const initialStore = new ProfileStore(layout, {
       now: () => "2026-08-24T00:00:00.000Z",
@@ -227,10 +227,10 @@ test("restores the previous config and index when an edit cannot publish its ind
         configText: 'model_provider = "changed"\n',
       }),
       (error: unknown) =>
-        error instanceof ProfileStoreError && error.code === "persistence-failed",
+        error instanceof ProfileStoreError && error.code === "rollback-failed",
     );
 
-    assert.equal(await readFile(created.configFile, "utf8"), 'model_provider = "openai"\n');
+    assert.equal(await readFile(created.configFile, "utf8"), 'model_provider = "changed"\n');
     assert.deepEqual(await initialStore.get(created.id), created);
   });
 });
@@ -1363,7 +1363,7 @@ test("preserves both profile write and temporary cleanup failures", async () => 
   });
 });
 
-test("rolls back a visible config when index persistence fails", async () => {
+test("preserves the just-written config when index persistence fails", async () => {
   await withTemporaryLayout(async (layout) => {
     const fileSystem = new FailingIndexProfileFileSystem();
     const store = new ProfileStore(layout, { fileSystem });
@@ -1381,11 +1381,12 @@ test("rolls back a visible config when index persistence fails", async () => {
           kind: "official",
           configText: 'model_provider = "openai"\n',
         }),
-      ProfileStoreError,
+      (error: unknown) =>
+        error instanceof ProfileStoreError && error.code === "rollback-failed",
     );
 
-    await assert.rejects(() => readFile(configPath, "utf8"), { code: "ENOENT" });
-    assert.ok(fileSystem.unlinked.includes(configPath));
+    assert.equal(await readFile(configPath, "utf8"), 'model_provider = "openai"\n');
+    assert.equal(fileSystem.unlinked.includes(configPath), false);
   });
 });
 
