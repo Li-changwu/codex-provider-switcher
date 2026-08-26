@@ -1635,6 +1635,139 @@ test("rejects a hard-linked backup manifest during restoration", async () => {
   });
 });
 
+test("rejects a backup manifest replaced after validation before opening it", async (t) => {
+  await withLayout(async (layout) => {
+    const externalDirectory = await mkdtemp(join(dirname(layout.codexHome), "external-manifest-"));
+    const externalManifestPath = join(externalDirectory, "manifest.json");
+    const externalBytes = Buffer.from("external manifest must not be read");
+    await writeFile(externalManifestPath, externalBytes);
+    const transaction = await beginTransaction(layout, {
+      operationId: "manifest-open-race",
+      io: {
+        async afterManifestPathValidated(manifestPath: string) {
+          const displacedPath = `${manifestPath}.displaced`;
+          await rename(manifestPath, displacedPath);
+          await symlink(externalManifestPath, manifestPath, "file");
+        },
+      },
+    });
+
+    try {
+      await transaction.backupTargets([{ kind: "config", path: layout.configPath }]);
+      await transaction.markApplying([{ kind: "config", path: layout.configPath }]);
+      await writeFile(layout.configPath, "changed config", "utf8");
+
+      try {
+        await assert.rejects(
+          () => transaction.rollback(),
+          (error: unknown) => error instanceof Error && "code" in error && error.code === "rollback-failed",
+        );
+      } catch (error: unknown) {
+        if (isWindowsSymlinkPrivilegeError(error)) {
+          t.skip("creating file symlinks requires Windows developer mode or equivalent privilege");
+          return;
+        }
+        throw error;
+      }
+      assert.equal(await readFile(layout.configPath, "utf8"), "changed config");
+      assert.deepEqual(await readFile(externalManifestPath), externalBytes);
+    } finally {
+      await transaction.release().catch(() => undefined);
+      await rm(externalDirectory, { recursive: true, force: true });
+    }
+  });
+});
+
+test("rejects a journal replaced after validation before opening it", async (t) => {
+  await withLayout(async (layout) => {
+    const externalDirectory = await mkdtemp(join(dirname(layout.codexHome), "external-journal-"));
+    const externalJournalPath = join(externalDirectory, "journal.jsonl");
+    const externalBytes = Buffer.from("external journal must not be read");
+    await writeFile(externalJournalPath, externalBytes);
+    const transaction = await beginTransaction(layout, { operationId: "journal-open-race" });
+    await transaction.backupTargets([{ kind: "config", path: layout.configPath }]);
+    await transaction.markApplying([{ kind: "config", path: layout.configPath }]);
+    await writeFile(layout.configPath, "changed config", "utf8");
+    await transaction.release();
+
+    try {
+      try {
+        await assert.rejects(
+          () => recoverPendingSwitches(layout, {
+            isProcessAlive: () => false,
+            io: {
+            async afterJournalPathValidated(journalPath: string) {
+                const displacedPath = `${journalPath}.displaced`;
+                await rename(journalPath, displacedPath);
+              await symlink(externalJournalPath, journalPath, "file");
+            },
+          },
+          }),
+          (error: unknown) => error instanceof Error && "code" in error && error.code === "journal-invalid",
+        );
+      } catch (error: unknown) {
+        if (isWindowsSymlinkPrivilegeError(error)) {
+          t.skip("creating file symlinks requires Windows developer mode or equivalent privilege");
+          return;
+        }
+        throw error;
+      }
+      assert.equal(await readFile(layout.configPath, "utf8"), "changed config");
+      assert.deepEqual(await readFile(externalJournalPath), externalBytes);
+    } finally {
+      await rm(externalDirectory, { recursive: true, force: true });
+    }
+  });
+});
+
+test("rejects a restore parent replaced before temporary creation", async (t) => {
+  await withLayout(async (layout) => {
+    const restoreParent = join(layout.codexHome, "restore-parent");
+    const displacedParent = `${restoreParent}.displaced`;
+    const externalDirectory = await mkdtemp(join(dirname(layout.codexHome), "external-restore-parent-"));
+    const externalConfigPath = join(externalDirectory, "config.toml");
+    const externalBytes = Buffer.from("external config must not be overwritten");
+    await mkdir(restoreParent);
+    layout.configPath = join(restoreParent, "config.toml");
+    await writeFile(layout.configPath, "original config", "utf8");
+    await writeFile(externalConfigPath, externalBytes);
+
+    const transaction = await beginTransaction(layout, {
+      operationId: "restore-parent-race",
+      io: {
+        async beforeRestoreTemporaryCreate(destination: string) {
+          assert.equal(destination, layout.configPath);
+          await rename(restoreParent, displacedParent);
+          await symlink(externalDirectory, restoreParent, "dir");
+        },
+      },
+    });
+
+    try {
+      await transaction.backupTargets([{ kind: "config", path: layout.configPath }]);
+      await transaction.markApplying([{ kind: "config", path: layout.configPath }]);
+      await writeFile(layout.configPath, "changed config", "utf8");
+
+      try {
+        await assert.rejects(
+          () => transaction.rollback(),
+          (error: unknown) => error instanceof Error && "code" in error && error.code === "rollback-failed",
+        );
+      } catch (error: unknown) {
+        if (isWindowsSymlinkPrivilegeError(error)) {
+          t.skip("creating directory symlinks requires Windows developer mode or equivalent privilege");
+          return;
+        }
+        throw error;
+      }
+      assert.deepEqual(await readFile(externalConfigPath), externalBytes);
+    } finally {
+      await transaction.release().catch(() => undefined);
+      await rm(externalDirectory, { recursive: true, force: true });
+    }
+  });
+});
+
 test("records the SHA256 of the saved backup bytes after the source path changes", async () => {
   await withLayout(async (layout) => {
     const original = Buffer.alloc(8 * 1024 * 1024, "a");

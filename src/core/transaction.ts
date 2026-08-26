@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  constants,
   link,
   lstat,
   mkdir,
@@ -131,6 +132,9 @@ export interface TransactionIo {
   closeHashHandle?: (handle: FileHandle) => Promise<void>;
   writeTemporary?: (path: string, contents: string) => Promise<void>;
   afterBackupValidation?: (path: string) => void | Promise<void>;
+  afterManifestPathValidated?: (path: string) => void | Promise<void>;
+  afterJournalPathValidated?: (path: string) => void | Promise<void>;
+  beforeRestoreTemporaryCreate?: (destination: string) => void | Promise<void>;
   copyTemporary?: (source: FileHandle, destination: FileHandle) => Promise<void>;
   removeTemporary?: (path: string) => Promise<void>;
   syncDirectory?: (path: string) => Promise<void>;
@@ -698,7 +702,7 @@ async function recoverPendingSwitchesWithLock(
     );
     const directory = operationDirectory.path;
     const journalPath = join(directory, journalFileName);
-    const journal = await readJournal(journalPath);
+    const journal = await readJournal(journalPath, dependencies.io);
     const last = journal.at(-1);
     if (!last) {
       throw new TransactionError("journal-invalid", "The transaction journal is invalid.");
@@ -1253,11 +1257,10 @@ async function restoreTransactionTargets(
     }
     for (const target of [...backupTargets].reverse()) {
       if (!target.entry.existed) {
-        await unlinkIfPresent(target.path);
-        await syncPublishedParentDirectory(target.path, io);
+        await removeRestoreTargetIfPresent(layout, target.path, io);
         continue;
       }
-      await restoreFileAtomically(target, target.path, io);
+      await restoreFileAtomically(layout, target, target.path, io);
     }
   } catch (error: unknown) {
     return await rethrowAfterValidatedBackupClose(backupTargets, error);
@@ -1312,7 +1315,7 @@ async function validateByteRestoreTargets(
     return [];
   }
 
-  const manifest = await readBackupManifest(manifestPath);
+  const manifest = await readBackupManifest(manifestPath, io);
   const backupDirectory = dirname(manifestPath);
   const validatedTargets: ValidatedByteRestoreTarget[] = [];
   try {
@@ -1357,14 +1360,20 @@ async function validateByteRestoreTargets(
   }
 }
 
-async function readBackupManifest(manifestPath: string): Promise<BackupManifest> {
+async function readBackupManifest(
+  manifestPath: string,
+  io?: TransactionIo,
+): Promise<BackupManifest> {
   let manifest: unknown;
   try {
-    const manifestStats = await lstat(manifestPath);
-    if (!isRegularNonLinkFile(manifestStats) || hasMultipleHardLinks(manifestStats)) {
-      throw new TransactionError("rollback-failed", "The backup manifest is not a regular file.");
-    }
-    manifest = JSON.parse(await readFile(manifestPath, "utf8")) as unknown;
+    manifest = JSON.parse(
+      (await readVerifiedMetadataFile(
+        manifestPath,
+        "rollback-failed",
+        "The backup manifest is not a regular file.",
+        io?.afterManifestPathValidated,
+      )).toString("utf8"),
+    ) as unknown;
   } catch (error: unknown) {
     if (error instanceof TransactionError) {
       throw error;
@@ -1417,7 +1426,16 @@ function isValidPermissionMode(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 0 && (value as number) <= 0o777;
 }
 
+interface TrustedRestoreParent {
+  readonly logicalPath: string;
+  readonly operationalPath: string;
+  readonly stats: BigIntStats;
+  readonly realPath: string;
+  readonly handle?: FileHandle;
+}
+
 async function restoreFileAtomically(
+  layout: CodexLayout,
   source: ValidatedByteRestoreTarget,
   destination: string,
   io?: TransactionIo,
@@ -1429,14 +1447,18 @@ async function restoreFileAtomically(
   if (!isValidPermissionMode(mode)) {
     throw new TransactionError("rollback-failed", "The backup manifest is incomplete.");
   }
-  const temporary = join(
-    dirname(destination),
-    `.${basename(destination)}.restore-${randomUUID()}`,
-  );
+  let parent: TrustedRestoreParent | undefined;
+  let temporary: string | undefined;
   let temporaryHandle: FileHandle | undefined;
   let primaryError: unknown;
   try {
-    await mkdir(dirname(destination), { recursive: true });
+    parent = await openTrustedRestoreParent(layout, destination);
+    await io?.beforeRestoreTemporaryCreate?.(destination);
+    await assertTrustedRestoreParent(parent);
+    temporary = join(
+      parent.operationalPath,
+      `.${basename(destination)}.restore-${randomUUID()}`,
+    );
     temporaryHandle = await open(temporary, "wx", mode);
     await (io?.copyTemporary ?? copyOpenedFile)(source.backupHandle, temporaryHandle);
     await assertVerifiedRestoreBackup(source.backupPath, source.backupHandle, source.backupStats);
@@ -1445,8 +1467,10 @@ async function restoreFileAtomically(
     temporaryHandle = undefined;
     await syncAndCloseRestoreTemporary(handleToSync, io);
     await assertVerifiedRestoreBackup(source.backupPath, source.backupHandle, source.backupStats);
-    await rename(temporary, destination);
-    await syncPublishedParentDirectory(destination, io);
+    await assertTrustedRestoreParent(parent);
+    await rename(temporary, join(parent.operationalPath, basename(destination)));
+    await assertTrustedRestoreParent(parent);
+    await syncTrustedRestoreParent(parent, io);
   } catch (error: unknown) {
     primaryError = error;
   }
@@ -1461,12 +1485,168 @@ async function restoreFileAtomically(
         : new AggregateError(
             [primaryError, closeError],
             "Restore copy and temporary handle close both failed.",
+      );
+    }
+  }
+  if (primaryError !== undefined && temporary !== undefined) {
+    try {
+      await (io?.removeTemporary ?? unlink)(temporary);
+    } catch (cleanupError: unknown) {
+      if (!isMissingFileError(cleanupError)) {
+        primaryError = new AggregateError(
+          [primaryError, cleanupError],
+          "Restore operation and temporary cleanup both failed.",
+        );
+      }
+    }
+  }
+  if (parent?.handle) {
+    try {
+      await parent.handle.close();
+    } catch (closeError: unknown) {
+      primaryError = primaryError === undefined
+        ? closeError
+        : new AggregateError(
+            [primaryError, closeError],
+            "Restore operation and parent directory close both failed.",
           );
     }
   }
   if (primaryError !== undefined) {
-    await rethrowAfterTemporaryCleanup(temporary, primaryError, io?.removeTemporary);
+    throw primaryError;
   }
+}
+
+async function removeRestoreTargetIfPresent(
+  layout: CodexLayout,
+  destination: string,
+  io?: TransactionIo,
+): Promise<void> {
+  const parent = await openTrustedRestoreParent(layout, destination);
+  let primaryError: unknown;
+  try {
+    await assertTrustedRestoreParent(parent);
+    await unlinkIfPresent(join(parent.operationalPath, basename(destination)));
+    await assertTrustedRestoreParent(parent);
+    await syncTrustedRestoreParent(parent, io);
+  } catch (error: unknown) {
+    primaryError = error;
+  }
+  if (parent.handle) {
+    try {
+      await parent.handle.close();
+    } catch (closeError: unknown) {
+      primaryError = primaryError === undefined
+        ? closeError
+        : new AggregateError(
+            [primaryError, closeError],
+            "Restore deletion and parent directory close both failed.",
+          );
+    }
+  }
+  if (primaryError !== undefined) {
+    throw primaryError;
+  }
+}
+
+async function openTrustedRestoreParent(
+  layout: CodexLayout,
+  destination: string,
+): Promise<TrustedRestoreParent> {
+  const resolvedDestination = resolve(destination);
+  const allowedDestinations = [resolve(layout.configPath), resolve(layout.sqlitePath)];
+  if (!allowedDestinations.includes(resolvedDestination)) {
+    throw new TransactionError("rollback-failed", "The restore target is not allowed.");
+  }
+  const logicalPath = dirname(resolvedDestination);
+  const inspected = await inspectTrustedRestoreParent(logicalPath);
+  if (process.platform !== "linux") {
+    return {
+      logicalPath,
+      operationalPath: logicalPath,
+      ...inspected,
+    };
+  }
+
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(
+      logicalPath,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    const handleStats = await handle.stat({ bigint: true });
+    if (!isSafeRestoreParentStats(handleStats) || !hasSameBigIntFileIdentity(inspected.stats, handleStats)) {
+      throw new TransactionError("rollback-failed", "The restore target parent changed after validation.");
+    }
+    return {
+      logicalPath,
+      operationalPath: `/proc/self/fd/${String(handle.fd)}`,
+      ...inspected,
+      handle,
+    };
+  } catch (error: unknown) {
+    await closeFileHandleQuietly(handle);
+    if (error instanceof TransactionError) {
+      throw error;
+    }
+    throw new TransactionError("rollback-failed", "The restore target parent is not safe.", {
+      cause: error,
+    });
+  }
+}
+
+async function assertTrustedRestoreParent(parent: TrustedRestoreParent): Promise<void> {
+  const current = await inspectTrustedRestoreParent(parent.logicalPath);
+  if (
+    !hasSameBigIntFileIdentity(parent.stats, current.stats) ||
+    !sameResolvedPath(parent.realPath, current.realPath)
+  ) {
+    throw new TransactionError("rollback-failed", "The restore target parent changed after validation.");
+  }
+  if (parent.handle) {
+    const handleStats = await parent.handle.stat({ bigint: true });
+    if (!isSafeRestoreParentStats(handleStats) || !hasSameBigIntFileIdentity(parent.stats, handleStats)) {
+      throw new TransactionError("rollback-failed", "The restore target parent changed after validation.");
+    }
+  }
+}
+
+async function inspectTrustedRestoreParent(
+  logicalPath: string,
+): Promise<Pick<TrustedRestoreParent, "stats" | "realPath">> {
+  const before = await lstat(logicalPath, { bigint: true });
+  if (!isSafeRestoreParentStats(before)) {
+    throw new TransactionError("rollback-failed", "The restore target parent is not a real directory.");
+  }
+  const realPath = await realpath(logicalPath);
+  const after = await lstat(logicalPath, { bigint: true });
+  if (
+    !isSafeRestoreParentStats(after) ||
+    !hasSameBigIntFileIdentity(before, after) ||
+    !sameResolvedPath(realPath, logicalPath)
+  ) {
+    throw new TransactionError("rollback-failed", "The restore target parent is indirect or changed.");
+  }
+  return { stats: after, realPath };
+}
+
+function isSafeRestoreParentStats(stats: BigIntStats): boolean {
+  return stats.isDirectory() && !stats.isSymbolicLink() && stats.ino !== 0n;
+}
+
+async function syncTrustedRestoreParent(
+  parent: TrustedRestoreParent,
+  io?: TransactionIo,
+): Promise<void> {
+  if (io?.syncDirectory) {
+    await io.syncDirectory(parent.logicalPath);
+    return;
+  }
+  if (parent.handle) {
+    await parent.handle.sync();
+    return;
+  }
+  await syncPublishedParentDirectory(join(parent.logicalPath, ".restore-parent"), io);
 }
 
 async function openVerifiedRestoreBackup(
@@ -1891,7 +2071,7 @@ async function appendJournal(
   if (path !== join(operationDirectory.path, journalFileName)) {
     throw new TransactionError("journal-invalid", "The transaction journal is outside its operation directory.");
   }
-  const existing = await readJournalSnapshot(path);
+  const existing = await readJournalSnapshot(path, io);
   const record = Buffer.from(`${JSON.stringify(entry)}\n`, "utf8");
   const snapshot = Buffer.concat([existing, record]);
   const temporary = join(
@@ -2053,9 +2233,12 @@ async function writeJournalSnapshot(
   }
 }
 
-async function readJournalSnapshot(path: string): Promise<Buffer> {
+async function readJournalSnapshot(
+  path: string,
+  io?: TransactionIo,
+): Promise<Buffer> {
   try {
-    const contents = await readJournalFile(path);
+    const contents = await readJournalFile(path, io?.afterJournalPathValidated);
     if (contents.length > 0) {
       parseJournalEntries(contents.toString("utf8"), path);
     }
@@ -2093,9 +2276,15 @@ async function writeAll(
   }
 }
 
-async function readJournal(path: string): Promise<JournalEntry[]> {
+async function readJournal(
+  path: string,
+  io?: TransactionIo,
+): Promise<JournalEntry[]> {
   try {
-    return parseJournalEntries((await readJournalFile(path)).toString("utf8"), path);
+    return parseJournalEntries(
+      (await readJournalFile(path, io?.afterJournalPathValidated)).toString("utf8"),
+      path,
+    );
   } catch (error: unknown) {
     if (error instanceof TransactionError) {
       throw error;
@@ -2106,12 +2295,69 @@ async function readJournal(path: string): Promise<JournalEntry[]> {
   }
 }
 
-async function readJournalFile(path: string): Promise<Buffer> {
-  const stats = await lstat(path);
-  if (!isRegularNonLinkFile(stats) || hasMultipleHardLinks(stats)) {
-    throw new TransactionError("journal-invalid", "The transaction journal is not a regular file.");
+async function readJournalFile(
+  path: string,
+  afterPathValidated?: (path: string) => void | Promise<void>,
+): Promise<Buffer> {
+  return readVerifiedMetadataFile(
+    path,
+    "journal-invalid",
+    "The transaction journal is not a regular file.",
+    afterPathValidated,
+  );
+}
+
+async function readVerifiedMetadataFile(
+  path: string,
+  code: "journal-invalid" | "rollback-failed",
+  unsafeMessage: string,
+  afterPathValidated?: (path: string) => void | Promise<void>,
+): Promise<Buffer> {
+  let handle: FileHandle | undefined;
+  let contents: Buffer | undefined;
+  let primaryError: unknown;
+  try {
+    const pathStats = await lstat(path, { bigint: true });
+    if (!isSafeMetadataStats(pathStats)) {
+      throw new TransactionError(code, unsafeMessage);
+    }
+    await afterPathValidated?.(path);
+    handle = await open(path, "r");
+    const openedStats = await handle.stat({ bigint: true });
+    if (!isSafeMetadataStats(openedStats) || !hasSameBigIntFileIdentity(pathStats, openedStats)) {
+      throw new TransactionError(code, unsafeMessage);
+    }
+    contents = await handle.readFile();
+    const finalStats = await handle.stat({ bigint: true });
+    if (!isSafeMetadataStats(finalStats) || !hasSameBigIntFileIdentity(openedStats, finalStats)) {
+      throw new TransactionError(code, unsafeMessage);
+    }
+  } catch (error: unknown) {
+    primaryError = error;
   }
-  return readFile(path);
+  if (handle) {
+    try {
+      await handle.close();
+    } catch (closeError: unknown) {
+      primaryError = primaryError === undefined
+        ? closeError
+        : new AggregateError(
+            [primaryError, closeError],
+            "Metadata read and file handle close both failed.",
+          );
+    }
+  }
+  if (primaryError !== undefined) {
+    if (isMissingFileError(primaryError) || primaryError instanceof TransactionError) {
+      throw primaryError;
+    }
+    throw new TransactionError(code, unsafeMessage, { cause: primaryError });
+  }
+  return contents!;
+}
+
+function isSafeMetadataStats(stats: BigIntStats): boolean {
+  return stats.isFile() && !stats.isSymbolicLink() && stats.nlink === 1n && stats.ino !== 0n;
 }
 
 function parseJournalEntries(contents: string, path: string): JournalEntry[] {
