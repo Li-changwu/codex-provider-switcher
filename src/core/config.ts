@@ -109,9 +109,14 @@ export function serializeActiveAuth(apiKey: string): string {
 export async function writeActiveConfig(
   layout: CodexLayout,
   text: string,
+  io: ConfigIo = {},
 ): Promise<void> {
   parseProfileConfig(text);
-  await writeAtomically(layout.configPath, text);
+  try {
+    await writeAtomically(layout.configPath, text, io);
+  } catch {
+    throw activeConfigPersistenceError();
+  }
 }
 
 export async function writeActiveCustomAuth(
@@ -156,6 +161,12 @@ export async function removeActiveCustomAuth(
 function activeAuthPersistenceError(message: string): ConfigPersistenceError {
   return new ConfigPersistenceError(message, {
     cause: new Error("Authentication persistence failure details are redacted."),
+  });
+}
+
+function activeConfigPersistenceError(): ConfigPersistenceError {
+  return new ConfigPersistenceError("Could not write active Codex configuration.", {
+    cause: new Error("Active configuration persistence failure details are redacted."),
   });
 }
 

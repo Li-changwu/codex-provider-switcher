@@ -1,14 +1,18 @@
 import {
   chmod as nativeChmod,
+  lstat as nativeLstat,
   mkdir as nativeMkdir,
   open as nativeOpen,
   readFile as nativeReadFile,
+  realpath as nativeRealpath,
   rename as nativeRename,
   unlink as nativeUnlink,
   writeFile as nativeWriteFile,
 } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
-import { basename, dirname, join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import type { BigIntStats } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
   parseAndValidateProfileConfig,
   ProfileConfigPolicyError,
@@ -25,6 +29,28 @@ const profileLockRecoveryClaimFileName = ".create.lock.recovery.claim";
 const defaultLockRetryMs = 25;
 const defaultLockTimeoutMs = 1_000;
 const defaultStaleLockMs = 5 * 60_000;
+const storedProfileIdPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const versionHashChunkSize = 64 * 1024;
+const publicProfileRecordKeys = new Set([
+  "id",
+  "name",
+  "kind",
+  "configFile",
+  "providerId",
+  "createdAt",
+  "updatedAt",
+]);
+
+interface ProfileConfigVersion {
+  sha256: string;
+  mode: bigint;
+  device: bigint;
+  inode: bigint;
+  links: bigint;
+  size: bigint;
+  modifiedAtNs: bigint;
+  changedAtNs: bigint;
+}
 
 export interface ProfileFileSystem {
   mkdir(path: string): Promise<void>;
@@ -41,6 +67,13 @@ export interface CreateProfileInput {
   configText: string;
   providerId?: string;
   apiKeySecretId?: string;
+}
+
+export interface UpdateProfileInput {
+  name: string;
+  kind: ProfileKind;
+  configText: string;
+  providerId?: string;
 }
 
 export interface ProfileStoreOptions {
@@ -116,7 +149,7 @@ export class ProfileStore {
 
   async create(input: CreateProfileInput): Promise<ProfileRecord> {
     assertNoCredentialAssignments(input.configText);
-    return this.withCreateLock(async () => {
+    return this.withProfileLock(async () => {
       const profiles = await this.readProfiles();
       const id = nextProfileId(input.name, profiles);
       const timestamp = this.now();
@@ -132,7 +165,11 @@ export class ProfileStore {
         updatedAt: timestamp,
       };
 
+      await this.ensureTrustedProfileConfig(profile.id, false);
       await this.writeAtomically(profile.configFile, input.configText);
+      const writtenConfigVersion = await this.captureConfigVersion(
+        profile.configFile,
+      );
       try {
         await this.writeAtomically(
           this.indexPath,
@@ -143,7 +180,7 @@ export class ProfileStore {
           )}\n`,
         );
       } catch (error: unknown) {
-        await this.rollbackConfig(profile.configFile);
+        await this.rollbackConfig(profile.configFile, writtenConfigVersion);
         if (
           error instanceof ProfileStoreError &&
           error.code === "rollback-failed"
@@ -164,6 +201,86 @@ export class ProfileStore {
     return (await this.list()).find((profile) => profile.id === id);
   }
 
+  async update(
+    id: string,
+    input: UpdateProfileInput,
+  ): Promise<ProfileRecord | undefined> {
+    assertNoCredentialAssignments(input.configText);
+    return this.withProfileLock(async () => {
+      const profiles = await this.readProfiles();
+      const index = profiles.findIndex((profile) => profile.id === id);
+      if (index === -1) {
+        return undefined;
+      }
+
+      const current = profiles[index];
+      if (input.kind !== current.kind) {
+        throw new ProfileStoreError(
+          "invalid-config",
+          "A Profile kind cannot be changed after creation.",
+        );
+      }
+      let previousConfig: string;
+      try {
+        await this.ensureTrustedProfileConfig(current.id, true);
+        previousConfig = await this.fileSystem.readFile(current.configFile);
+      } catch (error: unknown) {
+        throw new ProfileStoreError(
+          "persistence-failed",
+          "Could not read the existing Profile configuration.",
+          { cause: error },
+        );
+      }
+
+      const updated: ProfileRecord = {
+        ...current,
+        name: input.name,
+        providerId: input.providerId,
+        updatedAt: this.now(),
+      };
+      await this.writeAtomically(updated.configFile, input.configText);
+      const writtenConfigVersion = await this.captureConfigVersion(
+        updated.configFile,
+      );
+      try {
+        const nextProfiles = [...profiles];
+        nextProfiles[index] = updated;
+        await this.writeAtomically(
+          this.indexPath,
+          `${JSON.stringify(
+            { profiles: nextProfiles.map(toPublicProfileRecord) },
+            undefined,
+            2,
+          )}\n`,
+        );
+      } catch (error: unknown) {
+        try {
+          await this.restoreConfig(
+            current.configFile,
+            previousConfig,
+            writtenConfigVersion,
+          );
+        } catch {
+          throw profileRollbackError(
+            "Could not restore the Profile configuration after the index update failed.",
+          );
+        }
+        if (
+          error instanceof ProfileStoreError &&
+          error.code === "rollback-failed"
+        ) {
+          throw error;
+        }
+        throw new ProfileStoreError(
+          "persistence-failed",
+          "Could not update the profile index.",
+          { cause: error },
+        );
+      }
+      return withDerivedSecretId(updated);
+    });
+  }
+
   async list(): Promise<ProfileRecord[]> {
     const profiles = await this.readProfiles();
     return profiles.map(withDerivedSecretId);
@@ -172,6 +289,8 @@ export class ProfileStore {
   private async readProfiles(): Promise<ProfileRecord[]> {
     let contents: string;
     try {
+      await this.ensureTrustedProfileRoot(false);
+      await this.ensureTrustedMetadataFile(this.indexPath);
       contents = await this.fileSystem.readFile(this.indexPath);
     } catch (error: unknown) {
       if (isMissingFileError(error)) {
@@ -189,13 +308,20 @@ export class ProfileStore {
       if (!Array.isArray(parsed.profiles)) {
         throw new Error("missing profiles");
       }
-      return parsed.profiles.map(parsePublicProfileRecord);
+      return parsed.profiles.map((profile) =>
+        parsePublicProfileRecord(profile, this.profilesDir),
+      );
     } catch {
       throw new ProfileStoreError("index-invalid", "The profile index is not valid.");
     }
   }
 
-  private async writeAtomically(path: string, contents: string): Promise<void> {
+  private async writeAtomically(
+    path: string,
+    contents: string,
+    expectedVersion?: ProfileConfigVersion,
+  ): Promise<void> {
+    await this.ensureTrustedProfileWriteTarget(path);
     const temporaryPath = join(
       dirname(path),
       `.${basename(path)}.tmp-${randomUUID()}`,
@@ -205,6 +331,10 @@ export class ProfileStore {
       await this.fileSystem.writeFile(temporaryPath, contents);
       if (this.platform === "linux") {
         await this.fileSystem.chmod(temporaryPath, linuxPrivateFileMode);
+      }
+      await this.ensureTrustedProfileWriteTarget(path);
+      if (expectedVersion) {
+        await this.assertConfigVersion(path, expectedVersion);
       }
       await this.fileSystem.rename(temporaryPath, path);
     } catch (error: unknown) {
@@ -226,6 +356,9 @@ export class ProfileStore {
           },
         );
       }
+      if (error instanceof ProfileStoreError && error.code === "rollback-failed") {
+        throw error;
+      }
       throw new ProfileStoreError(
         "persistence-failed",
         "Could not write profile data.",
@@ -234,16 +367,87 @@ export class ProfileStore {
     }
   }
 
-  private async rollbackConfig(configPath: string): Promise<void> {
+  private async rollbackConfig(
+    configPath: string,
+    expectedVersion: ProfileConfigVersion,
+  ): Promise<void> {
     try {
+      const actualVersion = await this.captureConfigVersion(configPath);
+      if (!sameProfileConfigVersion(expectedVersion, actualVersion)) {
+        throw new Error("Profile config changed outside the save operation.");
+      }
       await this.fileSystem.unlink(configPath);
-    } catch (error: unknown) {
-      throw new ProfileStoreError(
-        "rollback-failed",
+    } catch {
+      throw profileRollbackError(
         "Could not recover the profile config after index persistence failed.",
-        { cause: error },
       );
     }
+  }
+
+  private async restoreConfig(
+    configPath: string,
+    contents: string,
+    expectedVersion: ProfileConfigVersion,
+  ): Promise<void> {
+    await this.writeAtomically(configPath, contents, expectedVersion);
+  }
+
+  private async assertConfigVersion(
+    configPath: string,
+    expectedVersion: ProfileConfigVersion,
+  ): Promise<void> {
+    const actualVersion = await this.captureConfigVersion(configPath);
+    if (!sameProfileConfigVersion(expectedVersion, actualVersion)) {
+      throw new ProfileStoreError(
+        "rollback-failed",
+        "The Profile configuration changed outside the save operation.",
+      );
+    }
+  }
+
+  private async captureConfigVersion(
+    configPath: string,
+  ): Promise<ProfileConfigVersion> {
+    let handle: FileHandle | undefined;
+    let version: ProfileConfigVersion | undefined;
+    let primaryError: unknown;
+    try {
+      await this.ensureTrustedProfileWriteTarget(configPath);
+      const pathBefore = await lstatBigIntIfPresent(configPath);
+      if (!pathBefore || !isSafeProfileFile(pathBefore)) {
+        throw new Error("Profile config is not a safe regular file.");
+      }
+
+      handle = await nativeOpen(configPath, "r");
+      const openedStats = await handle.stat({ bigint: true });
+      if (!sameStableProfileFileStats(pathBefore, openedStats)) {
+        throw new Error("Profile config changed while being opened.");
+      }
+      const sha256 = await hashOpenedProfileConfig(handle);
+      const finalStats = await handle.stat({ bigint: true });
+      const pathAfter = await nativeLstat(configPath, { bigint: true });
+      if (
+        !sameStableProfileFileStats(openedStats, finalStats) ||
+        !sameStableProfileFileStats(finalStats, pathAfter)
+      ) {
+        throw new Error("Profile config changed while being versioned.");
+      }
+      version = profileConfigVersion(finalStats, sha256);
+    } catch (error: unknown) {
+      primaryError = error;
+    }
+
+    if (handle) {
+      try {
+        await handle.close();
+      } catch (closeError: unknown) {
+        primaryError ??= closeError;
+      }
+    }
+    if (primaryError !== undefined || !version) {
+      throw profilePersistenceError();
+    }
+    return version;
   }
 
   private async removeTemporaryFile(path: string): Promise<void> {
@@ -256,18 +460,235 @@ export class ProfileStore {
     }
   }
 
-  private async withCreateLock<Result>(
+  private async withProfileLock<Result>(
     operation: () => Promise<Result>,
   ): Promise<Result> {
+    await this.ensureTrustedProfileRoot(true);
     const releaseLock = await acquireProfileFileLock(
       this.profilesDir,
       this.lockOptions,
     );
     try {
+      await this.ensureTrustedProfileRoot(true);
       return await operation();
     } finally {
       await releaseLock();
     }
+  }
+
+  private async ensureTrustedProfileRoot(create: boolean): Promise<void> {
+    const codexHome = resolve(this.layout.codexHome);
+    const switcher = resolve(this.layout.switcherDir);
+    const expectedSwitcher = join(codexHome, "provider-switcher");
+    if (!sameResolvedPath(switcher, expectedSwitcher)) {
+      throw profilePersistenceError();
+    }
+    const home = await inspectTrustedProfileDirectory(codexHome);
+    const switcherDirectory = await ensureTrustedProfileDirectory(
+      switcher,
+      home,
+      create,
+    );
+    await ensureTrustedProfileDirectory(this.profilesDir, switcherDirectory, create);
+  }
+
+  private async ensureTrustedProfileConfig(id: string, requireExisting: boolean): Promise<void> {
+    if (!storedProfileIdPattern.test(id)) {
+      throw profilePersistenceError();
+    }
+    await this.ensureTrustedProfileRoot(true);
+    const profileDirectory = join(this.profilesDir, id);
+    const profilesRoot = await inspectTrustedProfileDirectory(this.profilesDir);
+    await ensureTrustedProfileDirectory(profileDirectory, profilesRoot, !requireExisting);
+    const configPath = join(profileDirectory, "config.toml");
+    const stats = await lstatBigIntIfPresent(configPath);
+    if (!stats) {
+      if (requireExisting) {
+        throw profilePersistenceError();
+      }
+      return;
+    }
+    if (!isSafeProfileFile(stats) || !sameResolvedPath(await nativeRealpath(configPath), configPath)) {
+      throw profilePersistenceError();
+    }
+  }
+
+  private async ensureTrustedMetadataFile(path: string): Promise<void> {
+    const stats = await lstatBigIntIfPresent(path);
+    if (
+      stats &&
+      (!isSafeProfileFile(stats) || !sameResolvedPath(await nativeRealpath(path), path))
+    ) {
+      throw profilePersistenceError();
+    }
+  }
+
+  private async ensureTrustedProfileWriteTarget(path: string): Promise<void> {
+    const resolvedPath = resolve(path);
+    if (sameResolvedPath(resolvedPath, this.indexPath)) {
+      await this.ensureTrustedProfileRoot(true);
+      await this.ensureTrustedMetadataFile(this.indexPath);
+      return;
+    }
+
+    const relativeConfigPath = relative(this.profilesDir, resolvedPath);
+    const segments = relativeConfigPath.split(/[\\/]/u);
+    if (
+      isAbsolute(relativeConfigPath) ||
+      segments.length !== 2 ||
+      !storedProfileIdPattern.test(segments[0]) ||
+      segments[1] !== "config.toml"
+    ) {
+      throw profilePersistenceError();
+    }
+    await this.ensureTrustedProfileConfig(segments[0], false);
+  }
+}
+
+function profilePersistenceError(): ProfileStoreError {
+  return new ProfileStoreError(
+    "persistence-failed",
+    "Could not safely access managed Profile storage.",
+  );
+}
+
+function profileRollbackError(message: string): ProfileStoreError {
+  return new ProfileStoreError("rollback-failed", message, {
+    cause: new Error("Profile rollback failure details are redacted."),
+  });
+}
+
+async function ensureTrustedProfileDirectory(
+  path: string,
+  expectedParent: BigIntStats,
+  create: boolean,
+): Promise<BigIntStats> {
+  let stats = await lstatBigIntIfPresent(path);
+  if (!stats && create) {
+    await nativeMkdir(path);
+    stats = await lstatBigIntIfPresent(path);
+  }
+  if (!stats || !isSafeProfileDirectory(stats)) {
+    throw profilePersistenceError();
+  }
+  const parentPath = dirname(path);
+  const parent = await nativeLstat(parentPath, { bigint: true });
+  if (
+    !isSafeProfileDirectory(parent) ||
+    !sameProfileFileIdentity(parent, expectedParent) ||
+    !sameResolvedPath(await nativeRealpath(path), path)
+  ) {
+    throw profilePersistenceError();
+  }
+  const after = await nativeLstat(path, { bigint: true });
+  if (!isSafeProfileDirectory(after) || !sameProfileFileIdentity(stats, after)) {
+    throw profilePersistenceError();
+  }
+  return after;
+}
+
+async function inspectTrustedProfileDirectory(path: string): Promise<BigIntStats> {
+  const before = await nativeLstat(path, { bigint: true });
+  if (!isSafeProfileDirectory(before) || !sameResolvedPath(await nativeRealpath(path), path)) {
+    throw profilePersistenceError();
+  }
+  const after = await nativeLstat(path, { bigint: true });
+  if (!isSafeProfileDirectory(after) || !sameProfileFileIdentity(before, after)) {
+    throw profilePersistenceError();
+  }
+  return after;
+}
+
+function isSafeProfileDirectory(stats: BigIntStats): boolean {
+  return stats.isDirectory() && !stats.isSymbolicLink() && stats.ino !== 0n;
+}
+
+function isSafeProfileFile(stats: BigIntStats): boolean {
+  return stats.isFile() && !stats.isSymbolicLink() && stats.nlink === 1n && stats.ino !== 0n;
+}
+
+function sameProfileFileIdentity(left: BigIntStats, right: BigIntStats): boolean {
+  return left.dev === right.dev && left.ino !== 0n && left.ino === right.ino;
+}
+
+function sameStableProfileFileStats(
+  left: BigIntStats,
+  right: BigIntStats,
+): boolean {
+  return (
+    isSafeProfileFile(left) &&
+    isSafeProfileFile(right) &&
+    sameProfileFileIdentity(left, right) &&
+    left.nlink === right.nlink &&
+    left.mode === right.mode &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs
+  );
+}
+
+function profileConfigVersion(
+  stats: BigIntStats,
+  sha256: string,
+): ProfileConfigVersion {
+  return {
+    sha256,
+    mode: stats.mode,
+    device: stats.dev,
+    inode: stats.ino,
+    links: stats.nlink,
+    size: stats.size,
+    modifiedAtNs: stats.mtimeNs,
+    changedAtNs: stats.ctimeNs,
+  };
+}
+
+function sameProfileConfigVersion(
+  left: ProfileConfigVersion,
+  right: ProfileConfigVersion,
+): boolean {
+  return (
+    left.sha256 === right.sha256 &&
+    left.mode === right.mode &&
+    left.device === right.device &&
+    left.inode === right.inode &&
+    left.links === right.links &&
+    left.size === right.size &&
+    left.modifiedAtNs === right.modifiedAtNs &&
+    left.changedAtNs === right.changedAtNs
+  );
+}
+
+async function hashOpenedProfileConfig(handle: FileHandle): Promise<string> {
+  const hash = createHash("sha256");
+  const chunk = Buffer.alloc(versionHashChunkSize);
+  let offset = 0;
+  while (true) {
+    const { bytesRead } = await handle.read(chunk, 0, chunk.length, offset);
+    if (bytesRead === 0) {
+      return hash.digest("hex");
+    }
+    hash.update(chunk.subarray(0, bytesRead));
+    offset += bytesRead;
+  }
+}
+
+function sameResolvedPath(left: string, right: string): boolean {
+  const normalizedLeft = resolve(left);
+  const normalizedRight = resolve(right);
+  return process.platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
+}
+
+async function lstatBigIntIfPresent(path: string): Promise<BigIntStats | undefined> {
+  try {
+    return await nativeLstat(path, { bigint: true });
+  } catch (error: unknown) {
+    if (isMissingFileError(error)) {
+      return undefined;
+    }
+    throw error;
   }
 }
 
@@ -845,7 +1266,7 @@ export function toPublicProfileRecord(
 function withDerivedSecretId(profile: ProfileRecord): ProfileRecord {
   return profile.kind === "custom"
     ? { ...profile, apiKeySecretId: profileApiKeySecretId(profile.id) }
-    : profile;
+    : { ...profile, apiKeySecretId: undefined };
 }
 
 function assertNoCredentialAssignments(configText: string): void {
@@ -877,19 +1298,25 @@ function nextProfileId(name: string, profiles: readonly ProfileRecord[]): string
   return `${baseId}-${suffix}`;
 }
 
-function parsePublicProfileRecord(value: unknown): ProfileRecord {
+function parsePublicProfileRecord(
+  value: unknown,
+  profilesDir: string,
+): ProfileRecord {
   if (!value || typeof value !== "object") {
     throw new Error("invalid profile");
   }
   const profile = value as Record<string, unknown>;
   if (
+    !hasOnlyPublicProfileRecordKeys(profile) ||
     typeof profile.id !== "string" ||
+    !storedProfileIdPattern.test(profile.id) ||
     typeof profile.name !== "string" ||
     (profile.kind !== "official" && profile.kind !== "custom") ||
     typeof profile.configFile !== "string" ||
     typeof profile.createdAt !== "string" ||
     typeof profile.updatedAt !== "string" ||
-    (profile.providerId !== undefined && typeof profile.providerId !== "string")
+    (profile.providerId !== undefined && typeof profile.providerId !== "string") ||
+    profile.configFile !== join(profilesDir, profile.id, "config.toml")
   ) {
     throw new Error("invalid profile");
   }
@@ -902,6 +1329,12 @@ function parsePublicProfileRecord(value: unknown): ProfileRecord {
     createdAt: profile.createdAt,
     updatedAt: profile.updatedAt,
   };
+}
+
+function hasOnlyPublicProfileRecordKeys(
+  value: Record<string, unknown>,
+): boolean {
+  return Object.keys(value).every((key) => publicProfileRecordKeys.has(key));
 }
 
 function isMissingFileError(error: unknown): error is NodeJS.ErrnoException {

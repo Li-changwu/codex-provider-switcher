@@ -7,6 +7,7 @@ import {
   readFile,
   rename,
   rm,
+  symlink,
   unlink,
   writeFile,
 } from "node:fs/promises";
@@ -60,6 +61,246 @@ test("creates normalized profile IDs and deterministic collision suffixes", asyn
       ["research-proxy", "research-proxy-2"],
     );
     assert.deepEqual(await store.get(first.id), first);
+  });
+});
+
+test("updates a profile without changing its identity, creation time, or custom secret identifier", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const timestamps = [
+      "2026-08-24T00:00:00.000Z",
+      "2026-08-25T00:00:00.000Z",
+    ];
+    const store = new ProfileStore(layout, {
+      now: () => timestamps.shift() ?? "2026-08-26T00:00:00.000Z",
+    });
+    const created = await store.create({
+      name: "Research Proxy",
+      kind: "custom",
+      configText: 'model_provider = "research"\n',
+      providerId: "research",
+    });
+
+    const updated = await store.update(created.id, {
+      name: "Research Proxy V2",
+      kind: "custom",
+      configText: 'model_provider = "research-v2"\n',
+      providerId: "research-v2",
+    });
+
+    assert.ok(updated);
+    assert.equal(updated.id, created.id);
+    assert.equal(updated.configFile, created.configFile);
+    assert.equal(updated.createdAt, created.createdAt);
+    assert.equal(updated.updatedAt, "2026-08-25T00:00:00.000Z");
+    assert.equal(updated.apiKeySecretId, created.apiKeySecretId);
+    assert.equal(await readFile(created.configFile, "utf8"), 'model_provider = "research-v2"\n');
+    const persistedIndex = await readFile(
+      join(layout.switcherDir, "profiles", "index.json"),
+      "utf8",
+    );
+    assert.doesNotMatch(persistedIndex, /api-key/);
+    assert.deepEqual(await store.get(created.id), updated);
+  });
+});
+
+test("rejects a tampered Profile index config path before update can touch auth or external files", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const store = new ProfileStore(layout);
+    const profile = await store.create({
+      name: "Trusted Profile",
+      kind: "official",
+      configText: 'model_provider = "openai"\n',
+    });
+    const authBefore = '{"native":"credential"}';
+    const externalPath = join(layout.codexHome, "external.toml");
+    const externalBefore = 'model_provider = "external"\n';
+    await writeFile(layout.authPath, authBefore, "utf8");
+    await writeFile(externalPath, externalBefore, "utf8");
+    const indexPath = join(layout.switcherDir, "profiles", "index.json");
+    const index = JSON.parse(await readFile(indexPath, "utf8")) as {
+      profiles: Array<Record<string, unknown>>;
+    };
+    index.profiles[0].configFile = layout.authPath;
+    await writeFile(indexPath, `${JSON.stringify(index)}\n`, "utf8");
+
+    await assert.rejects(
+      () => store.update(profile.id, {
+        name: "Changed",
+        kind: "official",
+        configText: 'model_provider = "changed"\n',
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof ProfileStoreError);
+        assert.equal(error.code, "index-invalid");
+        assert.doesNotMatch(error.message, /auth\.json|external\.toml/);
+        return true;
+      },
+    );
+    assert.equal(await readFile(layout.authPath, "utf8"), authBefore);
+    assert.equal(await readFile(externalPath, "utf8"), externalBefore);
+  });
+});
+
+test("rejects Profile index entries with non-public fields", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const store = new ProfileStore(layout);
+    const profile = await store.create({
+      name: "Strict Public Index",
+      kind: "official",
+      configText: 'model_provider = "openai"\n',
+    });
+    const indexPath = join(layout.switcherDir, "profiles", "index.json");
+
+    for (const unexpectedField of [
+      "apiKeySecretId",
+      "credentials",
+      "arbitraryField",
+    ]) {
+      const index = JSON.parse(await readFile(indexPath, "utf8")) as {
+        profiles: Array<Record<string, unknown>>;
+      };
+      index.profiles[0][unexpectedField] = "untrusted";
+      await writeFile(indexPath, `${JSON.stringify(index)}\n`, "utf8");
+
+      await assert.rejects(
+        () => store.list(),
+        (error: unknown) =>
+          error instanceof ProfileStoreError && error.code === "index-invalid",
+      );
+
+      index.profiles[0] = {
+        id: profile.id,
+        name: profile.name,
+        kind: profile.kind,
+        configFile: profile.configFile,
+        createdAt: profile.createdAt,
+        updatedAt: profile.updatedAt,
+      };
+      await writeFile(indexPath, `${JSON.stringify(index)}\n`, "utf8");
+    }
+  });
+});
+
+test("rejects credential-bearing profile edits before changing an existing profile", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const store = new ProfileStore(layout);
+    const created = await store.create({
+      name: "Official",
+      kind: "official",
+      configText: 'model_provider = "openai"\n',
+    });
+
+    await assert.rejects(
+      () => store.update(created.id, {
+        name: "Official",
+        kind: "official",
+        configText: 'model_provider = "openai"\napi_key = "test-update-key"\n',
+      }),
+      (error: unknown) =>
+        error instanceof ProfileStoreError && error.code === "invalid-config",
+    );
+
+    assert.equal(await readFile(created.configFile, "utf8"), 'model_provider = "openai"\n');
+    assert.deepEqual(await store.get(created.id), created);
+  });
+});
+
+test("restores the previous config and index when an edit cannot publish its index", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const initialStore = new ProfileStore(layout, {
+      now: () => "2026-08-24T00:00:00.000Z",
+    });
+    const created = await initialStore.create({
+      name: "Rollback Edit",
+      kind: "official",
+      configText: 'model_provider = "openai"\n',
+    });
+    const failingStore = new ProfileStore(layout, {
+      fileSystem: new FailingIndexProfileFileSystem(),
+      now: () => "2026-08-25T00:00:00.000Z",
+    });
+
+    await assert.rejects(
+      () => failingStore.update(created.id, {
+        name: "Changed Name",
+        kind: "official",
+        configText: 'model_provider = "changed"\n',
+      }),
+      (error: unknown) =>
+        error instanceof ProfileStoreError && error.code === "persistence-failed",
+    );
+
+    assert.equal(await readFile(created.configFile, "utf8"), 'model_provider = "openai"\n');
+    assert.deepEqual(await initialStore.get(created.id), created);
+  });
+});
+
+test("rejects creation through a symbolic profiles root without changing external config bytes", async (t) => {
+  await withTemporaryLayout(async (layout) => {
+    const profilesRoot = join(layout.switcherDir, "profiles");
+    const externalRoot = join(layout.codexHome, "external-profiles");
+    const externalConfig = join(externalRoot, "safe-profile", "config.toml");
+    const externalBefore = 'model_provider = "external"\n';
+    await mkdir(join(externalRoot, "safe-profile"), { recursive: true });
+    await writeFile(externalConfig, externalBefore, "utf8");
+    await mkdir(layout.switcherDir, { recursive: true });
+    try {
+      await symlink(externalRoot, profilesRoot, "dir");
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === "EPERM") {
+        t.skip("Creating symbolic links requires Windows developer privileges.");
+        return;
+      }
+      throw error;
+    }
+
+    const store = new ProfileStore(layout);
+    await assert.rejects(
+      () => store.create({
+        name: "Safe Profile",
+        kind: "official",
+        configText: 'model_provider = "openai"\n',
+      }),
+      (error: unknown) => error instanceof ProfileStoreError && error.code === "persistence-failed",
+    );
+    assert.equal(await readFile(externalConfig, "utf8"), externalBefore);
+  });
+});
+
+test("rejects an edit through a symbolic managed Profile directory without changing external config bytes", async (t) => {
+  await withTemporaryLayout(async (layout) => {
+    const store = new ProfileStore(layout);
+    const profile = await store.create({
+      name: "Managed Profile",
+      kind: "official",
+      configText: 'model_provider = "openai"\n',
+    });
+    const profileDirectory = dirname(profile.configFile);
+    const externalDirectory = join(layout.codexHome, "external-profile");
+    const externalConfig = join(externalDirectory, "config.toml");
+    const externalBefore = 'model_provider = "external"\n';
+    await mkdir(externalDirectory, { recursive: true });
+    await writeFile(externalConfig, externalBefore, "utf8");
+    await rm(profileDirectory, { recursive: true, force: true });
+    try {
+      await symlink(externalDirectory, profileDirectory, "dir");
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === "EPERM") {
+        t.skip("Creating symbolic links requires Windows developer privileges.");
+        return;
+      }
+      throw error;
+    }
+
+    await assert.rejects(
+      () => store.update(profile.id, {
+        name: "Changed Profile",
+        kind: "official",
+        configText: 'model_provider = "custom"\n',
+      }),
+      (error: unknown) => error instanceof ProfileStoreError && error.code === "persistence-failed",
+    );
+    assert.equal(await readFile(externalConfig, "utf8"), externalBefore);
   });
 });
 
@@ -1148,6 +1389,68 @@ test("rolls back a visible config when index persistence fails", async () => {
   });
 });
 
+test("preserves an externally replaced config when Profile creation cannot publish its index", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const configPath = join(
+      layout.switcherDir,
+      "profiles",
+      "externally-replaced-profile",
+      "config.toml",
+    );
+    const externalConfig = 'model_provider = "external"\n';
+    const store = new ProfileStore(layout, {
+      fileSystem: new ExternalConfigEditOnIndexFailureProfileFileSystem(
+        configPath,
+        externalConfig,
+      ),
+    });
+
+    await assert.rejects(
+      () =>
+        store.create({
+          name: "Externally Replaced Profile",
+          kind: "official",
+          configText: 'model_provider = "openai"\n',
+        }),
+      (error: unknown) =>
+        error instanceof ProfileStoreError && error.code === "rollback-failed",
+    );
+
+    assert.equal(await readFile(configPath, "utf8"), externalConfig);
+  });
+});
+
+test("preserves an externally replaced config when Profile update cannot publish its index", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const initialStore = new ProfileStore(layout);
+    const created = await initialStore.create({
+      name: "Externally Replaced Update",
+      kind: "official",
+      configText: 'model_provider = "openai"\n',
+    });
+    const externalConfig = 'model_provider = "external"\n';
+    const store = new ProfileStore(layout, {
+      fileSystem: new ExternalConfigEditOnIndexFailureProfileFileSystem(
+        created.configFile,
+        externalConfig,
+      ),
+    });
+
+    await assert.rejects(
+      () =>
+        store.update(created.id, {
+          name: "Externally Replaced Update",
+          kind: "official",
+          configText: 'model_provider = "updated"\n',
+        }),
+      (error: unknown) =>
+        error instanceof ProfileStoreError && error.code === "rollback-failed",
+    );
+
+    assert.equal(await readFile(created.configFile, "utf8"), externalConfig);
+  });
+});
+
 test("reports a config cleanup failure after index persistence fails", async () => {
   await withTemporaryLayout(async (layout) => {
     const fileSystem = new FailingIndexProfileFileSystem({ failConfigCleanup: true });
@@ -1735,6 +2038,25 @@ class FailingIndexProfileFileSystem extends RecordingProfileFileSystem {
       throw new Error("temporary cleanup failed");
     }
     await unlink(path);
+  }
+}
+
+class ExternalConfigEditOnIndexFailureProfileFileSystem
+  extends RecordingProfileFileSystem
+{
+  constructor(
+    private readonly configPath: string,
+    private readonly externalConfig: string,
+  ) {
+    super();
+  }
+
+  override async rename(from: string, to: string): Promise<void> {
+    if (to.endsWith("index.json")) {
+      await writeFile(this.configPath, this.externalConfig, "utf8");
+      throw new Error("index persistence failed");
+    }
+    await super.rename(from, to);
   }
 }
 
