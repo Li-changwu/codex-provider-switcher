@@ -116,6 +116,11 @@ export class ProfileStoreError extends Error {
   }
 }
 
+interface ProfileDirectoryReservation {
+  readonly id: string;
+  readonly directory: BigIntStats;
+}
+
 export class ProfileStore {
   private readonly fileSystem: ProfileFileSystem;
   private readonly indexPath: string;
@@ -140,22 +145,26 @@ export class ProfileStore {
     assertNoCredentialAssignments(input.configText);
     return this.withProfileLock(async () => {
       const profiles = await this.readProfiles();
-      const id = await this.reserveAvailableProfileId(input.name, profiles);
+      const reservation = await this.reserveAvailableProfileId(input.name, profiles);
       const timestamp = this.now();
       const profile: ProfileRecord = {
-        id,
+        id: reservation.id,
         name: input.name,
         kind: input.kind,
-        configFile: join(this.profilesDir, id, "config.toml"),
+        configFile: join(this.profilesDir, reservation.id, "config.toml"),
         providerId: input.providerId,
         apiKeySecretId:
-          input.kind === "custom" ? profileApiKeySecretId(id) : undefined,
+          input.kind === "custom" ? profileApiKeySecretId(reservation.id) : undefined,
         createdAt: timestamp,
         updatedAt: timestamp,
       };
 
-      await this.ensureTrustedProfileConfig(profile.id, false);
-      await this.writeNewConfigAtomically(profile.configFile, input.configText);
+      await this.ensureTrustedProfileConfig(profile.id, false, reservation.directory);
+      await this.writeNewConfigAtomically(
+        profile.configFile,
+        input.configText,
+        reservation,
+      );
       try {
         await this.writeAtomically(
           this.indexPath,
@@ -313,8 +322,12 @@ export class ProfileStore {
     }
   }
 
-  private async writeNewConfigAtomically(path: string, contents: string): Promise<void> {
-    await this.ensureTrustedProfileWriteTarget(path);
+  private async writeNewConfigAtomically(
+    path: string,
+    contents: string,
+    reservation: ProfileDirectoryReservation,
+  ): Promise<void> {
+    await this.ensureTrustedProfileWriteTarget(path, reservation.directory);
     const temporaryPath = join(
       dirname(path),
       `.${basename(path)}.tmp-${randomUUID()}`,
@@ -326,7 +339,7 @@ export class ProfileStore {
       if (this.platform === "linux") {
         await this.fileSystem.chmod(temporaryPath, linuxPrivateFileMode);
       }
-      await this.ensureTrustedProfileWriteTarget(path);
+      await this.ensureTrustedProfileWriteTarget(path, reservation.directory);
       if (await lstatBigIntIfPresent(path)) {
         throw profilePersistenceError();
       }
@@ -335,7 +348,9 @@ export class ProfileStore {
       // rename, it cannot replace retained recovery state or an external edit.
       await this.fileSystem.link(temporaryPath, path);
       published = true;
+      await this.assertReservedProfileDirectory(reservation);
       await this.removeTemporaryFile(temporaryPath);
+      await this.ensureTrustedProfileWriteTarget(path, reservation.directory);
     } catch (error: unknown) {
       let cleanupError: unknown;
       if (!published) {
@@ -413,7 +428,7 @@ export class ProfileStore {
   private async reserveAvailableProfileId(
     name: string,
     profiles: readonly ProfileRecord[],
-  ): Promise<string> {
+  ): Promise<ProfileDirectoryReservation> {
     const baseId = normalizeProfileId(name);
     const indexedIds = new Set(profiles.map((profile) => profile.id));
     await this.ensureTrustedProfileRoot(true);
@@ -436,19 +451,34 @@ export class ProfileStore {
         }
         throw profilePersistenceError();
       }
-      await ensureTrustedProfileDirectory(directory, profilesRoot, false);
-      return id;
+      const reservedDirectory = await ensureTrustedProfileDirectory(
+        directory,
+        profilesRoot,
+        false,
+      );
+      return { id, directory: reservedDirectory };
     }
   }
 
-  private async ensureTrustedProfileConfig(id: string, requireExisting: boolean): Promise<void> {
+  private async ensureTrustedProfileConfig(
+    id: string,
+    requireExisting: boolean,
+    expectedDirectory?: BigIntStats,
+  ): Promise<void> {
     if (!storedProfileIdPattern.test(id)) {
       throw profilePersistenceError();
     }
     await this.ensureTrustedProfileRoot(true);
     const profileDirectory = join(this.profilesDir, id);
     const profilesRoot = await inspectTrustedProfileDirectory(this.profilesDir);
-    await ensureTrustedProfileDirectory(profileDirectory, profilesRoot, !requireExisting);
+    const directory = await ensureTrustedProfileDirectory(
+      profileDirectory,
+      profilesRoot,
+      !requireExisting,
+    );
+    if (expectedDirectory && !sameProfileFileIdentity(directory, expectedDirectory)) {
+      throw profilePersistenceError();
+    }
     const configPath = join(profileDirectory, "config.toml");
     const stats = await lstatBigIntIfPresent(configPath);
     if (!stats) {
@@ -472,7 +502,10 @@ export class ProfileStore {
     }
   }
 
-  private async ensureTrustedProfileWriteTarget(path: string): Promise<void> {
+  private async ensureTrustedProfileWriteTarget(
+    path: string,
+    expectedDirectory?: BigIntStats,
+  ): Promise<void> {
     const resolvedPath = resolve(path);
     if (sameResolvedPath(resolvedPath, this.indexPath)) {
       await this.ensureTrustedProfileRoot(true);
@@ -490,7 +523,22 @@ export class ProfileStore {
     ) {
       throw profilePersistenceError();
     }
-    await this.ensureTrustedProfileConfig(segments[0], false);
+    await this.ensureTrustedProfileConfig(segments[0], false, expectedDirectory);
+  }
+
+  private async assertReservedProfileDirectory(
+    reservation: ProfileDirectoryReservation,
+  ): Promise<void> {
+    await this.ensureTrustedProfileRoot(true);
+    const profilesRoot = await inspectTrustedProfileDirectory(this.profilesDir);
+    const directory = await ensureTrustedProfileDirectory(
+      join(this.profilesDir, reservation.id),
+      profilesRoot,
+      false,
+    );
+    if (!sameProfileFileIdentity(directory, reservation.directory)) {
+      throw profilePersistenceError();
+    }
   }
 }
 

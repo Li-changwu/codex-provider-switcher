@@ -1463,6 +1463,31 @@ test("does not overwrite config created after a new Profile directory is reserve
   });
 });
 
+test("fails closed when a reserved Profile directory is replaced before config publication", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const configPath = join(
+      layout.switcherDir,
+      "profiles",
+      "directory-race",
+      "config.toml",
+    );
+    const store = new ProfileStore(layout, {
+      fileSystem: new ReplaceDirectoryAfterTemporaryWriteProfileFileSystem(configPath),
+    });
+
+    await assert.rejects(
+      () => store.create({
+        name: "Directory Race",
+        kind: "official",
+        configText: 'model_provider = "extension"\n',
+      }),
+      (error: unknown) =>
+        error instanceof ProfileStoreError && error.code === "persistence-failed",
+    );
+    await assert.rejects(() => readFile(configPath, "utf8"), { code: "ENOENT" });
+  });
+});
+
 test("preserves an externally replaced config when Profile creation cannot publish its index", async () => {
   await withTemporaryLayout(async (layout) => {
     const configPath = join(
@@ -2157,6 +2182,28 @@ class ExternalConfigAfterTemporaryWriteProfileFileSystem
       basename(path).startsWith(".config.toml.tmp-")
     ) {
       await writeFile(this.configPath, this.externalConfig, "utf8");
+    }
+  }
+}
+
+class ReplaceDirectoryAfterTemporaryWriteProfileFileSystem
+  extends RecordingProfileFileSystem
+{
+  constructor(private readonly configPath: string) {
+    super();
+  }
+
+  override async writeFile(path: string, contents: string): Promise<void> {
+    await super.writeFile(path, contents);
+    if (
+      dirname(path) === dirname(this.configPath) &&
+      basename(path).startsWith(".config.toml.tmp-")
+    ) {
+      const originalDirectory = dirname(this.configPath);
+      const movedDirectory = `${originalDirectory}-replaced`;
+      await rename(originalDirectory, movedDirectory);
+      await mkdir(dirname(this.configPath));
+      await writeFile(path, contents, "utf8");
     }
   }
 }
