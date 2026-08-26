@@ -1,5 +1,6 @@
 import {
   chmod as nativeChmod,
+  link as nativeLink,
   lstat as nativeLstat,
   mkdir as nativeMkdir,
   open as nativeOpen,
@@ -43,6 +44,7 @@ export interface ProfileFileSystem {
   mkdir(path: string): Promise<void>;
   readFile(path: string): Promise<string>;
   writeFile(path: string, contents: string): Promise<void>;
+  link(source: string, destination: string): Promise<void>;
   rename(from: string, to: string): Promise<void>;
   chmod(path: string, mode: number): Promise<void>;
   unlink(path: string): Promise<void>;
@@ -138,7 +140,7 @@ export class ProfileStore {
     assertNoCredentialAssignments(input.configText);
     return this.withProfileLock(async () => {
       const profiles = await this.readProfiles();
-      const id = nextProfileId(input.name, profiles);
+      const id = await this.reserveAvailableProfileId(input.name, profiles);
       const timestamp = this.now();
       const profile: ProfileRecord = {
         id,
@@ -153,7 +155,7 @@ export class ProfileStore {
       };
 
       await this.ensureTrustedProfileConfig(profile.id, false);
-      await this.writeAtomically(profile.configFile, input.configText);
+      await this.writeNewConfigAtomically(profile.configFile, input.configText);
       try {
         await this.writeAtomically(
           this.indexPath,
@@ -311,6 +313,61 @@ export class ProfileStore {
     }
   }
 
+  private async writeNewConfigAtomically(path: string, contents: string): Promise<void> {
+    await this.ensureTrustedProfileWriteTarget(path);
+    const temporaryPath = join(
+      dirname(path),
+      `.${basename(path)}.tmp-${randomUUID()}`,
+    );
+    let published = false;
+    try {
+      await this.fileSystem.mkdir(dirname(path));
+      await this.fileSystem.writeFile(temporaryPath, contents);
+      if (this.platform === "linux") {
+        await this.fileSystem.chmod(temporaryPath, linuxPrivateFileMode);
+      }
+      await this.ensureTrustedProfileWriteTarget(path);
+      if (await lstatBigIntIfPresent(path)) {
+        throw profilePersistenceError();
+      }
+
+      // link creates the final name only when it does not already exist. Unlike
+      // rename, it cannot replace retained recovery state or an external edit.
+      await this.fileSystem.link(temporaryPath, path);
+      published = true;
+      await this.removeTemporaryFile(temporaryPath);
+    } catch (error: unknown) {
+      let cleanupError: unknown;
+      if (!published) {
+        try {
+          await this.removeTemporaryFile(temporaryPath);
+        } catch (removeError: unknown) {
+          cleanupError = removeError;
+        }
+      }
+      if (cleanupError !== undefined) {
+        throw new ProfileStoreError(
+          "rollback-failed",
+          "Could not clean up temporary profile data.",
+          {
+            cause: new AggregateError(
+              [error, cleanupError],
+              "Profile data write and cleanup both failed.",
+            ),
+          },
+        );
+      }
+      if (error instanceof ProfileStoreError && error.code === "rollback-failed") {
+        throw error;
+      }
+      throw new ProfileStoreError(
+        "persistence-failed",
+        "Could not write profile data.",
+        { cause: error },
+      );
+    }
+  }
+
   private async removeTemporaryFile(path: string): Promise<void> {
     try {
       await this.fileSystem.unlink(path);
@@ -351,6 +408,37 @@ export class ProfileStore {
       create,
     );
     await ensureTrustedProfileDirectory(this.profilesDir, switcherDirectory, create);
+  }
+
+  private async reserveAvailableProfileId(
+    name: string,
+    profiles: readonly ProfileRecord[],
+  ): Promise<string> {
+    const baseId = normalizeProfileId(name);
+    const indexedIds = new Set(profiles.map((profile) => profile.id));
+    await this.ensureTrustedProfileRoot(true);
+    const profilesRoot = await inspectTrustedProfileDirectory(this.profilesDir);
+    let suffix = 1;
+    while (true) {
+      const id = suffix === 1 ? baseId : `${baseId}-${suffix}`;
+      suffix += 1;
+      if (indexedIds.has(id)) {
+        continue;
+      }
+      const directory = join(this.profilesDir, id);
+      try {
+        // mkdir is the atomic reservation: an existing unindexed directory is
+        // retained recovery state and must never be reused by a new Profile.
+        await nativeMkdir(directory);
+      } catch (error: unknown) {
+        if (isExistingFileError(error)) {
+          continue;
+        }
+        throw profilePersistenceError();
+      }
+      await ensureTrustedProfileDirectory(directory, profilesRoot, false);
+      return id;
+    }
   }
 
   private async ensureTrustedProfileConfig(id: string, requireExisting: boolean): Promise<void> {
@@ -1084,19 +1172,6 @@ function assertNoCredentialAssignments(configText: string): void {
   }
 }
 
-function nextProfileId(name: string, profiles: readonly ProfileRecord[]): string {
-  const baseId = normalizeProfileId(name);
-  const usedIds = new Set(profiles.map((profile) => profile.id));
-  if (!usedIds.has(baseId)) {
-    return baseId;
-  }
-  let suffix = 2;
-  while (usedIds.has(`${baseId}-${suffix}`)) {
-    suffix += 1;
-  }
-  return `${baseId}-${suffix}`;
-}
-
 function parsePublicProfileRecord(
   value: unknown,
   profilesDir: string,
@@ -1156,6 +1231,7 @@ const nativeProfileFileSystem: ProfileFileSystem = {
   async writeFile(path, contents) {
     await nativeWriteFile(path, contents, "utf8");
   },
+  link: nativeLink,
   rename: nativeRename,
   chmod: nativeChmod,
   unlink: nativeUnlink,

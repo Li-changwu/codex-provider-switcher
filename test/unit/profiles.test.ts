@@ -3,6 +3,7 @@ import {
   chmod,
   mkdir,
   mkdtemp,
+  link,
   open,
   readFile,
   rename,
@@ -1259,7 +1260,7 @@ test("rejects undocumented generic provider retry and timeout fields", async () 
   }
 });
 
-test("uses same-directory atomic renames and requests Linux 0600 file modes", async () => {
+test("uses no-clobber config publication, atomic index renames, and Linux 0600 file modes", async () => {
   await withTemporaryLayout(async (layout) => {
     const fileSystem = new RecordingProfileFileSystem();
     const store = new ProfileStore(layout, {
@@ -1274,7 +1275,13 @@ test("uses same-directory atomic renames and requests Linux 0600 file modes", as
       configText: 'model_provider = "openai"\n',
     });
 
-    assert.ok(fileSystem.renames.length >= 2);
+    assert.equal(fileSystem.links.length, 1);
+    assert.ok(
+      fileSystem.links.every(
+        ({ from, to }) => dirname(from) === dirname(to) && basename(from).includes(".tmp-"),
+      ),
+    );
+    assert.ok(fileSystem.renames.length >= 1);
     assert.ok(
       fileSystem.renames.every(
         ({ from, to }) => dirname(from) === dirname(to) && basename(from).includes(".tmp-"),
@@ -1387,6 +1394,72 @@ test("preserves the just-written config when index persistence fails", async () 
 
     assert.equal(await readFile(configPath, "utf8"), 'model_provider = "openai"\n');
     assert.equal(fileSystem.unlinked.includes(configPath), false);
+  });
+});
+
+test("allocates a new Profile id instead of overwriting retained config after a failed create", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const failingStore = new ProfileStore(layout, {
+      fileSystem: new FailingIndexProfileFileSystem(),
+    });
+    const retainedConfigPath = join(
+      layout.switcherDir,
+      "profiles",
+      "retry-profile",
+      "config.toml",
+    );
+    const externalConfig = 'model_provider = "external"\n';
+
+    await assert.rejects(
+      () => failingStore.create({
+        name: "Retry Profile",
+        kind: "official",
+        configText: 'model_provider = "initial"\n',
+      }),
+      (error: unknown) =>
+        error instanceof ProfileStoreError && error.code === "rollback-failed",
+    );
+    await writeFile(retainedConfigPath, externalConfig, "utf8");
+
+    const created = await new ProfileStore(layout).create({
+      name: "Retry Profile",
+      kind: "official",
+      configText: 'model_provider = "replacement"\n',
+    });
+
+    assert.equal(created.id, "retry-profile-2");
+    assert.equal(await readFile(retainedConfigPath, "utf8"), externalConfig);
+    assert.equal(await readFile(created.configFile, "utf8"), 'model_provider = "replacement"\n');
+  });
+});
+
+test("does not overwrite config created after a new Profile directory is reserved", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const configPath = join(
+      layout.switcherDir,
+      "profiles",
+      "publish-race",
+      "config.toml",
+    );
+    const externalConfig = 'model_provider = "external"\n';
+    const store = new ProfileStore(layout, {
+      fileSystem: new ExternalConfigAfterTemporaryWriteProfileFileSystem(
+        configPath,
+        externalConfig,
+      ),
+    });
+
+    await assert.rejects(
+      () => store.create({
+        name: "Publish Race",
+        kind: "official",
+        configText: 'model_provider = "extension"\n',
+      }),
+      (error: unknown) =>
+        error instanceof ProfileStoreError && error.code === "persistence-failed",
+    );
+
+    assert.equal(await readFile(configPath, "utf8"), externalConfig);
   });
 });
 
@@ -1598,6 +1671,7 @@ async function withTemporaryLayout(
 }
 
 class RecordingProfileFileSystem implements ProfileFileSystem {
+  readonly links: Array<{ from: string; to: string }> = [];
   readonly renames: Array<{ from: string; to: string }> = [];
   readonly chmods: Array<{ path: string; mode: number }> = [];
   readonly unlinked: string[] = [];
@@ -1612,6 +1686,11 @@ class RecordingProfileFileSystem implements ProfileFileSystem {
 
   async writeFile(path: string, contents: string): Promise<void> {
     await writeFile(path, contents, "utf8");
+  }
+
+  async link(from: string, to: string): Promise<void> {
+    this.links.push({ from, to });
+    await link(from, to);
   }
 
   async rename(from: string, to: string): Promise<void> {
@@ -2058,6 +2137,27 @@ class ExternalConfigEditOnIndexFailureProfileFileSystem
       throw new Error("index persistence failed");
     }
     await super.rename(from, to);
+  }
+}
+
+class ExternalConfigAfterTemporaryWriteProfileFileSystem
+  extends RecordingProfileFileSystem
+{
+  constructor(
+    private readonly configPath: string,
+    private readonly externalConfig: string,
+  ) {
+    super();
+  }
+
+  override async writeFile(path: string, contents: string): Promise<void> {
+    await super.writeFile(path, contents);
+    if (
+      dirname(path) === dirname(this.configPath) &&
+      basename(path).startsWith(".config.toml.tmp-")
+    ) {
+      await writeFile(this.configPath, this.externalConfig, "utf8");
+    }
   }
 }
 
