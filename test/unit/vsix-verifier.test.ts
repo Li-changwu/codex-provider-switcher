@@ -52,6 +52,37 @@ for (const requiredEntry of ["[Content_Types].xml", "extension.vsixmanifest"]) {
   });
 }
 
+test("rejects a VSIX without required README documentation", async (context) => {
+  const directory = await mkdtemp(join(tmpdir(), "codex-provider-switcher-vsix-"));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  const vsixPath = join(directory, "missing-readme.vsix");
+  const entries = baseEntries();
+  delete entries["extension/README.md"];
+
+  await writeVsix(vsixPath, entries);
+
+  await assert.rejects(
+    verifyVsix(vsixPath),
+    /VSIX is missing required entry: extension\/README\.md/,
+  );
+});
+
+test("permits required README documentation in a VSIX", async (context) => {
+  const directory = await mkdtemp(join(tmpdir(), "codex-provider-switcher-vsix-"));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  const vsixPath = join(directory, "readme.vsix");
+
+  await writeVsix(vsixPath, baseEntries());
+
+  await assert.rejects(
+    verifyVsix(vsixPath, {
+      expectedNativeBindingEntry:
+        "extension/node_modules/sqlite3/bindings/current/binding.node",
+    }),
+    new RegExp(`Missing native SQLite binding under: ${escapeRegex(sqlitePrefix)}`),
+  );
+});
+
 test("rejects an archive entry that exceeds the configured extraction limit", async (context) => {
   const directory = await mkdtemp(join(tmpdir(), "codex-provider-switcher-vsix-"));
   context.after(() => rm(directory, { recursive: true, force: true }));
@@ -418,6 +449,7 @@ function baseEntries(): Record<string, string> {
     "extension.vsixmanifest":
       '<?xml version="1.0" encoding="utf-8"?><PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011"><Metadata><Identity Id="fixture" Version="0.0.0" Publisher="fixture"/></Metadata><Installation><InstallationTarget Id="Microsoft.VisualStudio.Code"/></Installation></PackageManifest>',
     "extension/.gitignore": "node_modules/\n",
+    "extension/README.md": "# Codex Provider Switcher\n",
     "extension/package.json": "{}",
     "extension/dist/extension.js": "",
   };

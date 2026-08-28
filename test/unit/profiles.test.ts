@@ -103,6 +103,46 @@ test("updates a profile without changing its identity, creation time, or custom 
   });
 });
 
+test("reads managed Profile TOML through the ProfileStore trust boundary", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const store = new ProfileStore(layout);
+    const configText = 'model_provider = "openai"\nmodel = "gpt-5"\n';
+    const created = await store.create({
+      name: "Read Config",
+      kind: "official",
+      configText,
+    });
+
+    assert.equal(await store.readConfig(created.id), configText);
+    assert.equal(await store.readConfig("missing-profile"), undefined);
+  });
+});
+
+test("rejects an external config replacement that races the trusted read handle", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const initialStore = new ProfileStore(layout);
+    const created = await initialStore.create({
+      name: "Read Race",
+      kind: "official",
+      configText: 'model_provider = "openai"\n',
+    });
+    const externalConfig = join(layout.codexHome, "external.toml");
+    await writeFile(externalConfig, 'model_provider = "external"\n', "utf8");
+    const store = new ProfileStore(layout, {
+      fileSystem: new ReplaceConfigBeforeReadHandleProfileFileSystem(
+        created.configFile,
+        externalConfig,
+      ),
+    });
+
+    await assert.rejects(
+      () => store.readConfig(created.id),
+      (error: unknown) => error instanceof ProfileStoreError
+        && error.code === "persistence-failed",
+    );
+  });
+});
+
 test("rejects a tampered Profile index config path before update can touch auth or external files", async () => {
   await withTemporaryLayout(async (layout) => {
     const store = new ProfileStore(layout);
@@ -1725,6 +1765,15 @@ class RecordingProfileFileSystem implements ProfileFileSystem {
     return readFile(path, "utf8");
   }
 
+  async openRead(path: string) {
+    const handle = await open(path, "r");
+    return {
+      stat: () => handle.stat({ bigint: true }),
+      readFile: () => handle.readFile({ encoding: "utf8" }),
+      close: () => handle.close(),
+    };
+  }
+
   async writeFile(path: string, contents: string): Promise<void> {
     await writeFile(path, contents, "utf8");
   }
@@ -2182,6 +2231,28 @@ class ExternalConfigBeforeExclusiveWriteProfileFileSystem
   override async writeFileExclusive(path: string, contents: string, mode: number): Promise<void> {
     await writeFile(this.configPath, this.externalConfig, "utf8");
     await super.writeFileExclusive(path, contents, mode);
+  }
+}
+
+class ReplaceConfigBeforeReadHandleProfileFileSystem
+  extends RecordingProfileFileSystem
+{
+  private replaced = false;
+
+  constructor(
+    private readonly configPath: string,
+    private readonly externalConfigPath: string,
+  ) {
+    super();
+  }
+
+  override async openRead(path: string) {
+    if (!this.replaced && path === this.configPath) {
+      this.replaced = true;
+      await rm(this.configPath);
+      await rename(this.externalConfigPath, this.configPath);
+    }
+    return super.openRead(path);
   }
 }
 
