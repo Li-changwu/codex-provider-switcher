@@ -1,6 +1,5 @@
 import {
   chmod as nativeChmod,
-  link as nativeLink,
   lstat as nativeLstat,
   mkdir as nativeMkdir,
   open as nativeOpen,
@@ -44,7 +43,7 @@ export interface ProfileFileSystem {
   mkdir(path: string): Promise<void>;
   readFile(path: string): Promise<string>;
   writeFile(path: string, contents: string): Promise<void>;
-  link(source: string, destination: string): Promise<void>;
+  writeFileExclusive(path: string, contents: string, mode: number): Promise<void>;
   rename(from: string, to: string): Promise<void>;
   chmod(path: string, mode: number): Promise<void>;
   unlink(path: string): Promise<void>;
@@ -160,7 +159,7 @@ export class ProfileStore {
       };
 
       await this.ensureTrustedProfileConfig(profile.id, false, reservation.directory);
-      await this.writeNewConfigAtomically(
+      await this.writeNewConfigExclusively(
         profile.configFile,
         input.configText,
         reservation,
@@ -266,11 +265,17 @@ export class ProfileStore {
     }
 
     try {
-      const parsed = JSON.parse(contents) as { profiles?: unknown };
-      if (!Array.isArray(parsed.profiles)) {
+      const parsed = JSON.parse(contents) as unknown;
+      if (
+        !parsed ||
+        typeof parsed !== "object" ||
+        Array.isArray(parsed) ||
+        !hasOnlyProfileIndexKeys(parsed as Record<string, unknown>) ||
+        !Array.isArray((parsed as { profiles?: unknown }).profiles)
+      ) {
         throw new Error("missing profiles");
       }
-      return parsed.profiles.map((profile) =>
+      return (parsed as { profiles: unknown[] }).profiles.map((profile) =>
         parsePublicProfileRecord(profile, this.profilesDir),
       );
     } catch {
@@ -322,56 +327,24 @@ export class ProfileStore {
     }
   }
 
-  private async writeNewConfigAtomically(
+  private async writeNewConfigExclusively(
     path: string,
     contents: string,
     reservation: ProfileDirectoryReservation,
   ): Promise<void> {
     await this.ensureTrustedProfileWriteTarget(path, reservation.directory);
-    const temporaryPath = join(
-      dirname(path),
-      `.${basename(path)}.tmp-${randomUUID()}`,
-    );
-    let published = false;
     try {
       await this.fileSystem.mkdir(dirname(path));
-      await this.fileSystem.writeFile(temporaryPath, contents);
-      if (this.platform === "linux") {
-        await this.fileSystem.chmod(temporaryPath, linuxPrivateFileMode);
-      }
       await this.ensureTrustedProfileWriteTarget(path, reservation.directory);
       if (await lstatBigIntIfPresent(path)) {
         throw profilePersistenceError();
       }
-
-      // link creates the final name only when it does not already exist. Unlike
-      // rename, it cannot replace retained recovery state or an external edit.
-      await this.fileSystem.link(temporaryPath, path);
-      published = true;
+      // The Profile is not indexed yet, so exclusive creation avoids overwriting
+      // another writer while no visible saved Profile can observe a partial file.
+      await this.fileSystem.writeFileExclusive(path, contents, linuxPrivateFileMode);
       await this.assertReservedProfileDirectory(reservation);
-      await this.removeTemporaryFile(temporaryPath);
       await this.ensureTrustedProfileWriteTarget(path, reservation.directory);
     } catch (error: unknown) {
-      let cleanupError: unknown;
-      if (!published) {
-        try {
-          await this.removeTemporaryFile(temporaryPath);
-        } catch (removeError: unknown) {
-          cleanupError = removeError;
-        }
-      }
-      if (cleanupError !== undefined) {
-        throw new ProfileStoreError(
-          "rollback-failed",
-          "Could not clean up temporary profile data.",
-          {
-            cause: new AggregateError(
-              [error, cleanupError],
-              "Profile data write and cleanup both failed.",
-            ),
-          },
-        );
-      }
       if (error instanceof ProfileStoreError && error.code === "rollback-failed") {
         throw error;
       }
@@ -393,7 +366,7 @@ export class ProfileStore {
     }
   }
 
-  private async withProfileLock<Result>(
+  async withProfileLock<Result>(
     operation: () => Promise<Result>,
   ): Promise<Result> {
     await this.ensureTrustedProfileRoot(true);
@@ -1259,6 +1232,10 @@ function hasOnlyPublicProfileRecordKeys(
   return Object.keys(value).every((key) => publicProfileRecordKeys.has(key));
 }
 
+function hasOnlyProfileIndexKeys(value: Record<string, unknown>): boolean {
+  return Object.keys(value).every((key) => key === "profiles");
+}
+
 function isMissingFileError(error: unknown): error is NodeJS.ErrnoException {
   return typeof error === "object" && error !== null && (error as NodeJS.ErrnoException).code === "ENOENT";
 }
@@ -1279,7 +1256,9 @@ const nativeProfileFileSystem: ProfileFileSystem = {
   async writeFile(path, contents) {
     await nativeWriteFile(path, contents, "utf8");
   },
-  link: nativeLink,
+  async writeFileExclusive(path, contents, mode) {
+    await nativeWriteFile(path, contents, { encoding: "utf8", flag: "wx", mode });
+  },
   rename: nativeRename,
   chmod: nativeChmod,
   unlink: nativeUnlink,

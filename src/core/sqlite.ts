@@ -1,4 +1,5 @@
 import sqlite3 from "sqlite3";
+import { lstat } from "node:fs/promises";
 import type { CodexLayout } from "./types";
 
 const supportedSchemaVersion = 5;
@@ -23,6 +24,7 @@ export type SqliteErrorCode =
   | "invalid-provider"
   | "unreadable"
   | "locked"
+  | "write-ahead-log"
   | "operation-failed";
 
 export class SqliteError extends Error {
@@ -55,6 +57,11 @@ export interface SqliteUpdateResult {
   changedRowCount: number;
   encryptedContentCount: number;
   warnings: string[];
+}
+
+export interface SqliteUpdateOptions {
+  /** Runs after BEGIN IMMEDIATE has excluded other writers, before any update. */
+  beforeUpdate?(): void | Promise<void>;
 }
 
 interface TableInfoRow {
@@ -127,6 +134,7 @@ export async function updateProviderMetadata(
   layout: CodexLayout,
   targetProvider: string,
   signal?: AbortSignal,
+  options: SqliteUpdateOptions = {},
 ): Promise<SqliteUpdateResult> {
   assertTargetProvider(targetProvider);
   if (signal?.aborted) {
@@ -139,10 +147,11 @@ export async function updateProviderMetadata(
   let closeError: unknown;
 
   try {
+    await assertNoWriteAheadLogFiles(layout.sqlitePath);
     database = await openDatabase(layout.sqlitePath, sqlite3.OPEN_READWRITE);
     database.configure("busyTimeout", busyTimeoutMs);
     database.serialize();
-    result = await updateOpenDatabase(database, targetProvider, signal);
+    result = await updateOpenDatabase(database, targetProvider, signal, options.beforeUpdate);
   } catch (error: unknown) {
     if (error instanceof CancellationRequested) {
       result = cancelledResult();
@@ -198,6 +207,7 @@ async function updateOpenDatabase(
   database: sqlite3.Database,
   targetProvider: string,
   signal?: AbortSignal,
+  beforeUpdate?: () => void | Promise<void>,
 ): Promise<SqliteUpdateResult> {
   throwIfCancelled(signal);
   const schema = await readSupportedSchema(database, signal);
@@ -225,6 +235,9 @@ async function updateOpenDatabase(
 
   let transactionActive = true;
   try {
+    throwIfCancelled(signal);
+    await assertRollbackJournalMode(database);
+    await beforeUpdate?.();
     throwIfCancelled(signal);
     const encryptedContentCount = schema.hasEncryptedContent
       ? await readCount(
@@ -266,10 +279,44 @@ async function updateOpenDatabase(
     if (error instanceof CancellationRequested) {
       return cancelledResult();
     }
+    if (error instanceof SqliteError) {
+      throw error;
+    }
     if (isBusyError(error)) {
       return lockedResult();
     }
     throw operationError("The SQLite metadata transaction failed.", error);
+  }
+}
+
+async function assertNoWriteAheadLogFiles(sqlitePath: string): Promise<void> {
+  for (const sidecar of [`${sqlitePath}-wal`, `${sqlitePath}-shm`]) {
+    try {
+      await lstat(sidecar);
+    } catch (error: unknown) {
+      if (isMissingFileError(error)) {
+        continue;
+      }
+      throw new SqliteError(
+        "unreadable",
+        "The Codex state database sidecar could not be inspected.",
+        { cause: error },
+      );
+    }
+    throw new SqliteError(
+      "write-ahead-log",
+      "The Codex state database has active write-ahead-log state.",
+    );
+  }
+}
+
+async function assertRollbackJournalMode(database: sqlite3.Database): Promise<void> {
+  const journal = await getRow<{ journal_mode?: unknown }>(database, "PRAGMA journal_mode");
+  if (typeof journal?.journal_mode !== "string" || journal.journal_mode.toLowerCase() === "wal") {
+    throw new SqliteError(
+      "write-ahead-log",
+      "The Codex state database must not use write-ahead-log mode during a provider switch.",
+    );
   }
 }
 
@@ -429,6 +476,14 @@ function isBusyError(error: unknown): boolean {
     candidate.code === "SQLITE_LOCKED" ||
     candidate.errno === sqlite3.BUSY ||
     candidate.errno === sqlite3.LOCKED
+  );
+}
+
+function isMissingFileError(error: unknown): error is NodeJS.ErrnoException {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as NodeJS.ErrnoException).code === "ENOENT"
   );
 }
 

@@ -3,7 +3,6 @@ import {
   chmod,
   mkdir,
   mkdtemp,
-  link,
   open,
   readFile,
   rename,
@@ -179,6 +178,27 @@ test("rejects Profile index entries with non-public fields", async () => {
       };
       await writeFile(indexPath, `${JSON.stringify(index)}\n`, "utf8");
     }
+  });
+});
+
+test("rejects Profile indexes with unknown top-level fields", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const store = new ProfileStore(layout);
+    await store.create({
+      name: "Strict Index Root",
+      kind: "official",
+      configText: 'model_provider = "openai"\n',
+    });
+    const indexPath = join(layout.switcherDir, "profiles", "index.json");
+    const index = JSON.parse(await readFile(indexPath, "utf8")) as Record<string, unknown>;
+    index.OPENAI_API_KEY = "untrusted";
+    await writeFile(indexPath, `${JSON.stringify(index)}\n`, "utf8");
+
+    await assert.rejects(
+      () => store.list(),
+      (error: unknown) =>
+        error instanceof ProfileStoreError && error.code === "index-invalid",
+    );
   });
 });
 
@@ -1260,7 +1280,7 @@ test("rejects undocumented generic provider retry and timeout fields", async () 
   }
 });
 
-test("uses no-clobber config publication, atomic index renames, and Linux 0600 file modes", async () => {
+test("uses exclusive config creation, atomic index renames, and Linux 0600 file modes", async () => {
   await withTemporaryLayout(async (layout) => {
     const fileSystem = new RecordingProfileFileSystem();
     const store = new ProfileStore(layout, {
@@ -1275,19 +1295,15 @@ test("uses no-clobber config publication, atomic index renames, and Linux 0600 f
       configText: 'model_provider = "openai"\n',
     });
 
-    assert.equal(fileSystem.links.length, 1);
-    assert.ok(
-      fileSystem.links.every(
-        ({ from, to }) => dirname(from) === dirname(to) && basename(from).includes(".tmp-"),
-      ),
-    );
     assert.ok(fileSystem.renames.length >= 1);
     assert.ok(
       fileSystem.renames.every(
         ({ from, to }) => dirname(from) === dirname(to) && basename(from).includes(".tmp-"),
       ),
     );
-    assert.ok(fileSystem.chmods.length >= 2);
+    assert.equal(fileSystem.exclusiveWrites.length, 1);
+    assert.equal(fileSystem.exclusiveWrites[0]?.mode, 0o600);
+    assert.ok(fileSystem.chmods.length >= 1);
     assert.ok(fileSystem.chmods.every(({ mode }) => mode === 0o600));
   });
 });
@@ -1344,7 +1360,7 @@ test("wraps profile write I/O errors without writing profile files", async () =>
   });
 });
 
-test("preserves both profile write and temporary cleanup failures", async () => {
+test("reports exclusive Profile config write failures without cleanup attempts", async () => {
   await withTemporaryLayout(async (layout) => {
     const fileSystem = new FailingWriteAndTemporaryCleanupProfileFileSystem();
     const store = new ProfileStore(layout, { fileSystem });
@@ -1358,12 +1374,8 @@ test("preserves both profile write and temporary cleanup failures", async () => 
         }),
       (error: unknown) => {
         assert.ok(error instanceof ProfileStoreError);
-        assert.equal(error.code, "rollback-failed");
-        assert.ok(error.cause instanceof AggregateError);
-        assert.deepEqual(error.cause.errors, [
-          fileSystem.writeFailure,
-          fileSystem.cleanupFailure,
-        ]);
+        assert.equal(error.code, "persistence-failed");
+        assert.equal(error.cause, fileSystem.writeFailure);
         return true;
       },
     );
@@ -1443,7 +1455,7 @@ test("does not overwrite config created after a new Profile directory is reserve
     );
     const externalConfig = 'model_provider = "external"\n';
     const store = new ProfileStore(layout, {
-      fileSystem: new ExternalConfigAfterTemporaryWriteProfileFileSystem(
+      fileSystem: new ExternalConfigBeforeExclusiveWriteProfileFileSystem(
         configPath,
         externalConfig,
       ),
@@ -1484,7 +1496,11 @@ test("fails closed when a reserved Profile directory is replaced before config p
       (error: unknown) =>
         error instanceof ProfileStoreError && error.code === "persistence-failed",
     );
-    await assert.rejects(() => readFile(configPath, "utf8"), { code: "ENOENT" });
+    assert.equal(await readFile(configPath, "utf8"), 'model_provider = "extension"\n');
+    await assert.rejects(
+      () => readFile(join(layout.switcherDir, "profiles", "index.json"), "utf8"),
+      { code: "ENOENT" },
+    );
   });
 });
 
@@ -1696,7 +1712,7 @@ async function withTemporaryLayout(
 }
 
 class RecordingProfileFileSystem implements ProfileFileSystem {
-  readonly links: Array<{ from: string; to: string }> = [];
+  readonly exclusiveWrites: Array<{ path: string; mode: number }> = [];
   readonly renames: Array<{ from: string; to: string }> = [];
   readonly chmods: Array<{ path: string; mode: number }> = [];
   readonly unlinked: string[] = [];
@@ -1713,9 +1729,14 @@ class RecordingProfileFileSystem implements ProfileFileSystem {
     await writeFile(path, contents, "utf8");
   }
 
-  async link(from: string, to: string): Promise<void> {
-    this.links.push({ from, to });
-    await link(from, to);
+  async writeFileExclusive(path: string, contents: string, mode: number): Promise<void> {
+    this.exclusiveWrites.push({ path, mode });
+    const handle = await open(path, "wx", mode);
+    try {
+      await handle.writeFile(contents, "utf8");
+    } finally {
+      await handle.close();
+    }
   }
 
   async rename(from: string, to: string): Promise<void> {
@@ -2087,33 +2108,16 @@ class FailingMkdirProfileFileSystem extends RecordingProfileFileSystem {
 class FailingWriteProfileFileSystem extends RecordingProfileFileSystem {
   readonly failure = createFileSystemError("EIO", "profile write failed");
 
-  override async writeFile(path: string, contents: string): Promise<void> {
-    if (path.includes(".config.toml.tmp-")) {
-      throw this.failure;
-    }
-    await super.writeFile(path, contents);
+  override async writeFileExclusive(): Promise<void> {
+    throw this.failure;
   }
 }
 
 class FailingWriteAndTemporaryCleanupProfileFileSystem extends RecordingProfileFileSystem {
   readonly writeFailure = createFileSystemError("EIO", "profile write failed");
-  readonly cleanupFailure = createFileSystemError(
-    "EIO",
-    "temporary profile cleanup failed",
-  );
 
-  override async writeFile(path: string, contents: string): Promise<void> {
-    if (path.includes(".config.toml.tmp-")) {
-      throw this.writeFailure;
-    }
-    await super.writeFile(path, contents);
-  }
-
-  override async unlink(path: string): Promise<void> {
-    if (path.includes(".config.toml.tmp-")) {
-      throw this.cleanupFailure;
-    }
-    await super.unlink(path);
+  override async writeFileExclusive(): Promise<void> {
+    throw this.writeFailure;
   }
 }
 
@@ -2165,7 +2169,7 @@ class ExternalConfigEditOnIndexFailureProfileFileSystem
   }
 }
 
-class ExternalConfigAfterTemporaryWriteProfileFileSystem
+class ExternalConfigBeforeExclusiveWriteProfileFileSystem
   extends RecordingProfileFileSystem
 {
   constructor(
@@ -2175,14 +2179,9 @@ class ExternalConfigAfterTemporaryWriteProfileFileSystem
     super();
   }
 
-  override async writeFile(path: string, contents: string): Promise<void> {
-    await super.writeFile(path, contents);
-    if (
-      dirname(path) === dirname(this.configPath) &&
-      basename(path).startsWith(".config.toml.tmp-")
-    ) {
-      await writeFile(this.configPath, this.externalConfig, "utf8");
-    }
+  override async writeFileExclusive(path: string, contents: string, mode: number): Promise<void> {
+    await writeFile(this.configPath, this.externalConfig, "utf8");
+    await super.writeFileExclusive(path, contents, mode);
   }
 }
 
@@ -2193,18 +2192,12 @@ class ReplaceDirectoryAfterTemporaryWriteProfileFileSystem
     super();
   }
 
-  override async writeFile(path: string, contents: string): Promise<void> {
-    await super.writeFile(path, contents);
-    if (
-      dirname(path) === dirname(this.configPath) &&
-      basename(path).startsWith(".config.toml.tmp-")
-    ) {
-      const originalDirectory = dirname(this.configPath);
-      const movedDirectory = `${originalDirectory}-replaced`;
-      await rename(originalDirectory, movedDirectory);
-      await mkdir(dirname(this.configPath));
-      await writeFile(path, contents, "utf8");
-    }
+  override async writeFileExclusive(path: string, contents: string, mode: number): Promise<void> {
+    const originalDirectory = dirname(this.configPath);
+    const movedDirectory = `${originalDirectory}-replaced`;
+    await rename(originalDirectory, movedDirectory);
+    await mkdir(dirname(this.configPath));
+    await super.writeFileExclusive(path, contents, mode);
   }
 }
 

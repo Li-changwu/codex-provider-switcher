@@ -3,6 +3,7 @@ import { access, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from
 import { dirname, join } from "node:path";
 import test from "node:test";
 import {
+  applyRolloutChanges,
   collectRolloutChanges,
   createRolloutInversePatches,
 } from "../../src/core/rollouts";
@@ -56,6 +57,28 @@ test("prepares a planned mutation before its apply writes visible state", async 
     assert.equal(applied, true);
     assert.deepEqual(journalStates, ["config"]);
     assert.equal(await readFile(layout.configPath, "utf8"), "changed");
+  });
+});
+
+test("starts generic switches with a durable strict source-version journal", async () => {
+  await withLayout(async (layout) => {
+    let journalPath: string | undefined;
+
+    const result = await switchProfile(
+      { targetProfileId: "target" },
+      dependencies(layout, {
+        preflight: async (context) => {
+          journalPath = context.transaction.journalPath;
+        },
+      }),
+    );
+
+    assert.equal(result.status, "committed");
+    assert.equal(journalPath === undefined, false);
+    assert.equal(
+      (await readTransactionJournal(journalPath!))[0]?.sourceVersionProtocol,
+      true,
+    );
   });
 });
 
@@ -144,7 +167,7 @@ test("does not apply a config mutation when only an unrelated SQLite byte backup
   });
 });
 
-test("rolls back a planned auth mutation that throws after changing auth mode", async () => {
+test("requires recovery when an auth mutation throws after changing auth mode before evidence is recorded", async () => {
   await withLayout(async (layout) => {
     let authMode = "official";
     const mutation: PreparedSwitchMutation = {
@@ -152,6 +175,7 @@ test("rolls back a planned auth mutation that throws after changing auth mode", 
       target: { kind: "auth", path: layout.authPath, previousMode: "official" },
       apply: async () => {
         authMode = "custom";
+        await writeFile(layout.authPath, '{"mode":"custom"}\n', "utf8");
         throw new Error("injected auth failure");
       },
       rollback: async () => {
@@ -174,8 +198,9 @@ test("rolls back a planned auth mutation that throws after changing auth mode", 
     );
 
     assert.equal(result.status, "failed");
-    assert.equal(result.journalState, "rolledBack");
-    assert.equal(authMode, "official");
+    assert.equal(result.journalState, "recoveryRequired");
+    assert.equal(authMode, "custom");
+    assert.equal(await readFile(layout.authPath, "utf8"), '{"mode":"custom"}\n');
   });
 });
 
@@ -224,7 +249,304 @@ test("uses the durable transaction rollback when callbacks leave config and SQLi
   });
 });
 
-test("marks recovery required when a callback fails after durable data changed", async () => {
+test("does not invoke mutation rollback callbacks after durable rollback begins", async () => {
+  await withLayout(async (layout) => {
+    let rollbackCallbackCalled = false;
+    const configMutation: PreparedSwitchMutation = {
+      name: "change config",
+      target: { kind: "config", path: layout.configPath },
+      apply: async () => writeFile(layout.configPath, "changed config", "utf8"),
+      rollback: async () => {
+        rollbackCallbackCalled = true;
+        await writeFile(layout.configPath, "callback overwrite", "utf8");
+      },
+    };
+    const failingMutation: PreparedSwitchMutation = {
+      name: "fail before commit",
+      target: { kind: "config", path: layout.configPath },
+      apply: async () => {
+        throw new Error("injected failure");
+      },
+      rollback: async () => undefined,
+    };
+
+    const result = await switchProfile(
+      { targetProfileId: "target" },
+      dependencies(layout, {
+        mutationPlan: {
+          rollouts: [],
+          sqlite: [],
+          commit: [configMutation, failingMutation],
+        },
+      }),
+    );
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.journalState, "rolledBack");
+    assert.equal(rollbackCallbackCalled, false);
+    assert.equal(await readFile(layout.configPath, "utf8"), "before");
+  });
+});
+
+test("fails closed before mutation when config changes after backup and preserves the external bytes", async () => {
+  await withLayout(async (layout) => {
+    let configMutationApplied = false;
+    const result = await switchProfile(
+      { targetProfileId: "target" },
+      dependencies(layout, {
+        scan: async () => {
+          await writeFile(layout.configPath, "native change after backup", "utf8");
+        },
+        mutationPlan: {
+          rollouts: [],
+          sqlite: [],
+          commit: [{
+            name: "materialize config",
+            target: { kind: "config", path: layout.configPath },
+            apply: async () => {
+              configMutationApplied = true;
+              await writeFile(layout.configPath, "extension config", "utf8");
+            },
+            rollback: async () => undefined,
+          }],
+        },
+      }),
+    );
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.journalState, "recoveryRequired");
+    assert.equal(configMutationApplied, false);
+    assert.equal(await readFile(layout.configPath, "utf8"), "native change after backup");
+  });
+});
+
+test("marks recovery required instead of restoring stale config after an external change follows application", async () => {
+  await withLayout(async (layout) => {
+    const result = await switchProfile(
+      { targetProfileId: "target" },
+      dependencies(layout, {
+        mutationPlan: {
+          rollouts: [],
+          sqlite: [],
+          commit: [
+            {
+              name: "materialize config",
+              target: { kind: "config", path: layout.configPath },
+              apply: async () => writeFile(layout.configPath, "extension config", "utf8"),
+              rollback: async () => undefined,
+            },
+            {
+              name: "external native write and failure",
+              target: { kind: "config", path: layout.configPath },
+              apply: async () => {
+                await writeFile(layout.configPath, "native change after apply", "utf8");
+                throw new Error("injected failure after external write");
+              },
+              rollback: async () => undefined,
+            },
+          ],
+        },
+      }),
+    );
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.journalState, "recoveryRequired");
+    assert.equal(await readFile(layout.configPath, "utf8"), "native change after apply");
+  });
+});
+
+test("marks recovery required when a byte mutation changes config and throws before applied state is recorded", async () => {
+  await withLayout(async (layout) => {
+    const result = await switchProfile(
+      { targetProfileId: "target" },
+      dependencies(layout, {
+        mutationPlan: {
+          rollouts: [],
+          sqlite: [],
+          commit: [{
+            name: "partially materialize config",
+            target: { kind: "config", path: layout.configPath },
+            apply: async () => {
+              await writeFile(layout.configPath, "unknown write before failure", "utf8");
+              throw new Error("injected failure after config write");
+            },
+            rollback: async () => undefined,
+          }],
+        },
+      }),
+    );
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.journalState, "recoveryRequired");
+    assert.equal(await readFile(layout.configPath, "utf8"), "unknown write before failure");
+  });
+});
+
+test("passes a fail-closed publish-boundary assertion to mutation apply", async () => {
+  await withLayout(async (layout) => {
+    let receivedBoundaryAssertion = false;
+    const mutation: PreparedSwitchMutation = {
+      name: "materialize config at publish boundary",
+      target: { kind: "config", path: layout.configPath },
+      apply: async (context) => {
+        receivedBoundaryAssertion = typeof context?.assertTargetUnchanged === "function";
+        assert.equal(receivedBoundaryAssertion, true);
+        await writeFile(layout.configPath, "native bytes at publish boundary", "utf8");
+        await context.assertTargetUnchanged();
+      },
+      rollback: async () => undefined,
+    };
+
+    const result = await switchProfile(
+      { targetProfileId: "target" },
+      dependencies(layout, {
+        mutationPlan: {
+          rollouts: [],
+          sqlite: [],
+          commit: [mutation],
+        },
+      }),
+    );
+
+    assert.equal(receivedBoundaryAssertion, true);
+    assert.equal(result.status, "failed");
+    assert.equal(result.journalState, "recoveryRequired");
+    assert.equal(await readFile(layout.configPath, "utf8"), "native bytes at publish boundary");
+  });
+});
+
+test("records a published rollout before rethrowing its apply failure", async () => {
+  await withLayout(async (layout) => {
+    const rolloutPath = join(layout.sessionsDir, "one.jsonl");
+    await writeFile(
+      rolloutPath,
+      '{"type":"session_meta","payload":{"id":"one","model_provider":"openai"}}\n',
+      "utf8",
+    );
+    const rolloutBefore = await readFile(rolloutPath, "utf8");
+    const [change] = await collectRolloutChanges(layout, "custom");
+    assert.ok(change);
+    const [inversePatch] = createRolloutInversePatches([change]);
+    assert.ok(inversePatch);
+    const mutation: PreparedSwitchMutation = {
+      name: "publish rollout then fail",
+      target: { kind: "rollout", path: change.path, inversePatch },
+      apply: async () => {
+        await applyRolloutChanges([change]);
+        throw new Error("injected failure after rollout publication");
+      },
+      rollback: async () => undefined,
+    };
+
+    const result = await switchProfile(
+      { targetProfileId: "target" },
+      dependencies(layout, {
+        mutationPlan: {
+          rollouts: [mutation],
+          sqlite: [],
+          commit: [],
+        },
+      }),
+    );
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.journalState, "rolledBack");
+    assert.equal(await readFile(rolloutPath, "utf8"), rolloutBefore);
+    assert.equal(
+      (await readTransactionJournal(
+        join(layout.switcherDir, "transactions", result.operationId, "journal.jsonl"),
+      )).some((entry) => entry.appliedTargets?.some((target) => target.kind === "rollout")),
+      true,
+    );
+  });
+});
+
+test("does not record rollout evidence when inverse validation is already reversed", async () => {
+  await withLayout(async (layout) => {
+    await writeFile(
+      join(layout.sessionsDir, "one.jsonl"),
+      '{"type":"session_meta","payload":{"id":"one","model_provider":"openai"}}\n',
+      "utf8",
+    );
+    const [change] = await collectRolloutChanges(layout, "custom");
+    assert.ok(change);
+    const [inversePatch] = createRolloutInversePatches([change]);
+    assert.ok(inversePatch);
+    const mutation: PreparedSwitchMutation = {
+      name: "fail without publishing rollout",
+      target: { kind: "rollout", path: change.path, inversePatch },
+      apply: async () => {
+        throw new Error("injected rollout failure before publication");
+      },
+      rollback: async () => undefined,
+    };
+
+    const result = await switchProfile(
+      { targetProfileId: "target" },
+      dependencies(layout, {
+        mutationPlan: {
+          rollouts: [mutation],
+          sqlite: [],
+          commit: [],
+        },
+      }),
+    );
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.journalState, "rolledBack");
+    assert.equal(
+      (await readTransactionJournal(
+        join(layout.switcherDir, "transactions", result.operationId, "journal.jsonl"),
+      )).some((entry) => entry.appliedTargets?.some((target) => target.kind === "rollout")),
+      false,
+    );
+  });
+});
+
+test("does not record rollout evidence when inverse validation fails", async () => {
+  await withLayout(async (layout) => {
+    await writeFile(
+      join(layout.sessionsDir, "one.jsonl"),
+      '{"type":"session_meta","payload":{"id":"one","model_provider":"openai"}}\n',
+      "utf8",
+    );
+    const [change] = await collectRolloutChanges(layout, "custom");
+    assert.ok(change);
+    const [inversePatch] = createRolloutInversePatches([change]);
+    assert.ok(inversePatch);
+    const mutation: PreparedSwitchMutation = {
+      name: "corrupt rollout then fail",
+      target: { kind: "rollout", path: change.path, inversePatch },
+      apply: async () => {
+        await writeFile(change.path, "not a rollout\n", "utf8");
+        throw new Error("injected rollout failure after unknown write");
+      },
+      rollback: async () => undefined,
+    };
+
+    const result = await switchProfile(
+      { targetProfileId: "target" },
+      dependencies(layout, {
+        mutationPlan: {
+          rollouts: [mutation],
+          sqlite: [],
+          commit: [],
+        },
+      }),
+    );
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.journalState, "recoveryRequired");
+    assert.equal(
+      (await readTransactionJournal(
+        join(layout.switcherDir, "transactions", result.operationId, "journal.jsonl"),
+      )).some((entry) => entry.appliedTargets?.some((target) => target.kind === "rollout")),
+      false,
+    );
+  });
+});
+
+test("does not invoke a failing mutation rollback callback after durable data changed", async () => {
   await withLayout(async (layout) => {
     const configMutation: PreparedSwitchMutation = {
       name: "change config",
@@ -255,7 +577,7 @@ test("marks recovery required when a callback fails after durable data changed",
     );
 
     assert.equal(result.status, "failed");
-    assert.equal(result.journalState, "recoveryRequired");
+    assert.equal(result.journalState, "rolledBack");
     assert.equal(await readFile(layout.configPath, "utf8"), "before");
     const transactions = await readdir(join(layout.switcherDir, "transactions"), {
       withFileTypes: true,
@@ -265,7 +587,7 @@ test("marks recovery required when a callback fails after durable data changed",
     const journal = await readTransactionJournal(
       join(layout.switcherDir, "transactions", operation.name, "journal.jsonl"),
     );
-    assert.equal(journal.at(-1)?.state, "recoveryRequired");
+    assert.equal(journal.at(-1)?.state, "rolledBack");
   });
 });
 
@@ -734,15 +1056,13 @@ test("reports failed when cancellation cannot reach a rolledBack terminal state"
   await withLayout(async (layout) => {
     const controller = new AbortController();
     const mutation: PreparedSwitchMutation = {
-      name: "cancel with failed callback rollback",
+      name: "cancel with failed durable rollback",
       target: { kind: "config", path: layout.configPath },
       apply: async () => {
         await writeFile(layout.configPath, "changed before cancellation", "utf8");
         controller.abort();
       },
-      rollback: async () => {
-        throw new Error("injected rollback failure after cancellation");
-      },
+      rollback: async () => undefined,
     };
 
     const result = await switchProfile(
@@ -753,12 +1073,17 @@ test("reports failed when cancellation cannot reach a rolledBack terminal state"
           sqlite: [],
           commit: [mutation],
         },
+        transactionIo: {
+          beforeRestoreTemporaryCreate: async () => {
+            throw new Error("injected durable rollback failure after cancellation");
+          },
+        },
       }),
     );
 
     assert.equal(result.status, "failed");
     assert.equal(result.journalState, "recoveryRequired");
-    assert.equal(await readFile(layout.configPath, "utf8"), "before");
+    assert.equal(await readFile(layout.configPath, "utf8"), "changed before cancellation");
   });
 });
 
@@ -841,6 +1166,56 @@ test("refuses a concurrent begin while the atomic switch operation is active", a
     finishPreflight();
 
     assert.equal((await switching).status, "committed");
+  });
+});
+
+test("keeps the operation lock through acknowledgement so later switches cannot overwrite active state out of order", async () => {
+  await withLayout(async (layout) => {
+    let releaseAcknowledgement!: () => void;
+    let acknowledgeAEntered!: () => void;
+    const acknowledgementAEntered = new Promise<void>((resolve) => {
+      acknowledgeAEntered = resolve;
+    });
+    const acknowledgementABarrier = new Promise<void>((resolve) => {
+      releaseAcknowledgement = resolve;
+    });
+    let activeProfile = "before";
+    const switchA = switchProfile(
+      { targetProfileId: "profile-a" },
+      dependencies(layout, {
+        acknowledge: async () => {
+          acknowledgeAEntered();
+          await acknowledgementABarrier;
+          activeProfile = "profile-a";
+        },
+      }),
+    );
+
+    await acknowledgementAEntered;
+    const blockedB = await switchProfile(
+      { targetProfileId: "profile-b" },
+      dependencies(layout, {
+        acknowledge: async () => {
+          activeProfile = "profile-b";
+        },
+      }),
+    );
+    assert.equal(blockedB.status, "failed");
+    assert.equal(blockedB.operationId, "unstarted");
+    assert.equal(activeProfile, "before");
+
+    releaseAcknowledgement();
+    assert.equal((await switchA).status, "committed");
+    const completedB = await switchProfile(
+      { targetProfileId: "profile-b" },
+      dependencies(layout, {
+        acknowledge: async () => {
+          activeProfile = "profile-b";
+        },
+      }),
+    );
+    assert.equal(completedB.status, "committed");
+    assert.equal(activeProfile, "profile-b");
   });
 });
 

@@ -11,6 +11,7 @@ import {
   type TransactionIo,
   type TransactionState,
 } from "./transaction";
+import { validateRolloutInversePatch } from "./rollouts";
 import {
   mapProgressUpdates,
   throwIfProgressCancelled,
@@ -27,14 +28,18 @@ export interface SwitchRequest {
   signal?: AbortSignal;
 }
 
+export interface MutationApplyContext {
+  assertTargetUnchanged(): Promise<void>;
+}
+
 export interface PreparedSwitchMutation {
   readonly name: string;
   readonly target: JournalMutationTarget;
-  readonly apply: () => Promise<void>;
+  readonly apply: (context: MutationApplyContext) => Promise<void>;
+  // Retained while existing mutation-plan builders migrate. Durable recovery
+  // is exclusively driven by the journal and never invokes this callback.
   readonly rollback: () => Promise<void>;
 }
-
-export type SwitchMutation = PreparedSwitchMutation;
 
 export interface SwitchStageContext {
   readonly request: SwitchRequest;
@@ -68,7 +73,8 @@ export interface SwitchDependencies {
   preflight(context: SwitchStageContext): Promise<void>;
   backup(context: SwitchStageContext): Promise<readonly BackupTarget[] | void>;
   scan(context: SwitchStageContext, reportProgress: ScanProgressReporter): Promise<void>;
-  mutationPlan: SwitchMutationPlan;
+  mutationPlan?: SwitchMutationPlan;
+  createMutationPlan?(context: SwitchStageContext): Promise<SwitchMutationPlan>;
   verify(context: SwitchStageContext): Promise<void>;
   acknowledge?(context: SwitchStageContext): Promise<void>;
   onProgress?(event: ProgressEvent): void;
@@ -113,7 +119,7 @@ export async function switchProfile(
 
   let transaction: TransactionHandle | undefined;
   let context: InternalSwitchStageContext | undefined;
-  const mutations: SwitchMutation[] = [];
+  let mutationPlan: SwitchMutationPlan | undefined;
   let currentStage: ProgressStage = "preflight";
   let committed = false;
   let commitDurabilityWarning = false;
@@ -121,13 +127,13 @@ export async function switchProfile(
 
   try {
     throwIfProgressCancelled(signal);
-    const mutationPlan = validateMutationPlan(dependencies.mutationPlan, dependencies.layout);
-    assertAuthPlanCanBeRestored(mutationPlan, dependencies.restoreAuthMode);
+    mutationPlan = prepareStaticMutationPlan(dependencies);
     const started = await recoverAndBeginTransaction(dependencies.layout, {
       now: dependencies.now,
       isProcessAlive: dependencies.isProcessAlive,
       restoreAuthMode: dependencies.restoreAuthMode,
       io: dependencies.transactionIo,
+      requireSourceVersionProtocol: true,
     });
     if (
       started.recovery.recoveryRequiredOperationIds.length > 0 ||
@@ -141,7 +147,7 @@ export async function switchProfile(
       };
     }
     transaction = started.transaction;
-    context = createContext(request, dependencies.layout, transaction, signal, mutations);
+    context = createContext(request, dependencies.layout, transaction, signal);
 
     await runStage("preflight", dependencies.preflight, context, progress);
     currentStage = "backup";
@@ -149,13 +155,28 @@ export async function switchProfile(
     if (targets) {
       context.registerBackupTargets(targets);
     }
+    if (mutationPlan) {
+      context.registerBackupTargets(rolloutBackupTargets(mutationPlan));
+    }
     const registeredTargets = collectBackupTargets(context);
-    const backupManifest = await transaction.backupTargets(registeredTargets);
-    assertDurableByteBackups(mutationPlan, backupManifest);
+    let backupManifest = await transaction.backupTargets(registeredTargets);
+    if (mutationPlan) {
+      assertDurableByteBackups(mutationPlan, backupManifest);
+    }
     progress.emit([{ stage: "backup", completed: 1, total: 1 }]);
 
     currentStage = "scan";
     await runScanStage(dependencies.scan, context, progress);
+    if (!mutationPlan) {
+      mutationPlan = validateMutationPlan(
+        await dependencies.createMutationPlan!(context),
+        dependencies.layout,
+      );
+      assertAuthPlanCanBeRestored(mutationPlan, dependencies.restoreAuthMode);
+      context.registerBackupTargets(rolloutBackupTargets(mutationPlan));
+      backupManifest = await transaction.backupTargets(collectBackupTargets(context));
+      assertDurableByteBackups(mutationPlan, backupManifest);
+    }
     await transaction.markApplying();
     currentStage = "rollouts";
     await runPlannedMutations(
@@ -163,7 +184,6 @@ export async function switchProfile(
       mutationPlan.rollouts,
       context,
       progress,
-      mutations,
     );
     currentStage = "sqlite";
     await runPlannedMutations(
@@ -171,7 +191,6 @@ export async function switchProfile(
       mutationPlan.sqlite,
       context,
       progress,
-      mutations,
     );
 
     throwIfProgressCancelled(signal);
@@ -183,7 +202,6 @@ export async function switchProfile(
       mutationPlan.commit,
       context,
       progress,
-      mutations,
     );
     throwIfProgressCancelled(signal);
     try {
@@ -195,16 +213,6 @@ export async function switchProfile(
       commitDurabilityWarning = true;
     }
     committed = true;
-    let lockReleaseFailed = false;
-    let lockReleaseError: unknown;
-    try {
-      await transaction.release();
-    } catch (error: unknown) {
-      // The journal is already durable; a lock-release failure cannot undo the commit.
-      lockReleaseFailed = true;
-      lockReleaseError = error;
-    }
-
     let acknowledgementFailed = false;
     if (dependencies.acknowledge) {
       try {
@@ -212,6 +220,17 @@ export async function switchProfile(
       } catch {
         acknowledgementFailed = true;
       }
+    }
+    let lockReleaseFailed = false;
+    let lockReleaseError: unknown;
+    try {
+      // The acknowledgement owns local post-commit state such as the active
+      // Profile marker, so it remains serialized with the committed switch.
+      await transaction.release();
+    } catch (error: unknown) {
+      // The journal is already durable; a lock-release failure cannot undo the commit.
+      lockReleaseFailed = true;
+      lockReleaseError = error;
     }
     return {
       status: "committed",
@@ -241,7 +260,6 @@ export async function switchProfile(
     const cancellationRequested = signal?.aborted === true;
     const rollback = await rollbackAfterFailure(
       transaction,
-      mutations,
       dependencies,
     );
     let rollbackState = rollback.state;
@@ -266,12 +284,27 @@ export async function switchProfile(
   }
 }
 
+function prepareStaticMutationPlan(
+  dependencies: SwitchDependencies,
+): SwitchMutationPlan | undefined {
+  const hasStaticPlan = dependencies.mutationPlan !== undefined;
+  const hasFactory = dependencies.createMutationPlan !== undefined;
+  if (hasStaticPlan === hasFactory || (hasFactory && typeof dependencies.createMutationPlan !== "function")) {
+    throw new TypeError("Provide exactly one switch mutation plan.");
+  }
+  if (!hasStaticPlan) {
+    return undefined;
+  }
+  const mutationPlan = validateMutationPlan(dependencies.mutationPlan, dependencies.layout);
+  assertAuthPlanCanBeRestored(mutationPlan, dependencies.restoreAuthMode);
+  return mutationPlan;
+}
+
 function createContext(
   request: SwitchRequest,
   layout: CodexLayout,
   transaction: TransactionHandle,
   signal: AbortSignal | undefined,
-  mutations: SwitchMutation[],
 ): InternalSwitchStageContext {
   const backupTargets: BackupTarget[] = [];
   return {
@@ -302,7 +335,11 @@ function assertDurableByteBackups(
   for (const stage of mutationPlanStages) {
     for (const mutation of mutationPlan[stage]) {
       const target = mutation.target;
-      if (target.kind !== "config" && target.kind !== "sqlite") {
+      if (
+        target.kind !== "config" &&
+        target.kind !== "sqlite" &&
+        target.kind !== "rollout"
+      ) {
         continue;
       }
       const path = resolve(target.path);
@@ -329,24 +366,64 @@ function assertDurableByteBackups(
   }
 }
 
+function rolloutBackupTargets(mutationPlan: SwitchMutationPlan): BackupTarget[] {
+  return mutationPlan.rollouts.map((mutation) => ({
+    kind: "rollout" as const,
+    path: mutation.target.path,
+  }));
+}
+
 async function runPlannedMutations(
   stage: ProgressStage,
   plannedMutations: readonly PreparedSwitchMutation[],
   context: SwitchStageContext,
   progress: ProgressEmitter,
-  mutations: SwitchMutation[],
 ): Promise<void> {
   throwIfProgressCancelled(context.signal);
   for (const mutation of plannedMutations) {
     assertCompensableMutation(mutation, context.layout);
     assertMutationAllowedInStage(stage, mutation);
     await context.transaction.prepareTarget(mutation.target);
-    mutations.push(mutation);
-    await mutation.apply();
+    try {
+      await mutation.apply({
+        assertTargetUnchanged: () => context.transaction.assertTargetUnchanged(mutation.target),
+      });
+    } catch (error: unknown) {
+      await recordPublishedRolloutFailure(
+        mutation.target,
+        context.layout,
+        context.signal,
+        context.transaction,
+      );
+      throw error;
+    }
     await context.transaction.markTargetApplied(mutation.target);
     throwIfProgressCancelled(context.signal);
   }
   progress.emit([{ stage, completed: 1, total: 1 }]);
+}
+
+async function recordPublishedRolloutFailure(
+  target: JournalMutationTarget,
+  layout: CodexLayout,
+  signal: AbortSignal | undefined,
+  transaction: TransactionHandle,
+): Promise<void> {
+  if (target.kind !== "rollout") {
+    return;
+  }
+  try {
+    if (await validateRolloutInversePatch(target.inversePatch, layout, signal) !== "ready") {
+      return;
+    }
+    try {
+      await transaction.markTargetApplied(target);
+    } catch {
+      // Re-throw the original mutation error; a missing durable record remains fail-closed.
+    }
+  } catch {
+    // An unverifiable rollout publication must not gain applied evidence.
+  }
 }
 
 async function runStage(
@@ -386,28 +463,13 @@ async function runScanStage(
 
 async function rollbackAfterFailure(
   transaction: TransactionHandle,
-  mutations: readonly SwitchMutation[],
   dependencies: Pick<SwitchDependencies, "restoreAuthMode">,
 ): Promise<RollbackResult> {
   const errors: unknown[] = [];
-  let validationFailed = false;
   try {
     await transaction.validateRollback(dependencies.restoreAuthMode);
   } catch (error: unknown) {
-    validationFailed = true;
     errors.push(error);
-  }
-
-  let callbackFailed = false;
-  if (!validationFailed) {
-    for (const mutation of [...mutations].reverse()) {
-      try {
-        await mutation.rollback();
-      } catch (error: unknown) {
-        callbackFailed = true;
-        errors.push(error);
-      }
-    }
   }
 
   let durableRollbackFailed = false;
@@ -418,7 +480,7 @@ async function rollbackAfterFailure(
     errors.push(error);
   }
 
-  if (!callbackFailed && !durableRollbackFailed) {
+  if (!durableRollbackFailed) {
     return { state: "rolledBack", errors };
   }
 

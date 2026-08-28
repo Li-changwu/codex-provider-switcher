@@ -261,6 +261,23 @@ test("returns a bounded locked result when another writer owns the database", as
   });
 });
 
+test("refuses a state database with active write-ahead-log files before updating metadata", async () => {
+  await withDatabase(async (layout, database) => {
+    await seedSupportedDatabase(database, [["one", "openai", "Keep", null]]);
+    await run(database, "PRAGMA journal_mode = WAL");
+    await run(database, "UPDATE threads SET title = ? WHERE id = ?", "WAL state", "one");
+
+    await assert.rejects(
+      () => updateProviderMetadata(layout, "switched"),
+      (error: unknown) =>
+        error instanceof SqliteError && error.code === "write-ahead-log",
+    );
+    assert.deepEqual(await readThreads(database), [
+      { id: "one", provider: "openai", title: "WAL state", encrypted: null },
+    ]);
+  });
+});
+
 test("rolls back when cancellation is observed before commit", async () => {
   await withDatabase(async (layout, database) => {
     await seedSupportedDatabase(database, [["one", "openai", "Keep", "opaque"]]);

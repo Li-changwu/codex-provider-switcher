@@ -17,7 +17,6 @@ import type { BigIntStats, Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
-  reverseRolloutInversePatch,
   validateRolloutInversePatch,
   type RolloutInversePatch,
 } from "./rollouts";
@@ -44,6 +43,7 @@ export interface BackupManifestEntry {
   existed: boolean;
   sha256?: string;
   mode?: number;
+  sourceVersion: ByteTargetVersion;
 }
 
 export interface BackupManifest {
@@ -91,8 +91,35 @@ export interface JournalEntry {
   operationId: string;
   state: TransactionState;
   timestamp: string;
+  sourceVersionProtocol?: true;
   pendingTargets?: JournalMutationTarget[];
   appliedTargets?: JournalMutationTarget[];
+  appliedTargetVersions?: AppliedByteTargetVersion[];
+}
+
+interface ByteTargetVersion {
+  existed: boolean;
+  sha256?: string;
+  mode?: number;
+  device?: string;
+  inode?: string;
+  links?: string;
+  size?: string;
+  modifiedAtNs?: string;
+  changedAtNs?: string;
+}
+
+interface ByteBackedTarget {
+  kind: BackupKind;
+  path: string;
+}
+
+type ByteBackedJournalTarget = JournalTarget | RolloutJournalTarget;
+type VersionedJournalTarget = ByteBackedJournalTarget | AuthJournalTarget;
+
+interface AppliedByteTargetVersion {
+  target: VersionedJournalTarget;
+  version: ByteTargetVersion;
 }
 
 export interface TransactionOptions {
@@ -100,6 +127,7 @@ export interface TransactionOptions {
   now?: () => string;
   isProcessAlive?: (pid: number) => boolean | undefined;
   io?: TransactionIo;
+  requireSourceVersionProtocol?: boolean;
 }
 
 export interface TransactionIo {
@@ -169,6 +197,7 @@ export interface TransactionHandle {
   backupTargets(targets: readonly BackupTarget[]): Promise<BackupManifest>;
   markApplying(targets?: readonly (JournalMutationTarget | string)[]): Promise<void>;
   prepareTarget(target: JournalMutationTarget): Promise<void>;
+  assertTargetUnchanged(target: JournalMutationTarget): Promise<void>;
   markTargetApplied(target: JournalMutationTarget): Promise<void>;
   markCommitted(): Promise<void>;
   markRolledBack(): Promise<void>;
@@ -399,6 +428,7 @@ async function beginTransactionWithLock(
       operationId,
       state: "prepared",
       timestamp: now(),
+      ...(options.requireSourceVersionProtocol ? { sourceVersionProtocol: true as const } : {}),
     }, operationDirectory, options.io);
     preparedPersisted = true;
   } catch (error: unknown) {
@@ -431,9 +461,15 @@ async function beginTransactionWithLock(
   let state: RuntimeTransactionState = "prepared";
   const pendingTargets: JournalMutationTarget[] = [];
   const appliedTargets: JournalMutationTarget[] = [];
+  const appliedTargetVersions: AppliedByteTargetVersion[] = [];
+  let backupManifest: BackupManifest | undefined;
   const setState = async (
     nextState: TransactionState,
-    targetUpdate?: { pending?: readonly JournalMutationTarget[]; applied?: readonly JournalMutationTarget[] },
+    targetUpdate?: {
+      pending?: readonly JournalMutationTarget[];
+      applied?: readonly JournalMutationTarget[];
+      appliedVersions?: readonly AppliedByteTargetVersion[];
+    },
   ): Promise<void> => {
     try {
       await appendJournal(journalPath, {
@@ -443,6 +479,9 @@ async function beginTransactionWithLock(
         timestamp: now(),
         ...(targetUpdate?.pending ? { pendingTargets: [...targetUpdate.pending] } : {}),
         ...(targetUpdate?.applied ? { appliedTargets: [...targetUpdate.applied] } : {}),
+        ...(targetUpdate?.appliedVersions
+          ? { appliedTargetVersions: [...targetUpdate.appliedVersions] }
+          : {}),
       }, operationDirectory, options.io);
       state = nextState;
     } catch (error: unknown) {
@@ -470,18 +509,20 @@ async function beginTransactionWithLock(
           "Backups can only be created before transaction application.",
         );
       }
-      const manifest = await createBackupManifest(
-        layout,
-        operationId,
-        backupDirectory,
-        targets,
-        options.io,
+        const manifest = await createBackupManifest(
+          layout,
+          operationId,
+          backupDirectory,
+          targets,
+          options.io,
+          backupManifest?.entries,
       );
       await writeJsonAtomically(
         join(backupDirectory, manifestFileName),
         manifest,
         options.io,
       );
+      backupManifest = manifest;
       return manifest;
     },
     async markApplying(targets = []) {
@@ -505,6 +546,34 @@ async function beginTransactionWithLock(
       const normalized = normalizeJournalTarget(layout, target);
       await setState("applying", { pending: [normalized] });
       pendingTargets.push(normalized);
+      try {
+        await assertPreparedByteTargetVersion(
+          layout,
+          normalized,
+          backupManifest,
+          appliedTargetVersions,
+          options.io,
+        );
+      } catch (error: unknown) {
+        await setState("recoveryRequired");
+        throw error;
+      }
+    },
+    async assertTargetUnchanged(target) {
+      if (state !== "applying") {
+        throw new TransactionError(
+          "journal-invalid",
+          "Mutation targets can only be checked while applying.",
+        );
+      }
+      const normalized = normalizeJournalTarget(layout, target);
+      await assertPreparedByteTargetVersion(
+        layout,
+        normalized,
+        backupManifest,
+        appliedTargetVersions,
+        options.io,
+      );
     },
     async markTargetApplied(target) {
       if (state !== "applying") {
@@ -520,7 +589,16 @@ async function beginTransactionWithLock(
           "A mutation target must be prepared before it is applied.",
         );
       }
-      await setState("applying", { applied: [normalized] });
+      const version = await captureAppliedByteTargetVersion(layout, normalized, options.io);
+      if (version) {
+        // Keep the evidence for this process even if publishing the journal record fails.
+        // A later crash still recovers conservatively because the failed record is not durable.
+        appliedTargetVersions.push(version);
+      }
+      await setState("applying", {
+        applied: [normalized],
+        ...(version ? { appliedVersions: [version] } : {}),
+      });
       appliedTargets.push(normalized);
     },
     async markCommitted() {
@@ -573,6 +651,8 @@ async function beginTransactionWithLock(
           pendingTargets,
           restoreAuthMode,
           options.io,
+          appliedTargetVersions,
+          options.requireSourceVersionProtocol === true,
         );
         await setState("rolledBack");
       } catch (error: unknown) {
@@ -604,6 +684,8 @@ async function beginTransactionWithLock(
         pendingTargets,
         restoreAuthMode,
         options.io,
+        appliedTargetVersions,
+        options.requireSourceVersionProtocol === true,
       );
       await closeValidatedBackupTargets(backupTargets);
     },
@@ -707,7 +789,9 @@ async function recoverPendingSwitchesWithLock(
     if (!last) {
       throw new TransactionError("journal-invalid", "The transaction journal is invalid.");
     }
+    const enforceSourceVersionProtocol = journal[0]?.sourceVersionProtocol === true;
     const pendingTargets = normalizeJournalRecoveryTargets(layout, journal);
+    const appliedTargetVersions = normalizeJournalRecoveryTargetVersions(layout, journal);
     if (last.state === "committed") {
       skippedCommittedOperationIds.push(operationId);
       continue;
@@ -727,6 +811,8 @@ async function recoverPendingSwitchesWithLock(
           pendingTargets,
           dependencies.restoreAuthMode,
           dependencies.io,
+          appliedTargetVersions,
+          enforceSourceVersionProtocol,
         );
       }
       await appendJournal(journalPath, {
@@ -1182,17 +1268,12 @@ async function createBackupManifest(
   backupDirectory: string,
   targets: readonly BackupTarget[],
   io?: TransactionIo,
+  existingEntries: readonly BackupManifestEntry[] = [],
 ): Promise<BackupManifest> {
-  const entries: BackupManifestEntry[] = [];
-  const seen = new Set<string>();
+  const entries: BackupManifestEntry[] = [...existingEntries];
+  const seen = new Set(entries.map((entry) => `${entry.kind}:${entry.path}`));
   for (const target of targets) {
     const path = resolve(target.path);
-    if (target.kind === "rollout") {
-      throw new TransactionError(
-        "invalid-backup-target",
-        "Rollout backups require a metadata-only inverse patch.",
-      );
-    }
     assertAllowedBackupTarget(layout, target.kind, path);
     const key = `${target.kind}:${path}`;
     if (seen.has(key)) {
@@ -1201,14 +1282,25 @@ async function createBackupManifest(
     seen.add(key);
     const sourceStats = await lstatBigIntIfPresent(path);
     if (!sourceStats) {
-      entries.push({ kind: target.kind, path, existed: false });
+      entries.push({
+        kind: target.kind,
+        path,
+        existed: false,
+        sourceVersion: { existed: false },
+      });
       continue;
     }
     await assertSafeByteBackupSource(layout, path, sourceStats);
     await io?.afterBackupSourceLstat?.(path);
     const index = entries.length.toString().padStart(4, "0");
     const backupPath = join(backupDirectory, `${index}-${basename(path)}`);
-    await copyBackupSourceSafely(layout, path, sourceStats, backupPath, io);
+    const sourceVersion = await copyBackupSourceSafely(
+      layout,
+      path,
+      sourceStats,
+      backupPath,
+      io,
+    );
     await syncFile(backupPath, io);
     entries.push({
       kind: target.kind,
@@ -1217,9 +1309,235 @@ async function createBackupManifest(
       existed: true,
       sha256: await hashFile(backupPath, io),
       mode: Number(sourceStats.mode & 0o777n),
+      sourceVersion,
     });
   }
   return { version: 1, operationId, entries };
+}
+
+async function assertPreparedByteTargetVersion(
+  layout: CodexLayout,
+  target: JournalMutationTarget,
+  manifest: BackupManifest | undefined,
+  appliedVersions: readonly AppliedByteTargetVersion[],
+  io?: TransactionIo,
+): Promise<void> {
+  if (target.kind === "auth") {
+    return;
+  }
+  const entry = findBackupManifestEntry(manifest, target);
+  const expected = latestAppliedTargetVersion(appliedVersions, target) ?? entry.sourceVersion;
+  await assertByteTargetVersion(layout, target, expected, io);
+}
+
+async function captureAppliedByteTargetVersion(
+  layout: CodexLayout,
+  target: JournalMutationTarget,
+  io?: TransactionIo,
+): Promise<AppliedByteTargetVersion | undefined> {
+  if (target.kind === "auth") {
+    return {
+      target,
+      version: await captureAuthTargetVersion(layout, target, io),
+    };
+  }
+  if (target.kind !== "config" && target.kind !== "sqlite" && target.kind !== "rollout") {
+    return undefined;
+  }
+  return {
+    target,
+    version: await captureByteTargetVersion(layout, target, io),
+  };
+}
+
+function findBackupManifestEntry(
+  manifest: BackupManifest | undefined,
+  target: ByteBackedTarget,
+): BackupManifestEntry {
+  const matches = manifest?.entries.filter((entry) => (
+    entry.kind === target.kind && sameResolvedPath(entry.path, target.path)
+  )) ?? [];
+  const [entry] = matches;
+  if (!entry || matches.length !== 1 || !isValidBackupManifestEntry(entry)) {
+    throw new TransactionError("rollback-failed", "The transaction backup source cannot be verified.");
+  }
+  return entry;
+}
+
+function latestAppliedTargetVersion(
+  versions: readonly AppliedByteTargetVersion[],
+  target: VersionedJournalTarget,
+): ByteTargetVersion | undefined {
+  for (let index = versions.length - 1; index >= 0; index -= 1) {
+    const candidate = versions[index];
+    if (candidate.target.kind === target.kind && sameResolvedPath(candidate.target.path, target.path)) {
+      return candidate.version;
+    }
+  }
+  return undefined;
+}
+
+async function assertByteTargetVersion(
+  layout: CodexLayout,
+  target: ByteBackedTarget,
+  expected: ByteTargetVersion,
+  io?: TransactionIo,
+): Promise<void> {
+  if (!isValidByteTargetVersion(expected)) {
+    throw new TransactionError("rollback-failed", "The transaction byte target version is invalid.");
+  }
+  const actual = await captureByteTargetVersion(layout, target, io);
+  if (!sameByteTargetVersion(expected, actual)) {
+    throw new TransactionError(
+      "rollback-failed",
+      "The transaction byte target changed outside the switch operation.",
+    );
+  }
+}
+
+async function captureByteTargetVersion(
+  layout: CodexLayout,
+  target: ByteBackedTarget,
+  io?: TransactionIo,
+): Promise<ByteTargetVersion> {
+  const path = resolve(target.path);
+  assertAllowedBackupTarget(layout, target.kind, path);
+  let handle: FileHandle | undefined;
+  let primaryError: unknown;
+  try {
+    const pathStats = await lstatBigIntIfPresent(path);
+    if (!pathStats) {
+      return { existed: false };
+    }
+    await assertSafeByteBackupSource(layout, path, pathStats);
+    handle = await open(path, "r");
+    const openedStats = await handle.stat({ bigint: true });
+    await assertOpenedBackupSource(layout, path, pathStats, openedStats);
+    const sha256 = await hashOpenedFile(handle, io);
+    const finalStats = await handle.stat({ bigint: true });
+    await assertOpenedBackupSource(layout, path, openedStats, finalStats);
+    const pathAfter = await lstat(path, { bigint: true });
+    if (!sameStableByteSourceStats(finalStats, pathAfter)) {
+      throw new Error("The byte target changed while being versioned.");
+    }
+    const version = byteTargetVersion(finalStats, sha256);
+    await handle.close();
+    handle = undefined;
+    return version;
+  } catch (error: unknown) {
+    primaryError = error;
+  }
+  if (handle) {
+    try {
+      await handle.close();
+    } catch (closeError: unknown) {
+      primaryError = new AggregateError(
+        [primaryError, closeError],
+        "Byte target versioning and handle close both failed.",
+      );
+    }
+  }
+  throw new TransactionError(
+    "rollback-failed",
+    "The transaction byte target could not be safely verified.",
+    { cause: primaryError },
+  );
+}
+
+async function captureAuthTargetVersion(
+  layout: CodexLayout,
+  target: AuthJournalTarget,
+  io?: TransactionIo,
+): Promise<ByteTargetVersion> {
+  const path = resolve(target.path);
+  if (path !== resolve(layout.authPath)) {
+    throw new TransactionError("rollback-failed", "The auth target is not allowed.");
+  }
+
+  let handle: FileHandle | undefined;
+  let primaryError: unknown;
+  try {
+    const pathStats = await lstatBigIntIfPresent(path);
+    if (!pathStats) {
+      return { existed: false };
+    }
+    assertSafeAuthVersionSource(pathStats);
+    handle = await open(path, "r");
+    const openedStats = await handle.stat({ bigint: true });
+    assertSafeAuthVersionSource(openedStats);
+    if (!sameStableByteSourceStats(pathStats, openedStats)) {
+      throw new Error("The auth target changed before opening.");
+    }
+    const sha256 = await hashOpenedFile(handle, io);
+    const finalStats = await handle.stat({ bigint: true });
+    assertSafeAuthVersionSource(finalStats);
+    const pathAfter = await lstat(path, { bigint: true });
+    if (
+      !sameStableByteSourceStats(openedStats, finalStats) ||
+      !sameStableByteSourceStats(finalStats, pathAfter)
+    ) {
+      throw new Error("The auth target changed while being versioned.");
+    }
+    const version = byteTargetVersion(finalStats, sha256);
+    await handle.close();
+    handle = undefined;
+    return version;
+  } catch (error: unknown) {
+    primaryError = error;
+  }
+  if (handle) {
+    try {
+      await handle.close();
+    } catch (closeError: unknown) {
+      primaryError = new AggregateError(
+        [primaryError, closeError],
+        "Auth target versioning and handle close both failed.",
+      );
+    }
+  }
+  throw new TransactionError(
+    "rollback-failed",
+    "The auth target could not be safely verified.",
+    { cause: primaryError },
+  );
+}
+
+function assertSafeAuthVersionSource(stats: BigIntStats): void {
+  if (!stats.isFile() || stats.isSymbolicLink() || stats.nlink !== 1n || stats.ino === 0n) {
+    throw new Error("The auth target is not a safe regular file.");
+  }
+}
+
+function byteTargetVersion(stats: BigIntStats, sha256: string): ByteTargetVersion {
+  return {
+    existed: true,
+    sha256,
+    mode: Number(stats.mode & 0o777n),
+    device: stats.dev.toString(),
+    inode: stats.ino.toString(),
+    links: stats.nlink.toString(),
+    size: stats.size.toString(),
+    modifiedAtNs: stats.mtimeNs.toString(),
+    changedAtNs: stats.ctimeNs.toString(),
+  };
+}
+
+function sameByteTargetVersion(
+  left: ByteTargetVersion,
+  right: ByteTargetVersion,
+): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function sameStableByteSourceStats(left: BigIntStats, right: BigIntStats): boolean {
+  return (
+    hasSameBigIntFileIdentity(left, right) &&
+    left.nlink === right.nlink &&
+    left.mode === right.mode &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs
+  );
 }
 
 async function restoreBackupManifest(
@@ -1228,8 +1546,18 @@ async function restoreBackupManifest(
   targets: readonly JournalMutationTarget[],
   restoreAuthMode?: AuthModeRestorer,
   io?: TransactionIo,
+  appliedTargetVersions: readonly AppliedByteTargetVersion[] = [],
+  enforceSourceVersionProtocol = false,
 ): Promise<void> {
-  await restoreTransactionTargets(layout, manifestPath, targets, restoreAuthMode, io);
+  await restoreTransactionTargets(
+    layout,
+    manifestPath,
+    targets,
+    restoreAuthMode,
+    io,
+    appliedTargetVersions,
+    enforceSourceVersionProtocol,
+  );
 }
 
 async function restoreTransactionTargets(
@@ -1238,6 +1566,8 @@ async function restoreTransactionTargets(
   targets: readonly JournalMutationTarget[],
   restoreAuthMode?: AuthModeRestorer,
   io?: TransactionIo,
+  appliedTargetVersions: readonly AppliedByteTargetVersion[] = [],
+  enforceSourceVersionProtocol = false,
 ): Promise<void> {
   const backupTargets = await validateTransactionTargets(
     layout,
@@ -1245,22 +1575,36 @@ async function restoreTransactionTargets(
     targets,
     restoreAuthMode,
     io,
+    appliedTargetVersions,
+    enforceSourceVersionProtocol,
   );
   try {
     for (const target of [...targets].reverse()) {
-      if (target.kind === "rollout") {
-        await reverseRolloutInversePatch(target.inversePatch, layout);
-      }
       if (target.kind === "auth") {
         await restoreAuthMode!(target);
       }
     }
     for (const target of [...backupTargets].reverse()) {
-      if (!target.entry.existed) {
-        await removeRestoreTargetIfPresent(layout, target.path, io);
+      if (!target.shouldRestore) {
         continue;
       }
-      await restoreFileAtomically(layout, target, target.path, io);
+      if (!target.entry.existed) {
+        await removeRestoreTargetIfPresent(
+          layout,
+          target.path,
+          target.entry.kind,
+          target.expectedVersion,
+          io,
+        );
+        continue;
+      }
+      await restoreFileAtomically(
+        layout,
+        target,
+        target.path,
+        target.expectedVersion,
+        io,
+      );
     }
   } catch (error: unknown) {
     return await rethrowAfterValidatedBackupClose(backupTargets, error);
@@ -1274,12 +1618,36 @@ async function validateTransactionTargets(
   targets: readonly JournalMutationTarget[],
   restoreAuthMode?: AuthModeRestorer,
   io?: TransactionIo,
+  appliedTargetVersions: readonly AppliedByteTargetVersion[] = [],
+  enforceSourceVersionProtocol = false,
 ): Promise<ValidatedByteRestoreTarget[]> {
-  const backupTargets = await validateByteRestoreTargets(layout, manifestPath, targets, io);
+  const backupTargets = await validateByteRestoreTargets(
+    layout,
+    manifestPath,
+    targets,
+    io,
+    appliedTargetVersions,
+    enforceSourceVersionProtocol,
+  );
   try {
     for (const target of targets) {
       if (target.kind === "rollout") {
         await validateRolloutInversePatch(target.inversePatch, layout);
+      }
+    }
+    for (const target of targets) {
+      if (target.kind !== "auth") {
+        continue;
+      }
+      const expectedVersion = latestAppliedTargetVersion(appliedTargetVersions, target);
+      if (enforceSourceVersionProtocol && !expectedVersion) {
+        throw new TransactionError(
+          "rollback-failed",
+          "The strict transaction journal lacks auth mutation evidence.",
+        );
+      }
+      if (expectedVersion) {
+        await assertAuthTargetVersion(layout, target, expectedVersion, io);
       }
     }
     if (targets.some((target) => target.kind === "auth") && !restoreAuthMode) {
@@ -1294,9 +1662,29 @@ async function validateTransactionTargets(
   }
 }
 
+async function assertAuthTargetVersion(
+  layout: CodexLayout,
+  target: AuthJournalTarget,
+  expected: ByteTargetVersion,
+  io?: TransactionIo,
+): Promise<void> {
+  if (!isValidByteTargetVersion(expected)) {
+    throw new TransactionError("rollback-failed", "The auth target version is invalid.");
+  }
+  const actual = await captureAuthTargetVersion(layout, target, io);
+  if (!sameByteTargetVersion(expected, actual)) {
+    throw new TransactionError(
+      "rollback-failed",
+      "The auth target changed outside the switch operation.",
+    );
+  }
+}
+
 interface ValidatedByteRestoreTarget {
   readonly path: string;
   readonly entry: BackupManifestEntry;
+  readonly expectedVersion?: ByteTargetVersion;
+  readonly shouldRestore: boolean;
   readonly backupPath?: string;
   readonly backupHandle?: FileHandle;
   readonly backupStats?: BigIntStats;
@@ -1307,9 +1695,13 @@ async function validateByteRestoreTargets(
   manifestPath: string,
   targets: readonly JournalMutationTarget[],
   io?: TransactionIo,
+  appliedTargetVersions: readonly AppliedByteTargetVersion[] = [],
+  enforceSourceVersionProtocol = false,
 ): Promise<ValidatedByteRestoreTarget[]> {
   const selectedTargets = targets.filter(
-    (target): target is JournalTarget => target.kind === "config" || target.kind === "sqlite",
+    (target): target is ByteBackedJournalTarget => (
+      target.kind === "config" || target.kind === "sqlite" || target.kind === "rollout"
+    ),
   );
   if (selectedTargets.length === 0) {
     return [];
@@ -1318,9 +1710,15 @@ async function validateByteRestoreTargets(
   const manifest = await readBackupManifest(manifestPath, io);
   const backupDirectory = dirname(manifestPath);
   const validatedTargets: ValidatedByteRestoreTarget[] = [];
+  const seen = new Set<string>();
   try {
     for (const target of selectedTargets) {
       const path = resolve(target.path);
+      const key = `${target.kind}:${path}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
       assertAllowedBackupTarget(layout, target.kind, path);
       const matches = manifest.entries.filter((entry) => (
         entry &&
@@ -1335,8 +1733,23 @@ async function validateByteRestoreTargets(
         throw new TransactionError("rollback-failed", "The backup manifest is incomplete.");
       }
       assertAllowedBackupTarget(layout, entry.kind, resolve(entry.path));
+      const appliedVersion = latestAppliedTargetVersion(
+        appliedTargetVersions,
+        target,
+      );
+      const expectedVersion = appliedVersion ?? (
+        enforceSourceVersionProtocol ? entry.sourceVersion : undefined
+      );
+      if (expectedVersion) {
+        await assertByteTargetVersion(layout, target, expectedVersion, io);
+      }
       if (!entry.existed) {
-        validatedTargets.push({ path, entry });
+        validatedTargets.push({
+          path,
+          entry,
+          expectedVersion,
+          shouldRestore: true,
+        });
         continue;
       }
 
@@ -1348,6 +1761,8 @@ async function validateByteRestoreTargets(
       validatedTargets.push({
         path,
         entry,
+        expectedVersion,
+        shouldRestore: true,
         backupPath,
         backupHandle: verifiedBackup.handle,
         backupStats: verifiedBackup.stats,
@@ -1404,21 +1819,28 @@ function isValidBackupManifestEntry(value: unknown): value is BackupManifestEntr
   }
   const entry = value as Record<string, unknown>;
   if (
-    !hasOnlyKeys(entry, ["kind", "path", "backupPath", "existed", "sha256", "mode"]) ||
-    (entry.kind !== "config" && entry.kind !== "sqlite") ||
+    !hasOnlyKeys(entry, ["kind", "path", "backupPath", "existed", "sha256", "mode", "sourceVersion"]) ||
+    (entry.kind !== "config" && entry.kind !== "sqlite" && entry.kind !== "rollout") ||
     typeof entry.path !== "string" ||
     !isAbsolute(entry.path) ||
-    typeof entry.existed !== "boolean"
+    typeof entry.existed !== "boolean" ||
+    !isValidByteTargetVersion(entry.sourceVersion)
   ) {
     return false;
   }
   if (!entry.existed) {
-    return entry.backupPath === undefined && entry.sha256 === undefined && entry.mode === undefined;
+    return (
+      entry.backupPath === undefined &&
+      entry.sha256 === undefined &&
+      entry.mode === undefined &&
+      entry.sourceVersion.existed === false
+    );
   }
   return (
     typeof entry.backupPath === "string" &&
     isSha256(entry.sha256) &&
-    isValidPermissionMode(entry.mode)
+    isValidPermissionMode(entry.mode) &&
+    entry.sourceVersion.existed === true
   );
 }
 
@@ -1438,6 +1860,7 @@ async function restoreFileAtomically(
   layout: CodexLayout,
   source: ValidatedByteRestoreTarget,
   destination: string,
+  expectedVersion: ByteTargetVersion | undefined,
   io?: TransactionIo,
 ): Promise<void> {
   if (!source.backupPath || !source.backupHandle || !source.backupStats) {
@@ -1452,7 +1875,7 @@ async function restoreFileAtomically(
   let temporaryHandle: FileHandle | undefined;
   let primaryError: unknown;
   try {
-    parent = await openTrustedRestoreParent(layout, destination);
+    parent = await openTrustedRestoreParent(layout, destination, source.entry.kind);
     await io?.beforeRestoreTemporaryCreate?.(destination);
     await assertTrustedRestoreParent(parent);
     temporary = join(
@@ -1468,6 +1891,14 @@ async function restoreFileAtomically(
     await syncAndCloseRestoreTemporary(handleToSync, io);
     await assertVerifiedRestoreBackup(source.backupPath, source.backupHandle, source.backupStats);
     await assertTrustedRestoreParent(parent);
+    if (expectedVersion) {
+      await assertByteTargetVersion(
+        layout,
+        { kind: source.entry.kind, path: destination } as ByteBackedJournalTarget,
+        expectedVersion,
+        io,
+      );
+    }
     await rename(temporary, join(parent.operationalPath, basename(destination)));
     await assertTrustedRestoreParent(parent);
     await syncTrustedRestoreParent(parent, io);
@@ -1520,12 +1951,17 @@ async function restoreFileAtomically(
 async function removeRestoreTargetIfPresent(
   layout: CodexLayout,
   destination: string,
+  kind: BackupKind,
+  expectedVersion: ByteTargetVersion | undefined,
   io?: TransactionIo,
 ): Promise<void> {
-  const parent = await openTrustedRestoreParent(layout, destination);
+  const parent = await openTrustedRestoreParent(layout, destination, kind);
   let primaryError: unknown;
   try {
     await assertTrustedRestoreParent(parent);
+    if (expectedVersion) {
+      await assertByteTargetVersion(layout, { kind, path: destination }, expectedVersion, io);
+    }
     await unlinkIfPresent(join(parent.operationalPath, basename(destination)));
     await assertTrustedRestoreParent(parent);
     await syncTrustedRestoreParent(parent, io);
@@ -1552,12 +1988,10 @@ async function removeRestoreTargetIfPresent(
 async function openTrustedRestoreParent(
   layout: CodexLayout,
   destination: string,
+  kind: BackupKind,
 ): Promise<TrustedRestoreParent> {
   const resolvedDestination = resolve(destination);
-  const allowedDestinations = [resolve(layout.configPath), resolve(layout.sqlitePath)];
-  if (!allowedDestinations.includes(resolvedDestination)) {
-    throw new TransactionError("rollback-failed", "The restore target is not allowed.");
-  }
+  assertAllowedBackupTarget(layout, kind, resolvedDestination);
   const logicalPath = dirname(resolvedDestination);
   const inspected = await inspectTrustedRestoreParent(logicalPath);
   if (process.platform !== "linux") {
@@ -1845,9 +2279,12 @@ function assertAllowedBackupTarget(
   if (kind === "sqlite" && path === sqlitePath) {
     return;
   }
+  if (kind === "rollout" && isInsideRolloutDirectory(layout, path)) {
+    return;
+  }
   throw new TransactionError(
     "invalid-backup-target",
-    "The backup target is not allowed: only config.toml and state_5.sqlite may be byte backed up.",
+    "The backup target is not allowed outside managed configuration, state database, or rollout files.",
   );
 }
 
@@ -2382,13 +2819,25 @@ function isValidJournalEntry(value: unknown): value is JournalEntry {
   }
   const entry = value as Record<string, unknown>;
   return (
-    hasOnlyKeys(entry, ["version", "operationId", "state", "timestamp", "pendingTargets", "appliedTargets"]) &&
+    hasOnlyKeys(entry, [
+      "version",
+      "operationId",
+      "state",
+      "timestamp",
+      "sourceVersionProtocol",
+      "pendingTargets",
+      "appliedTargets",
+      "appliedTargetVersions",
+    ]) &&
     entry.version === 1 &&
     typeof entry.operationId === "string" &&
     isTransactionState(entry.state) &&
     typeof entry.timestamp === "string" &&
+    (entry.sourceVersionProtocol === undefined || entry.sourceVersionProtocol === true) &&
     (entry.pendingTargets === undefined || isValidJournalTargetList(entry.pendingTargets)) &&
-    (entry.appliedTargets === undefined || isValidJournalTargetList(entry.appliedTargets))
+    (entry.appliedTargets === undefined || isValidJournalTargetList(entry.appliedTargets)) &&
+    (entry.appliedTargetVersions === undefined ||
+      isValidAppliedTargetVersionList(entry.appliedTargetVersions))
   );
 }
 
@@ -2412,6 +2861,12 @@ function validateJournalProtocol(
     if (entry.operationId !== directoryOperationId) {
       throw new TransactionError("journal-invalid", "The transaction journal is invalid.");
     }
+    if (
+      entry.sourceVersionProtocol !== undefined &&
+      (index !== 0 || entry.state !== "prepared" || entry.sourceVersionProtocol !== true)
+    ) {
+      throw new TransactionError("journal-invalid", "The transaction journal is invalid.");
+    }
     if (terminalState !== undefined) {
       if (terminalState !== "rolledBack" || entry.state !== "recoveryRequired") {
         throw new TransactionError("journal-invalid", "The transaction journal is invalid.");
@@ -2420,7 +2875,12 @@ function validateJournalProtocol(
       continue;
     }
     if (entry.state === "prepared") {
-      if (index !== 0 || entry.pendingTargets !== undefined || entry.appliedTargets !== undefined) {
+      if (
+        index !== 0 ||
+        entry.pendingTargets !== undefined ||
+        entry.appliedTargets !== undefined ||
+        entry.appliedTargetVersions !== undefined
+      ) {
         throw new TransactionError("journal-invalid", "The transaction journal is invalid.");
       }
       continue;
@@ -2432,12 +2892,27 @@ function validateJournalProtocol(
           throw new TransactionError("journal-invalid", "The transaction journal is invalid.");
         }
       }
+      for (const version of entry.appliedTargetVersions ?? []) {
+        if (
+          !entry.appliedTargets?.some((target) =>
+          target.kind === "config" ||
+          target.kind === "sqlite" ||
+          target.kind === "rollout" ||
+          target.kind === "auth"
+              ? journalTargetsMatch(target, version.target)
+              : false,
+          )
+        ) {
+          throw new TransactionError("journal-invalid", "The transaction journal is invalid.");
+        }
+      }
       pendingTargets.push(...(entry.pendingTargets ?? []));
       continue;
     }
     if (
       entry.pendingTargets !== undefined ||
       entry.appliedTargets !== undefined ||
+      entry.appliedTargetVersions !== undefined ||
       (entry.state === "committed" && !applying)
     ) {
       throw new TransactionError("journal-invalid", "The transaction journal is invalid.");
@@ -2471,8 +2946,102 @@ function normalizeJournalRecoveryTargets(
   return targets;
 }
 
+function normalizeJournalRecoveryTargetVersions(
+  layout: CodexLayout,
+  journal: readonly JournalEntry[],
+): AppliedByteTargetVersion[] {
+  const versions: AppliedByteTargetVersion[] = [];
+  try {
+    for (const entry of journal) {
+      for (const version of entry.appliedTargetVersions ?? []) {
+        const target = normalizeJournalTarget(layout, version.target);
+        if (
+          target.kind !== "config" &&
+          target.kind !== "sqlite" &&
+          target.kind !== "rollout" &&
+          target.kind !== "auth"
+        ) {
+          throw new Error("Applied target version is invalid.");
+        }
+        versions.push({ target, version: version.version });
+      }
+    }
+  } catch (error: unknown) {
+    throw new TransactionError("journal-invalid", "The transaction journal is invalid.", {
+      cause: error,
+    });
+  }
+  return versions;
+}
+
 function isValidJournalTargetList(value: unknown): value is JournalMutationTarget[] {
   return Array.isArray(value) && value.every((target) => isValidJournalTarget(target));
+}
+
+function isValidAppliedTargetVersionList(
+  value: unknown,
+): value is AppliedByteTargetVersion[] {
+  return Array.isArray(value) && value.every(isValidAppliedTargetVersion);
+}
+
+function isValidAppliedTargetVersion(value: unknown): value is AppliedByteTargetVersion {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const version = value as Record<string, unknown>;
+  return (
+    hasOnlyKeys(version, ["target", "version"]) &&
+    isValidJournalTarget(version.target) &&
+    isValidByteTargetVersion(version.version)
+  );
+}
+
+function isValidByteTargetVersion(value: unknown): value is ByteTargetVersion {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const version = value as Record<string, unknown>;
+  if (!hasOnlyKeys(version, [
+    "existed",
+    "sha256",
+    "mode",
+    "device",
+    "inode",
+    "links",
+    "size",
+    "modifiedAtNs",
+    "changedAtNs",
+  ]) || typeof version.existed !== "boolean") {
+    return false;
+  }
+  if (!version.existed) {
+    return (
+      version.sha256 === undefined &&
+      version.mode === undefined &&
+      version.device === undefined &&
+      version.inode === undefined &&
+      version.links === undefined &&
+      version.size === undefined &&
+      version.modifiedAtNs === undefined &&
+      version.changedAtNs === undefined
+    );
+  }
+  return (
+    isSha256(version.sha256) &&
+    isValidPermissionMode(version.mode) &&
+    typeof version.device === "string" &&
+    /^[0-9]+$/.test(version.device) &&
+    typeof version.inode === "string" &&
+    /^[1-9][0-9]*$/.test(version.inode) &&
+    typeof version.links === "string" &&
+    /^[1-9][0-9]*$/.test(version.links) &&
+    typeof version.size === "string" &&
+    /^[0-9]+$/.test(version.size) &&
+    typeof version.modifiedAtNs === "string" &&
+    /^[0-9]+$/.test(version.modifiedAtNs) &&
+    typeof version.changedAtNs === "string" &&
+    /^[0-9]+$/.test(version.changedAtNs)
+  );
 }
 
 function isValidJournalTarget(value: unknown): value is JournalMutationTarget {
@@ -2724,7 +3293,7 @@ async function copyBackupSourceSafely(
   expectedSourceStats: BigIntStats,
   backupPath: string,
   io?: TransactionIo,
-): Promise<void> {
+): Promise<ByteTargetVersion> {
   const temporaryPath = join(
     dirname(backupPath),
     `.${basename(backupPath)}.copy-${randomUUID()}`,
@@ -2737,6 +3306,7 @@ async function copyBackupSourceSafely(
     await assertOpenedBackupSource(layout, sourcePath, expectedSourceStats, openedStats);
 
     backupHandle = await open(temporaryPath, "wx", 0o600);
+    const sourceHash = createHash("sha256");
     const chunk = Buffer.alloc(backupCopyChunkSize);
     let sourceOffset = 0;
     while (true) {
@@ -2749,6 +3319,7 @@ async function copyBackupSourceSafely(
       if (bytesRead === 0) {
         break;
       }
+      sourceHash.update(chunk.subarray(0, bytesRead));
       let written = 0;
       while (written < bytesRead) {
         const result = await backupHandle.write(
@@ -2784,6 +3355,7 @@ async function copyBackupSourceSafely(
     await sourceHandle.close();
     sourceHandle = undefined;
     await rename(temporaryPath, backupPath);
+    return byteTargetVersion(afterReadStats, sourceHash.digest("hex"));
   } catch {
     await closeFileHandleQuietly(backupHandle);
     await closeFileHandleQuietly(sourceHandle);

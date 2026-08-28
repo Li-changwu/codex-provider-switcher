@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import test from "node:test";
@@ -57,6 +57,25 @@ test("redacts active config durability failure details", async () => {
         return true;
       },
     );
+  });
+});
+
+test("does not replace active config when its pre-publish version guard rejects", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const nativeConfig = 'model_provider = "native"\n';
+    await writeFile(layout.configPath, nativeConfig, "utf8");
+
+    await assert.rejects(
+      () =>
+        writeActiveConfig(layout, 'model_provider = "extension"\n', {
+          beforePublish: async () => {
+            throw new Error("The config changed after transaction preparation.");
+          },
+        } as never),
+      (error: unknown) => error instanceof ConfigPersistenceError,
+    );
+
+    assert.equal(await readFile(layout.configPath, "utf8"), nativeConfig);
   });
 });
 

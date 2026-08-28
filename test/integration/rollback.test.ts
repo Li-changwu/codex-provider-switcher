@@ -93,7 +93,57 @@ test("restores the full snapshot when the first real rollout rename fails", asyn
     assert.equal(result.journalState, "rolledBack");
     assert.equal(failureInjectedAfterFirstRename, true);
     await assertSnapshotRestored(fixture, before);
-    await assertByteBackupsExcludeRollouts(fixture.layout, result.operationId);
+    await assertBoundedTransactionBackups(
+      fixture.layout,
+      result.operationId,
+      before.rollouts,
+    );
+    await assertNoSensitiveTransactionData(fixture.layout, result.operationId);
+  });
+});
+
+test("keeps a bounded byte backup for every rollout selected by a failed switch", async () => {
+  await withFixture(async (fixture) => {
+    const before = await takeSnapshot(fixture);
+    const changes = await collectRolloutChanges(fixture.layout, "custom");
+    const result = await switchProfile(
+      { targetProfileId: "custom" },
+      dependencies(fixture, {
+        mutationPlan: {
+          rollouts: createRolloutMutations(fixture.layout, changes, async () => {
+            throw new Error("force rollback after rollout publication");
+          }),
+          sqlite: [],
+          commit: [],
+        },
+      }),
+    );
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.journalState, "rolledBack");
+    const manifest = JSON.parse(
+      await readFile(
+        join(
+          fixture.layout.switcherDir,
+          "transactions",
+          result.operationId,
+          "backup",
+          "manifest.json",
+        ),
+        "utf8",
+      ),
+    ) as {
+      entries: Array<{ kind: string; path: string; backupPath?: string }>;
+    };
+    const rolloutEntries = manifest.entries.filter((entry) => entry.kind === "rollout");
+    assert.equal(rolloutEntries.length, changes.length);
+    for (const entry of rolloutEntries) {
+      assert.ok(entry.backupPath);
+      assert.deepEqual(
+        await readFile(entry.backupPath),
+        before.rollouts.get(entry.path),
+      );
+    }
     await assertNoSensitiveTransactionData(fixture.layout, result.operationId);
   });
 });
@@ -110,7 +160,6 @@ test("restores rollback snapshots after a real SQLite metadata update fails", as
         const update = await updateProviderMetadata(fixture.layout, "custom");
         assert.equal(update.status, "updated");
         sqliteUpdated = true;
-        throw new Error("injected failure after SQLite update");
       },
       rollback: async () => writeFile(fixture.layout.sqlitePath, before.sqlite),
     };
@@ -123,6 +172,10 @@ test("restores rollback snapshots after a real SQLite metadata update fails", as
           sqlite: [sqliteMutation],
           commit: [],
         },
+        verify: async () => {
+          assert.equal(sqliteUpdated, true);
+          throw new Error("injected failure after SQLite update");
+        },
       }),
     );
 
@@ -130,7 +183,11 @@ test("restores rollback snapshots after a real SQLite metadata update fails", as
     assert.equal(result.status, "failed");
     assert.equal(result.journalState, "rolledBack");
     await assertSnapshotRestored(fixture, before);
-    await assertByteBackupsExcludeRollouts(fixture.layout, result.operationId);
+    await assertBoundedTransactionBackups(
+      fixture.layout,
+      result.operationId,
+      before.rollouts,
+    );
     await assertNoSensitiveTransactionData(fixture.layout, result.operationId);
   });
 });
@@ -191,7 +248,11 @@ test("restores commit mutations when failure occurs before the durable commit", 
       false,
     );
     await assertSnapshotRestored(fixture, before);
-    await assertByteBackupsExcludeRollouts(fixture.layout, result.operationId);
+    await assertBoundedTransactionBackups(
+      fixture.layout,
+      result.operationId,
+      before.rollouts,
+    );
     await assertNoSensitiveTransactionData(fixture.layout, result.operationId);
   });
 });
@@ -201,7 +262,6 @@ test("reports cancellation only after the applied rollout is restored", async ()
     const before = await takeSnapshot(fixture);
     const changes = await collectRolloutChanges(fixture.layout, "custom");
     const controller = new AbortController();
-    let rollbackCompleted = false;
     const [change] = changes;
     assert.ok(change);
     const [inversePatch] = createRolloutInversePatches([change]);
@@ -213,10 +273,7 @@ test("reports cancellation only after the applied rollout is restored", async ()
         await applyRolloutChanges([change]);
         controller.abort();
       },
-      rollback: async () => {
-        await reverseRolloutInversePatch(inversePatch, fixture.layout);
-        rollbackCompleted = true;
-      },
+      rollback: async () => undefined,
     };
 
     const result = await switchProfile(
@@ -232,9 +289,12 @@ test("reports cancellation only after the applied rollout is restored", async ()
 
     assert.equal(result.status, "cancelled");
     assert.equal(result.journalState, "rolledBack");
-    assert.equal(rollbackCompleted, true);
     await assertSnapshotRestored(fixture, before);
-    await assertByteBackupsExcludeRollouts(fixture.layout, result.operationId);
+    await assertBoundedTransactionBackups(
+      fixture.layout,
+      result.operationId,
+      selectedRolloutBackups(before, [change.path]),
+    );
     await assertNoSensitiveTransactionData(fixture.layout, result.operationId);
   });
 });
@@ -258,7 +318,7 @@ test("recovers an interrupted applying transaction with its live lock still pres
     const rolloutTarget = { kind: "rollout" as const, path: change.path, inversePatch };
     const sqliteTarget = { kind: "sqlite" as const, path: fixture.layout.sqlitePath };
 
-    await transaction.backupTargets(byteBackupTargets(fixture.layout));
+    await transaction.backupTargets(byteBackupTargets(fixture.layout, [change.path]));
     await transaction.markApplying();
     await transaction.prepareTarget(configTarget);
     await writeFile(fixture.layout.configPath, 'model_provider = "custom"\n');
@@ -292,7 +352,11 @@ test("recovers an interrupted applying transaction with its live lock still pres
       (await readTransactionJournal(transaction.journalPath)).at(-1)?.state,
       "rolledBack",
     );
-    await assertByteBackupsExcludeRollouts(fixture.layout, operationId);
+    await assertBoundedTransactionBackups(
+      fixture.layout,
+      operationId,
+      selectedRolloutBackups(before, [change.path]),
+    );
     await assertNoSensitiveTransactionData(fixture.layout, operationId);
     try {
       await transaction.release();
@@ -349,7 +413,7 @@ test("keeps a durable commit when acknowledgement fails", async () => {
     assert.notDeepEqual(committed.config, before.config);
     assert.equal(committed.authMode, "custom");
     assert.equal(committed.authPathExists, true);
-    await assertByteBackupsExcludeRollouts(fixture.layout, result.operationId);
+    await assertBoundedTransactionBackups(fixture.layout, result.operationId, new Map());
 
     const recovery = await recoverPendingSwitches(fixture.layout, {
       isProcessAlive: () => false,
@@ -389,6 +453,7 @@ test("does not reverse auth or rollout when a selected SQLite backup is tampered
     try {
       const manifest = await transaction.backupTargets([
         { kind: "sqlite", path: fixture.layout.sqlitePath },
+        { kind: "rollout", path: change.path },
       ]);
       await transaction.markApplying();
       await transaction.prepareTarget(authTarget);
@@ -462,10 +527,11 @@ function dependencies(
   };
 }
 
-function byteBackupTargets(layout: CodexLayout) {
+function byteBackupTargets(layout: CodexLayout, rolloutPaths: readonly string[] = []) {
   return [
     { kind: "config" as const, path: layout.configPath },
     { kind: "sqlite" as const, path: layout.sqlitePath },
+    ...rolloutPaths.map((path) => ({ kind: "rollout" as const, path })),
   ];
 }
 
@@ -565,24 +631,14 @@ async function assertNoSensitiveTransactionData(
   operationId: string,
 ): Promise<void> {
   const directory = join(layout.switcherDir, "transactions", operationId);
-  const files = await listFiles(directory);
-  const contents = Buffer.concat(await Promise.all(files.map((path) => readFile(path))));
+  const metadataPaths = [join(directory, "journal.jsonl")];
+  const manifestPath = join(directory, "backup", "manifest.json");
+  if (await fileExists(manifestPath)) {
+    metadataPaths.push(manifestPath);
+  }
+  const contents = Buffer.concat(await Promise.all(metadataPaths.map((path) => readFile(path))));
   assert.equal(contents.includes(Buffer.from(transcriptBody)), false);
   assert.equal(contents.includes(Buffer.from(customApiKey)), false);
-}
-
-async function listFiles(directory: string): Promise<string[]> {
-  const entries = await readdir(directory, { withFileTypes: true });
-  const files: string[] = [];
-  for (const entry of entries) {
-    const path = join(directory, entry.name);
-    if (entry.isDirectory()) {
-      files.push(...(await listFiles(path)));
-    } else if (entry.isFile()) {
-      files.push(path);
-    }
-  }
-  return files;
 }
 
 async function fileExists(path: string): Promise<boolean> {
@@ -630,9 +686,21 @@ async function restoreOfficialAuth(fixture: Fixture): Promise<void> {
   await rm(fixture.layout.authPath, { force: true });
 }
 
-async function assertByteBackupsExcludeRollouts(
+function selectedRolloutBackups(
+  snapshot: Snapshot,
+  paths: readonly string[],
+): ReadonlyMap<string, Buffer> {
+  return new Map(paths.map((path) => {
+    const bytes = snapshot.rollouts.get(path);
+    assert.ok(bytes, `Missing rollout snapshot for ${path}`);
+    return [path, bytes] as const;
+  }));
+}
+
+async function assertBoundedTransactionBackups(
   layout: CodexLayout,
   operationId: string,
+  expectedRollouts: ReadonlyMap<string, Buffer>,
 ): Promise<void> {
   const backupDirectory = join(
     layout.switcherDir,
@@ -644,21 +712,26 @@ async function assertByteBackupsExcludeRollouts(
   const manifest = JSON.parse(
     await readFile(join(backupDirectory, "manifest.json"), "utf8"),
   ) as { entries: Array<{ kind: string; path: string; backupPath?: string }> };
-  assert.equal(names.some((name) => /auth|\.jsonl/i.test(name)), false);
+  assert.equal(names.some((name) => /auth/i.test(name)), false);
   assert.equal(names.includes("manifest.json"), true);
   assert.equal(names.some((name) => /config\.toml/i.test(name)), true);
   assert.equal(names.some((name) => /state_5\.sqlite/i.test(name)), true);
-  assert.deepEqual(
-    manifest.entries.map((entry) => entry.kind).sort(),
-    ["config", "sqlite"],
-  );
+  assert.equal(manifest.entries.filter((entry) => entry.kind === "config").length, 1);
+  assert.equal(manifest.entries.filter((entry) => entry.kind === "sqlite").length, 1);
+
+  const rolloutEntries = manifest.entries.filter((entry) => entry.kind === "rollout");
+  assert.equal(rolloutEntries.length, expectedRollouts.size);
+  let rolloutBackupBytes = 0;
+  for (const [path, expectedBytes] of expectedRollouts) {
+    const entry = rolloutEntries.find((candidate) => candidate.path === path);
+    assert.ok(entry?.backupPath, `Missing rollout backup for ${path}`);
+    const backupBytes = await readFile(entry.backupPath);
+    rolloutBackupBytes += backupBytes.length;
+    assert.deepEqual(backupBytes, expectedBytes, `Rollout backup differs for ${path}`);
+  }
   assert.equal(
-    manifest.entries.some((entry) => (
-      entry.kind === "rollout" ||
-      /\.jsonl/i.test(entry.path) ||
-      /\.jsonl/i.test(entry.backupPath ?? "")
-    )),
-    false,
+    rolloutBackupBytes,
+    [...expectedRollouts.values()].reduce((total, bytes) => total + bytes.length, 0),
   );
 }
 

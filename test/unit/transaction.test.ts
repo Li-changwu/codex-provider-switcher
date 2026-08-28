@@ -11,6 +11,7 @@ import {
   recoverAndBeginTransaction,
   recoverPendingSwitches,
   operationLockPath,
+  TransactionError,
   type BackupTarget,
   type FileIdentity,
 } from "../../src/core/transaction";
@@ -56,7 +57,7 @@ test("requires comparable exact filesystem identity for trusted directories", ()
   );
 });
 
-test("backs up config and sqlite only, rejecting raw rollout copies", async () => {
+test("backs up config, sqlite, and managed rollout files without backing up auth", async () => {
   await withLayout(async (layout) => {
     const transaction = await beginTransaction(layout, { operationId: "backup-only" });
     try {
@@ -75,9 +76,12 @@ test("backs up config and sqlite only, rejecting raw rollout copies", async () =
         true,
       );
       assert.doesNotMatch(JSON.stringify(manifest), /auth|secret|message|transcript/i);
-      assert.rejects(
-        () => transaction.backupTargets([{ kind: "rollout", path: join(layout.sessionsDir, "one.jsonl") }]),
-        /inverse patch/i,
+      const extended = await transaction.backupTargets([
+        { kind: "rollout", path: join(layout.sessionsDir, "one.jsonl") },
+      ]);
+      assert.deepEqual(
+        extended.entries.map((entry) => entry.kind),
+        ["config", "sqlite", "rollout"],
       );
       assert.rejects(
         () => transaction.backupTargets([{ kind: "config", path: layout.authPath }]),
@@ -2529,6 +2533,81 @@ test("rejects a journal containing a state outside the durable transaction proto
   });
 });
 
+test("accepts source-version protocol only on the canonical prepared journal record", async () => {
+  await withLayout(async (layout) => {
+    const validOperationId = "source-version-protocol-valid";
+    const validDirectory = join(layout.switcherDir, "transactions", validOperationId);
+    await mkdir(validDirectory, { recursive: true });
+    await writeFile(join(validDirectory, "journal.jsonl"), `${[
+      {
+        version: 1,
+        operationId: validOperationId,
+        state: "prepared",
+        timestamp: "2026-08-26T00:00:00.000Z",
+        sourceVersionProtocol: true,
+      },
+      {
+        version: 1,
+        operationId: validOperationId,
+        state: "applying",
+        timestamp: "2026-08-26T00:00:01.000Z",
+      },
+    ].map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf8");
+
+    const recovered = await recoverPendingSwitches(layout, {
+      isProcessAlive: () => false,
+      requireSourceVersionProtocol: false,
+    });
+    assert.deepEqual(recovered.recoveredOperationIds, [validOperationId]);
+
+    for (const [operationId, invalidEntry] of [
+      [
+        "source-version-protocol-false",
+        {
+          version: 1,
+          operationId: "source-version-protocol-false",
+          state: "prepared",
+          timestamp: "2026-08-26T00:00:00.000Z",
+          sourceVersionProtocol: false,
+        },
+      ],
+      [
+        "source-version-protocol-late",
+        {
+          version: 1,
+          operationId: "source-version-protocol-late",
+          state: "applying",
+          timestamp: "2026-08-26T00:00:01.000Z",
+          sourceVersionProtocol: true,
+        },
+      ],
+    ] as const) {
+      const directory = join(layout.switcherDir, "transactions", operationId);
+      await mkdir(directory, { recursive: true });
+      const journal = invalidEntry.state === "applying"
+        ? [
+          {
+            version: 1,
+            operationId,
+            state: "prepared",
+            timestamp: "2026-08-26T00:00:00.000Z",
+          },
+          invalidEntry,
+        ]
+        : [invalidEntry];
+      await writeFile(
+        join(directory, "journal.jsonl"),
+        `${journal.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+        "utf8",
+      );
+      await assert.rejects(
+        () => readTransactionJournal(join(directory, "journal.jsonl")),
+        (error: unknown) => error instanceof TransactionError && error.code === "journal-invalid",
+      );
+    }
+  });
+});
+
 test("rejects incomplete custom auth journal metadata before restoration", async () => {
   await withLayout(async (layout) => {
     const operationId = "incomplete-custom-auth";
@@ -3028,6 +3107,88 @@ test("recovers auth only through an injected restorer with normalized metadata",
   });
 });
 
+test("preserves a post-apply auth edit and requires recovery instead of restoring", async () => {
+  await withLayout(async (layout) => {
+    const operationId = "auth-external-after-apply";
+    const transaction = await beginTransaction(layout, {
+      operationId,
+      requireSourceVersionProtocol: true,
+    });
+    const authTarget = {
+      kind: "auth",
+      path: layout.authPath,
+      previousMode: "custom" as const,
+      customProfileId: "research-proxy",
+    };
+    await transaction.markApplying([authTarget]);
+    await rm(layout.authPath);
+    await transaction.markTargetApplied(authTarget);
+    const externalAuth = '{"native":"post-apply-user-edit"}\n';
+    await writeFile(layout.authPath, externalAuth, "utf8");
+    await transaction.release();
+
+    let restoreCalls = 0;
+    const result = await recoverPendingSwitches(layout, {
+      isProcessAlive: () => false,
+      restoreAuthMode: async () => {
+        restoreCalls += 1;
+      },
+    });
+
+    assert.equal(restoreCalls, 0);
+    assert.deepEqual(result.recoveredOperationIds, []);
+    assert.deepEqual(result.recoveryRequiredOperationIds, [operationId]);
+    assert.equal(await readFile(layout.authPath, "utf8"), externalAuth);
+    const journal = await readFile(transaction.journalPath, "utf8");
+    assert.doesNotMatch(journal, /post-apply-user-edit|OPENAI_API_KEY/);
+    assert.equal(
+      (await readTransactionJournal(transaction.journalPath)).at(-1)?.state,
+      "recoveryRequired",
+    );
+  });
+});
+
+test("preserves a post-apply auth edit during in-process rollback", async () => {
+  await withLayout(async (layout) => {
+    const transaction = await beginTransaction(layout, {
+      operationId: "auth-external-before-rollback",
+      requireSourceVersionProtocol: true,
+    });
+    const authTarget = {
+      kind: "auth",
+      path: layout.authPath,
+      previousMode: "custom" as const,
+      customProfileId: "research-proxy",
+    };
+    await transaction.markApplying([authTarget]);
+    await writeFile(layout.authPath, '{"OPENAI_API_KEY":"extension-materialization"}', "utf8");
+    await transaction.markTargetApplied(authTarget);
+    const externalAuth = '{"native":"post-apply-user-edit"}\n';
+    await writeFile(layout.authPath, externalAuth, "utf8");
+
+    let restoreCalls = 0;
+    try {
+      await assert.rejects(
+        () => transaction.rollback(async () => {
+          restoreCalls += 1;
+        }),
+        (error: unknown) =>
+          error instanceof TransactionError && error.code === "rollback-failed",
+      );
+      assert.equal(restoreCalls, 0);
+      assert.equal(await readFile(layout.authPath, "utf8"), externalAuth);
+      const journal = await readFile(transaction.journalPath, "utf8");
+      assert.doesNotMatch(journal, /extension-materialization|post-apply-user-edit/);
+      assert.equal(
+        (await readTransactionJournal(transaction.journalPath)).at(-1)?.state,
+        "recoveryRequired",
+      );
+    } finally {
+      await transaction.release();
+    }
+  });
+});
+
 test("continues recovery when recoveryRequired journalling also fails", async () => {
   await withLayout(async (layout) => {
     const firstOperationId = "a-recovery-and-journal-fail";
@@ -3069,7 +3230,7 @@ test("continues recovery when recoveryRequired journalling also fails", async ()
   });
 });
 
-test("restores an applying transaction with a metadata-only rollout inverse patch", async () => {
+test("restores an applying transaction from the rollout byte backup", async () => {
   await withLayout(async (layout) => {
     const beforeConfig = await readFile(layout.configPath, "utf8");
     const rolloutPath = join(layout.sessionsDir, "one.jsonl");
@@ -3083,6 +3244,7 @@ test("restores an applying transaction with a metadata-only rollout inverse patc
     await transaction.backupTargets([
       { kind: "config", path: layout.configPath },
       { kind: "sqlite", path: layout.sqlitePath },
+      { kind: "rollout", path: rolloutPath },
     ]);
     await transaction.markApplying([
       { kind: "config", path: layout.configPath },
@@ -3105,6 +3267,108 @@ test("restores an applying transaction with a metadata-only rollout inverse patc
       "utf8",
     );
     assert.equal(JSON.parse(journal.trim().split("\n").at(-1)!).state, "rolledBack");
+  });
+});
+
+test("strict recovery preserves an external post-apply write", async () => {
+  await withLayout(async (layout) => {
+    const transaction = await beginTransaction(layout, {
+      operationId: "external-after-apply",
+      requireSourceVersionProtocol: true,
+    });
+    await transaction.backupTargets([{ kind: "config", path: layout.configPath }]);
+    await transaction.markApplying([{ kind: "config", path: layout.configPath }]);
+    await writeFile(layout.configPath, "extension config", "utf8");
+    await transaction.markTargetApplied({ kind: "config", path: layout.configPath });
+    await writeFile(layout.configPath, "native change after apply", "utf8");
+    await transaction.release();
+
+    const result = await recoverPendingSwitches(layout, {
+      isProcessAlive: () => false,
+      requireSourceVersionProtocol: false,
+    });
+
+    assert.deepEqual(result.recoveredOperationIds, []);
+    assert.deepEqual(result.recoveryRequiredOperationIds, ["external-after-apply"]);
+    assert.equal(await readFile(layout.configPath, "utf8"), "native change after apply");
+    assert.equal(
+      (await readTransactionJournal(transaction.journalPath)).at(-1)?.state,
+      "recoveryRequired",
+    );
+  });
+});
+
+test("retains an applied config version in memory when its journal append fails", async () => {
+  await withLayout(async (layout) => {
+    const originalConfig = await readFile(layout.configPath, "utf8");
+    const appendFailure = new Error("injected applied-version journal failure");
+    let failAppliedRecord = false;
+    const transaction = await beginTransaction(layout, {
+      operationId: "applied-version-in-memory",
+      requireSourceVersionProtocol: true,
+      io: {
+        async renameJournal(source, destination) {
+          const records = (await readFile(source, "utf8")).trim().split("\n");
+          const entry = JSON.parse(records.at(-1)!) as {
+            appliedTargetVersions?: unknown;
+          };
+          if (failAppliedRecord && entry.appliedTargetVersions !== undefined) {
+            throw appendFailure;
+          }
+          await rename(source, destination);
+        },
+      },
+    });
+    await transaction.backupTargets([{ kind: "config", path: layout.configPath }]);
+    await transaction.markApplying([{ kind: "config", path: layout.configPath }]);
+    await writeFile(layout.configPath, "extension config", "utf8");
+    failAppliedRecord = true;
+
+    try {
+      await assert.rejects(
+        () => transaction.markTargetApplied({ kind: "config", path: layout.configPath }),
+        (error: unknown) => error === appendFailure,
+      );
+      assert.equal(
+        (await readTransactionJournal(transaction.journalPath))
+          .some((entry) => entry.appliedTargetVersions !== undefined),
+        false,
+      );
+
+      failAppliedRecord = false;
+      await transaction.rollback();
+      assert.equal(await readFile(layout.configPath, "utf8"), originalConfig);
+    } finally {
+      await transaction.release();
+    }
+  });
+});
+
+test("derives strict recovery from the prepared journal instead of a caller toggle", async () => {
+  await withLayout(async (layout) => {
+    const transaction = await beginTransaction(layout, {
+      operationId: "strict-journal-overrides-caller",
+      requireSourceVersionProtocol: true,
+    });
+    await transaction.backupTargets([{ kind: "config", path: layout.configPath }]);
+    await transaction.markApplying();
+    await transaction.prepareTarget({ kind: "config", path: layout.configPath });
+    await writeFile(layout.configPath, "external bytes after a possible application", "utf8");
+    await transaction.release();
+
+    const result = await recoverPendingSwitches(layout, {
+      isProcessAlive: () => false,
+      requireSourceVersionProtocol: false,
+    });
+
+    assert.deepEqual(result.recoveredOperationIds, []);
+    assert.deepEqual(result.recoveryRequiredOperationIds, [
+      "strict-journal-overrides-caller",
+    ]);
+    assert.equal(
+      await readFile(layout.configPath, "utf8"),
+      "external bytes after a possible application",
+    );
   });
 });
 
@@ -3142,6 +3406,160 @@ test("restores only config data selected by the pending journal targets", async 
     assert.equal(result.recoveredOperationIds.includes("targeted-backup-restore"), true);
     assert.equal(await readFile(layout.configPath, "utf8"), beforeConfig);
     assert.equal(await readFile(layout.sqlitePath, "utf8"), "changed sqlite");
+  });
+});
+
+test("creates a durable byte backup for an allowed rollout file", async () => {
+  await withLayout(async (layout) => {
+    const rolloutPath = join(layout.sessionsDir, "one.jsonl");
+    const transaction = await beginTransaction(layout, {
+      operationId: "rollout-byte-backup",
+    });
+    try {
+      const manifest = await transaction.backupTargets([
+        { kind: "rollout", path: rolloutPath },
+      ]);
+      const [entry] = manifest.entries;
+
+      assert.equal(entry?.kind, "rollout");
+      assert.equal(entry?.path, rolloutPath);
+      assert.equal(entry?.existed, true);
+      assert.equal(typeof entry?.backupPath, "string");
+      assert.deepEqual(
+        await readFile(entry?.backupPath ?? "", "utf8"),
+        await readFile(rolloutPath, "utf8"),
+      );
+    } finally {
+      await transaction.release();
+    }
+  });
+});
+
+test("does not append journal state when a publish-boundary version check fails", async () => {
+  await withLayout(async (layout) => {
+    const transaction = await beginTransaction(layout, {
+      operationId: "boundary-version-check",
+      requireSourceVersionProtocol: true,
+    });
+    const target = { kind: "config" as const, path: layout.configPath };
+    try {
+      await transaction.backupTargets([target]);
+      await transaction.markApplying();
+      await transaction.prepareTarget(target);
+      const journalBeforeCheck = await readTransactionJournal(transaction.journalPath);
+      await writeFile(layout.configPath, "native bytes at publish boundary", "utf8");
+
+      await assert.rejects(
+        () => transaction.assertTargetUnchanged(target),
+        (error: unknown) =>
+          error instanceof TransactionError && error.code === "rollback-failed",
+      );
+
+      assert.deepEqual(
+        await readTransactionJournal(transaction.journalPath),
+        journalBeforeCheck,
+      );
+      assert.equal(
+        await readFile(layout.configPath, "utf8"),
+        "native bytes at publish boundary",
+      );
+      await assert.rejects(
+        () => transaction.rollback(),
+        (error: unknown) =>
+          error instanceof TransactionError && error.code === "rollback-failed",
+      );
+      assert.equal(
+        (await readTransactionJournal(transaction.journalPath)).at(-1)?.state,
+        "recoveryRequired",
+      );
+    } finally {
+      await transaction.release();
+    }
+  });
+});
+
+test("accepts rollout applied-version evidence before preparing a following target", async () => {
+  await withLayout(async (layout) => {
+    const rolloutPath = join(layout.sessionsDir, "one.jsonl");
+    await writeFile(
+      rolloutPath,
+      '{"type":"session_meta","payload":{"id":"one","model_provider":"before"}}\n',
+      "utf8",
+    );
+    const rolloutBefore = await readFile(rolloutPath, "utf8");
+    const [change] = await collectRolloutChanges(layout, "after");
+    assert.ok(change);
+    const [inversePatch] = createRolloutInversePatches([change]);
+    assert.ok(inversePatch);
+    const rolloutTarget = {
+      kind: "rollout" as const,
+      path: rolloutPath,
+      inversePatch,
+    };
+    const configTarget = { kind: "config" as const, path: layout.configPath };
+    const transaction = await beginTransaction(layout, {
+      operationId: "rollout-version-before-next-target",
+      requireSourceVersionProtocol: true,
+    });
+    try {
+      await transaction.backupTargets([rolloutTarget, configTarget]);
+      await transaction.markApplying();
+      await transaction.prepareTarget(rolloutTarget);
+      await applyRolloutChanges([change]);
+      await transaction.markTargetApplied(rolloutTarget);
+
+      await transaction.prepareTarget(configTarget);
+
+      assert.equal(
+        (await readTransactionJournal(transaction.journalPath))
+          .some((entry) => entry.appliedTargetVersions?.some(
+            (version) => version.target.kind === "rollout",
+          )),
+        true,
+      );
+      await transaction.rollback();
+      assert.equal(await readFile(rolloutPath, "utf8"), rolloutBefore);
+    } finally {
+      await transaction.release();
+    }
+  });
+});
+
+test("recovers strict rollout applied-version evidence", async () => {
+  await withLayout(async (layout) => {
+    const rolloutPath = join(layout.sessionsDir, "one.jsonl");
+    await writeFile(
+      rolloutPath,
+      '{"type":"session_meta","payload":{"id":"one","model_provider":"before"}}\n',
+      "utf8",
+    );
+    const rolloutBefore = await readFile(rolloutPath, "utf8");
+    const [change] = await collectRolloutChanges(layout, "after");
+    assert.ok(change);
+    const [inversePatch] = createRolloutInversePatches([change]);
+    assert.ok(inversePatch);
+    const target = {
+      kind: "rollout" as const,
+      path: rolloutPath,
+      inversePatch,
+    };
+    const transaction = await beginTransaction(layout, {
+      operationId: "recover-rollout-applied-version",
+      requireSourceVersionProtocol: true,
+    });
+    await transaction.backupTargets([target]);
+    await transaction.markApplying();
+    await transaction.prepareTarget(target);
+    await applyRolloutChanges([change]);
+    await transaction.markTargetApplied(target);
+    await transaction.release();
+
+    const recovery = await recoverPendingSwitches(layout, {
+      isProcessAlive: () => false,
+    });
+
+    assert.deepEqual(recovery.recoveredOperationIds, ["recover-rollout-applied-version"]);
+    assert.equal(await readFile(rolloutPath, "utf8"), rolloutBefore);
   });
 });
 

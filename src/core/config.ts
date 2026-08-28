@@ -53,6 +53,7 @@ export class ConfigPersistenceError extends Error {
 export interface ConfigIo {
   syncFile?(path: string): Promise<void>;
   syncDirectory?(path: string): Promise<void>;
+  beforePublish?(path: string): Promise<void>;
 }
 
 export function validateProfileConfig(
@@ -232,6 +233,7 @@ async function writeAtomically(
     if (io) {
       await (io.syncFile ?? syncFile)(temporaryPath);
     }
+    await io?.beforePublish?.(path);
     await nativeRename(temporaryPath, path);
     renamed = true;
     if (io) {
