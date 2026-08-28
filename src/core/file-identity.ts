@@ -112,11 +112,15 @@ export async function hydrateWindowsFileIdentity(
   if (!isValidWindowsSystemRoot(systemRoot)) {
     throw new FileIdentityError();
   }
+  const fsutilPath = getWindowsFsutilPath(systemRoot);
+  if (fsutilPath === undefined) {
+    throw new FileIdentityError();
+  }
 
   try {
     const targetPath = win32.normalize(path);
     const result = await (options.runner ?? runWindowsFileIdCommand)(
-      win32.join(systemRoot, "System32", "fsutil.exe"),
+      fsutilPath,
       ["file", "queryFileID", targetPath],
       {
         shell: false,
@@ -160,10 +164,24 @@ function getCanonicalWindowsFileId(identity: FileIdentity): string | undefined {
 }
 
 function isValidWindowsSystemRoot(value: string | undefined): value is string {
-  return typeof value === "string" && (
-    /^[A-Za-z]:[\\/]/.test(value) ||
-    /^\\\\[^\\/]+[\\/][^\\/]+/.test(value)
-  );
+  if (typeof value !== "string" || value.includes("/") || !win32.isAbsolute(value)) {
+    return false;
+  }
+
+  const normalized = win32.normalize(value);
+  const parsed = win32.parse(normalized);
+  const segments = normalized.slice(parsed.root.length).split("\\");
+  return normalized === value &&
+    /^[A-Za-z]:\\$/.test(parsed.root) &&
+    segments.length === 1 &&
+    segments[0].toLowerCase() === "windows";
+}
+
+function getWindowsFsutilPath(systemRoot: string): string | undefined {
+  const fsutilPath = win32.join(systemRoot, "System32", "fsutil.exe");
+  return win32.relative(systemRoot, fsutilPath).toLowerCase() === "system32\\fsutil.exe"
+    ? fsutilPath
+    : undefined;
 }
 
 function parseWindowsFileId(stdout: string): string {

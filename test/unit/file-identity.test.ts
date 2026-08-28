@@ -141,6 +141,37 @@ test("hydrates zero-inode Windows identities through the constrained File ID com
   assert.equal(sameStableFileIdentity(original, hydrated, "win32"), false);
 });
 
+test("rejects noncanonical Windows system roots before the File ID runner", async () => {
+  let calls = 0;
+  const runner: WindowsFileIdCommandRunner = async () => {
+    calls += 1;
+    return { stdout: FILE_ID };
+  };
+
+  for (const systemRoot of [
+    "C:\\Windows\\..\\attacker",
+    "C:\\Windows\\.\\attacker",
+    "C:\\Windows\\System32\\..\\attacker",
+    "C:/Windows",
+    "C:\\Windows\\",
+    "C:\\attacker",
+    "\\\\server\\share\\Windows",
+  ]) {
+    const result = await hydrateWindowsFileIdentity(
+      "C:\\work\\active.toml",
+      identity({ ino: 0n }),
+      { platform: "win32", systemRoot, runner },
+    ).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+
+    assert.equal(result instanceof FileIdentityError, true, systemRoot);
+  }
+
+  assert.equal(calls, 0);
+});
+
 test("does not query File IDs outside the zero-inode Windows path", async () => {
   let calls = 0;
   const runner: WindowsFileIdCommandRunner = async () => {
