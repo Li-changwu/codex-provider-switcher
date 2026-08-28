@@ -108,6 +108,24 @@ test("compares complete native Windows identities for zero inode observations", 
   assert.equal(sameStableFileIdentity(first, differentLinkCount, "win32"), false);
 });
 
+test("fails closed for a mutable Windows file identity accessor", () => {
+  let reads = 0;
+  const mutable: FileIdentity = {
+    dev: 1n,
+    ino: 0n,
+    nlink: 1n,
+    get windowsFileIdentity(): WindowsFileIdentity {
+      reads += 1;
+      return reads % 2 === 0
+        ? nativeIdentity({ volumeSerial: "not-a-volume-id" })
+        : nativeIdentity();
+    },
+  };
+  const stable = identity({ ino: 0n, windowsFileIdentity: nativeIdentity() });
+
+  assert.equal(sameStableFileIdentity(mutable, stable, "win32"), false);
+});
+
 test("rejects missing native identities and mixed zero and nonzero inode observations", () => {
   const nativeZeroInode = identity({ ino: 0n, windowsFileIdentity: nativeIdentity() });
   const missingNativeIdentity = identity({ ino: 0n });

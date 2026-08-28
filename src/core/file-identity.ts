@@ -19,6 +19,13 @@ export interface HydrateWindowsFileIdentityOptions {
   readonly windowsFileOperations?: WindowsFileOperations;
 }
 
+interface ComparableFileIdentity {
+  readonly dev: number | bigint;
+  readonly ino: number | bigint;
+  readonly nlink: number | bigint;
+  readonly windowsFileIdentity?: WindowsFileIdentity;
+}
+
 export class FileIdentityError extends Error {
   constructor() {
     super("Windows file identity is unavailable.");
@@ -30,21 +37,7 @@ export function hasComparableFileIdentity(
   identity: FileIdentity,
   platform: NodeJS.Platform = process.platform,
 ): boolean {
-  if (
-    !isSafeIdentityValue(identity.dev) ||
-    !isSafeIdentityValue(identity.ino) ||
-    !isSafeIdentityValue(identity.nlink)
-  ) {
-    return false;
-  }
-
-  if (!isZero(identity.ino)) {
-    return true;
-  }
-
-  return platform === "win32" &&
-    hasNativeWindowsFileIdentity(identity.windowsFileIdentity) &&
-    sameIdentityValue(identity.nlink, identity.windowsFileIdentity.linkCount);
+  return snapshotComparableFileIdentity(identity, platform) !== undefined;
 }
 
 export function sameStableFileIdentity(
@@ -52,23 +45,23 @@ export function sameStableFileIdentity(
   right: FileIdentity,
   platform: NodeJS.Platform = process.platform,
 ): boolean {
-  if (
-    !hasComparableFileIdentity(left, platform) ||
-    !hasComparableFileIdentity(right, platform)
-  ) {
+  const leftSnapshot = snapshotComparableFileIdentity(left, platform);
+  const rightSnapshot = snapshotComparableFileIdentity(right, platform);
+  if (leftSnapshot === undefined || rightSnapshot === undefined) {
     return false;
   }
 
-  if (!isZero(left.ino) && !isZero(right.ino)) {
-    return sameIdentityValue(left.dev, right.dev) && sameIdentityValue(left.ino, right.ino);
+  if (!isZero(leftSnapshot.ino) && !isZero(rightSnapshot.ino)) {
+    return sameIdentityValue(leftSnapshot.dev, rightSnapshot.dev) &&
+      sameIdentityValue(leftSnapshot.ino, rightSnapshot.ino);
   }
 
-  if (platform !== "win32" || !isZero(left.ino) || !isZero(right.ino)) {
+  if (platform !== "win32" || !isZero(leftSnapshot.ino) || !isZero(rightSnapshot.ino)) {
     return false;
   }
 
-  const leftWindowsIdentity = left.windowsFileIdentity;
-  const rightWindowsIdentity = right.windowsFileIdentity;
+  const leftWindowsIdentity = leftSnapshot.windowsFileIdentity;
+  const rightWindowsIdentity = rightSnapshot.windowsFileIdentity;
   return leftWindowsIdentity !== undefined &&
     rightWindowsIdentity !== undefined &&
     leftWindowsIdentity.volumeSerial === rightWindowsIdentity.volumeSerial &&
@@ -105,10 +98,50 @@ export async function hydrateWindowsFileIdentity(
   }
 }
 
-function isSafeIdentityValue(value: number | bigint): boolean {
+function snapshotComparableFileIdentity(
+  identity: FileIdentity,
+  platform: NodeJS.Platform,
+): ComparableFileIdentity | undefined {
+  try {
+    const dev = readOwnDataProperty(identity, "dev");
+    const ino = readOwnDataProperty(identity, "ino");
+    const nlink = readOwnDataProperty(identity, "nlink");
+    if (!isSafeIdentityValue(dev) || !isSafeIdentityValue(ino) || !isSafeIdentityValue(nlink)) {
+      return undefined;
+    }
+
+    if (!isZero(ino)) {
+      return Object.freeze({ dev, ino, nlink });
+    }
+
+    if (platform !== "win32") {
+      return undefined;
+    }
+
+    const windowsFileIdentity = snapshotWindowsFileIdentity(
+      readOwnDataProperty(identity, "windowsFileIdentity"),
+    );
+    if (
+      windowsFileIdentity === undefined ||
+      !sameIdentityValue(nlink, windowsFileIdentity.linkCount)
+    ) {
+      return undefined;
+    }
+    return Object.freeze({ dev, ino, nlink, windowsFileIdentity });
+  } catch {
+    return undefined;
+  }
+}
+
+function readOwnDataProperty(value: object, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  return descriptor !== undefined && "value" in descriptor ? descriptor.value : undefined;
+}
+
+function isSafeIdentityValue(value: unknown): value is number | bigint {
   return typeof value === "bigint"
     ? value >= 0n
-    : Number.isSafeInteger(value) && value >= 0;
+    : typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function sameIdentityValue(left: number | bigint, right: number | bigint): boolean {
@@ -123,28 +156,27 @@ function isZero(value: number | bigint): boolean {
 }
 
 function snapshotWindowsFileIdentity(value: unknown): WindowsFileIdentity | undefined {
-  if (!hasNativeWindowsFileIdentity(value)) {
+  try {
+    if (!isRecord(value)) {
+      return undefined;
+    }
+    const volumeSerial = readOwnDataProperty(value, "volumeSerial");
+    const fileId = readOwnDataProperty(value, "fileId");
+    const linkCount = readOwnDataProperty(value, "linkCount");
+    if (
+      typeof volumeSerial !== "string" ||
+      !VOLUME_SERIAL_PATTERN.test(volumeSerial) ||
+      typeof fileId !== "string" ||
+      !FILE_ID_PATTERN.test(fileId) ||
+      typeof linkCount !== "bigint" ||
+      linkCount !== 1n
+    ) {
+      return undefined;
+    }
+    return Object.freeze({ volumeSerial, fileId, linkCount });
+  } catch {
     return undefined;
   }
-
-  return Object.freeze({
-    volumeSerial: value.volumeSerial,
-    fileId: value.fileId,
-    linkCount: value.linkCount,
-  });
-}
-
-function hasNativeWindowsFileIdentity(value: unknown): value is WindowsFileIdentity {
-  if (!isRecord(value)) {
-    return false;
-  }
-
-  return typeof value.volumeSerial === "string" &&
-    VOLUME_SERIAL_PATTERN.test(value.volumeSerial) &&
-    typeof value.fileId === "string" &&
-    FILE_ID_PATTERN.test(value.fileId) &&
-    typeof value.linkCount === "bigint" &&
-    value.linkCount === 1n;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

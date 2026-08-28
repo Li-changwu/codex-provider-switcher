@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { lstatSync } from "node:fs";
 import { link, lstat, mkdir, mkdtemp, open, readFile, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
@@ -123,6 +124,48 @@ test("rejects a replaced zero-inode active Profile file after its path is checke
         return;
       }
       replaceOnRead = false;
+      const replacementPath = `${path}.replacement`;
+      await writeFile(
+        replacementPath,
+        '{\n  "version": 1,\n  "profileId": "replacement",\n  "updatedAt": "2026-08-25T00:00:00.000Z"\n}\n',
+        "utf8",
+      );
+      await rename(replacementPath, path);
+    },
+  });
+});
+
+test("rejects an opened zero-inode active Profile file after its path is replaced", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  let replaceAfterOpen = false;
+  let activeProfilePath: string | undefined;
+  await withZeroInodeStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const store = new ActiveProfileStore(layout, {
+        now: () => "2026-08-25T00:00:00.000Z",
+        fileIdentityOptions: {
+          platform: "win32",
+          windowsFileOperations: nativeWindowsFileOperations(),
+        },
+      });
+      activeProfilePath = store.path;
+      await store.set("official");
+      replaceAfterOpen = true;
+
+      await assert.rejects(
+        () => store.get(),
+        (error: unknown) => error instanceof ActiveProfileStoreError && error.code === "unsafe-state",
+      );
+    });
+  }, {
+    afterOpen: async (path, flags) => {
+      if (!replaceAfterOpen || path !== activeProfilePath || flags !== "r") {
+        return;
+      }
+      replaceAfterOpen = false;
       const replacementPath = `${path}.replacement`;
       await writeFile(
         replacementPath,
@@ -337,6 +380,7 @@ function isWindowsSymlinkPrivilegeError(error: unknown): boolean {
 
 interface ZeroInodeStatsHooks {
   beforeOpen?: (path: string, flags: string | number | undefined) => Promise<void>;
+  afterOpen?: (path: string, flags: string | number | undefined) => Promise<void>;
 }
 
 async function withZeroInodeStats(
@@ -351,22 +395,22 @@ async function withZeroInodeStats(
   const originalOpen = mutableFs.open;
   mutableFs.lstat = (async (...args: Parameters<typeof lstat>) => {
     const stats = await originalLstat(...args);
-    rememberNativeIdentity(args[0], stats);
     return withZeroInode(stats);
   }) as typeof lstat;
   mutableFs.open = (async (...args: Parameters<typeof open>) => {
-    const logicalPath = args[0];
     const path = args[0];
     if (typeof path === "string") {
       await hooks.beforeOpen?.(path, args[1]);
     }
     const handle = await originalOpen(...args);
+    if (typeof path === "string") {
+      await hooks.afterOpen?.(path, args[1]);
+    }
     return new Proxy(handle, {
       get(target, property) {
         if (property === "stat") {
           return async (...statArgs: Parameters<typeof target.stat>) => {
             const stats = await target.stat(...statArgs);
-            rememberNativeIdentity(logicalPath, stats);
             return withZeroInode(stats);
           };
         }
@@ -381,7 +425,6 @@ async function withZeroInodeStats(
   } finally {
     mutableFs.lstat = originalLstat;
     mutableFs.open = originalOpen;
-    nativeIdentityStats.clear();
     syncBuiltinESMExports();
   }
 }
@@ -400,17 +443,11 @@ function withZeroInode<T extends Awaited<ReturnType<typeof lstat>>>(stats: T): T
   return copy;
 }
 
-const nativeIdentityStats = new Map<string, {
-  readonly dev: bigint;
-  readonly ino: bigint;
-  readonly nlink: bigint;
-}>();
-
 function nativeWindowsFileOperations(): WindowsFileOperations {
   return {
     captureFileIdentity(path) {
-      const stats = nativeIdentityStats.get(path);
-      if (stats === undefined || stats.nlink !== 1n) {
+      const stats = lstatSync(path, { bigint: true });
+      if (stats.nlink !== 1n) {
         throw new Error("native identity is unavailable");
       }
       return {
@@ -442,17 +479,4 @@ function unavailableWindowsFileOperations(): WindowsFileOperations {
       throw new Error("unused");
     },
   };
-}
-
-function rememberNativeIdentity(
-  path: unknown,
-  stats: { dev: bigint; ino: bigint; nlink: bigint },
-): void {
-  if (typeof path === "string") {
-    nativeIdentityStats.set(path, {
-      dev: stats.dev,
-      ino: stats.ino,
-      nlink: stats.nlink,
-    });
-  }
 }

@@ -125,3 +125,69 @@ git commit -m "fix: adopt native Windows file identities"
 - The adaptation preserves the Task 3 API: every zero-inode identity has a complete volume serial, file ID, and link count from the Windows native helper.
 - The only consumer changes are property projection and fixture injection. Atomic mutation routing remains reserved for Tasks 4 and 5.
 - The old hard-link integration assertion is replaced with the native helper's required fail-closed behavior.
+
+### Task 4: Validate the Open-Then-Replace Read Boundary
+
+**Files:**
+- Modify: `src/core/file-identity.ts`
+- Modify: `test/unit/file-identity.test.ts`
+- Modify: `test/unit/active-profile.test.ts`
+- Modify: `test/unit/profiles.test.ts`
+
+- [x] **Step 1: Add an open-then-replace regression test using a path-faithful fake**
+
+The fake `captureFileIdentity(path)` must synchronously read the current path's real
+`BigIntStats` with `lstatSync`, rather than accepting a map populated by a file
+handle's `stat`. Add a zero-inode ActiveProfile test that opens file A, atomically
+renames file B onto the logical path before the first handle stat, and asserts the
+read rejects with `unsafe-state`. This test establishes the reviewed race's actual
+observable result: the retained pre-open snapshot for A cannot equal B.
+
+Run:
+
+```text
+npx tsx --test test/unit/active-profile.test.ts --test-name-pattern "opened zero-inode"
+```
+
+Expected: PASS before any production change; it demonstrates the alleged bypass
+does not reproduce with a path-faithful native identity source.
+
+- [x] **Step 2: Add a failing mutable-accessor identity test**
+
+Add a test where `windowsFileIdentity` is a getter returning a valid snapshot on
+its first read and an invalid or substituted snapshot on its next read. Assert
+`sameStableFileIdentity` returns `false`; run it before the implementation change.
+
+```text
+npx tsx --test test/unit/file-identity.test.ts --test-name-pattern "mutable"
+```
+
+Expected: FAIL because the current comparison reads the property more than once.
+
+- [x] **Step 3: Snapshot comparable identities exactly once**
+
+Replace repeated direct property accesses in `hasComparableFileIdentity` and
+`sameStableFileIdentity` with a private helper that reads `dev`, `ino`, `nlink`,
+and (for zero inode) native identity fields once inside `try/catch`, validates all
+values, and returns frozen copied primitives. An accessor exception or a malformed
+second value must return false, never throw. Preserve exact `dev + ino` behavior
+for nonzero inode.
+
+- [x] **Step 4: Run the Task 3 regression suite and commit**
+
+Run:
+
+```text
+npx tsx --test test/unit/file-identity.test.ts test/unit/active-profile.test.ts test/unit/profiles.test.ts
+npm run check
+npm test
+npm run test:integration
+git diff --check
+```
+
+Then commit only the tested Task 3 hardening:
+
+```text
+git add src/core/file-identity.ts test/unit/file-identity.test.ts test/unit/active-profile.test.ts test/unit/profiles.test.ts docs/superpowers/plans/2026-08-28-native-file-identity-consumer-adaptation.md
+git commit -m "fix: harden native file identity comparison"
+```

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { lstatSync } from "node:fs";
 import {
   chmod,
   link,
@@ -2182,18 +2183,15 @@ async function withZeroInodeProfileStats(callback: () => Promise<void>): Promise
   const originalOpen = mutableFs.open;
   mutableFs.lstat = (async (...args: Parameters<typeof lstat>) => {
     const stats = await originalLstat(...args);
-    rememberNativeProfileIdentity(args[0], stats);
     return withZeroInodeProfileStatsValue(stats);
   }) as typeof lstat;
   mutableFs.open = (async (...args: Parameters<typeof open>) => {
-    const logicalPath = args[0];
     const handle = await originalOpen(...args);
     return new Proxy(handle, {
       get(target, property) {
         if (property === "stat") {
           return async (...statArgs: Parameters<typeof target.stat>) => {
             const stats = await target.stat(...statArgs);
-            rememberNativeProfileIdentity(logicalPath, stats);
             return withZeroInodeProfileStatsValue(stats);
           };
         }
@@ -2208,7 +2206,6 @@ async function withZeroInodeProfileStats(callback: () => Promise<void>): Promise
   } finally {
     mutableFs.lstat = originalLstat;
     mutableFs.open = originalOpen;
-    nativeProfileIdentityStats.clear();
     syncBuiltinESMExports();
   }
 }
@@ -2229,12 +2226,6 @@ function withZeroInodeProfileStatsValue<T extends Awaited<ReturnType<typeof lsta
   return copy;
 }
 
-const nativeProfileIdentityStats = new Map<string, {
-  readonly dev: bigint;
-  readonly ino: bigint;
-  readonly nlink: bigint;
-}>();
-
 function zeroInodeProfileIdentityOptions() {
   return {
     platform: "win32" as const,
@@ -2245,8 +2236,8 @@ function zeroInodeProfileIdentityOptions() {
 function nativeProfileWindowsFileOperations(): WindowsFileOperations {
   return {
     captureFileIdentity(path) {
-      const stats = nativeProfileIdentityStats.get(path);
-      if (stats === undefined || stats.nlink !== 1n) {
+      const stats = lstatSync(path, { bigint: true });
+      if (stats.nlink !== 1n) {
         throw new Error("native identity is unavailable");
       }
       return {
@@ -2278,19 +2269,6 @@ function unavailableProfileWindowsFileOperations(): WindowsFileOperations {
       throw new Error("unused");
     },
   };
-}
-
-function rememberNativeProfileIdentity(
-  path: unknown,
-  stats: { dev: bigint; ino: bigint; nlink: bigint },
-): void {
-  if (typeof path === "string") {
-    nativeProfileIdentityStats.set(path, {
-      dev: stats.dev,
-      ino: stats.ino,
-      nlink: stats.nlink,
-    });
-  }
 }
 
 class RecordingProfileFileSystem implements ProfileFileSystem {
