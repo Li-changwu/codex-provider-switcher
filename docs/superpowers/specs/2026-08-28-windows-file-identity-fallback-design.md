@@ -18,9 +18,10 @@ on Linux.
 
 ## Decision
 
-Create `src/core/file-identity.ts` as the single policy owner for trusted
-filesystem identity. Every current `dev + ino` check in active Profile,
-ProfileStore, stored-profile preflight, and transaction code delegates to it.
+Task 1 creates `src/core/file-identity.ts` as the single policy owner for
+trusted filesystem identity. This phase does not change active Profile,
+ProfileStore, stored-profile preflight, or transaction code. Task 2 will make
+their current `dev + ino` checks delegate to this policy.
 
 The policy has two modes:
 
@@ -49,6 +50,13 @@ stable across a hard link and rename but changes for a replacement file at the
 same path. If Windows cannot expose the ID, the extension fails closed instead
 of treating timestamps as identity.
 
+Production command execution derives its root only from the Extension Host
+process's `SystemRoot`. A `systemRoot` override is accepted only with an
+explicit injected command runner for unit tests; it cannot redirect the real
+`execFile` invocation. Both paths require a canonical, drive-absolute Windows
+root and verify that the derived executable is exactly
+`System32\\fsutil.exe` beneath it.
+
 The path query cannot be tied to a Node FileHandle, so it does not eliminate
 every race an active local attacker could create around all observations. The
 extension preserves the existing defenses around it: no-link checks, canonical
@@ -72,11 +80,12 @@ argument vector, timeout and output parsing separately. A Windows integration
 test exercises `fsutil` on a real temporary file and proves that a hard link
 shares the ID while a replacement file does not.
 
-Existing active Profile, ProfileStore, orchestrator, and transaction tests run
-against real temporary files. Windows CI proves that those layers operate on a
-zero-inode volume. Existing symlink and hard-link tests remain unchanged and
-must continue passing. The activation fixture chooses the actual host platform
-and corresponding path values, so Linux no longer constructs a Windows layout.
+Task 2 will update active Profile, ProfileStore, orchestrator, and transaction
+tests to exercise the policy through real temporary files. After that wiring,
+Windows CI must prove those layers operate on a zero-inode volume. Existing
+symlink and hard-link tests remain unchanged and must continue passing. Task 3
+will make the activation fixture choose the actual host platform and
+corresponding path values, so Linux no longer constructs a Windows layout.
 
 ## Out of Scope
 

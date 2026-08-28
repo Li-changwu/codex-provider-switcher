@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import test from "node:test";
 import {
   FileIdentityError,
@@ -11,6 +12,8 @@ import {
 
 const FILE_ID = "0x0123456789abcdef";
 const OTHER_FILE_ID = "0xfedcba9876543210";
+const nodeRequire = createRequire(import.meta.url);
+const childProcess = nodeRequire("node:child_process") as typeof import("node:child_process");
 
 function identity(overrides: Partial<FileIdentity> = {}): FileIdentity {
   return {
@@ -162,6 +165,35 @@ test("hydrates through a canonical nondefault Windows system root", async () => 
       options: { shell: false, windowsHide: true, timeout: 2000, maxBuffer: 8192 },
     },
   ]);
+});
+
+test("does not permit a production SystemRoot override to launch the default command", async () => {
+  let calls = 0;
+  const originalExecFile = childProcess.execFile;
+  childProcess.execFile = ((...args: unknown[]) => {
+    calls += 1;
+    const callback = args.at(-1);
+    if (typeof callback === "function") {
+      callback(new Error("controlled default command runner"), "");
+    }
+    return undefined;
+  }) as typeof childProcess.execFile;
+  syncBuiltinESMExports();
+
+  try {
+    await assertRedactedFileIdentityFailure(
+      () => hydrateWindowsFileIdentity(
+        "C:\\work\\active.toml",
+        identity({ ino: 0n }),
+        { platform: "win32", systemRoot: "C:\\attacker" },
+      ),
+    );
+  } finally {
+    childProcess.execFile = originalExecFile;
+    syncBuiltinESMExports();
+  }
+
+  assert.equal(calls, 0);
 });
 
 test("rejects noncanonical Windows system roots before the File ID runner", async () => {

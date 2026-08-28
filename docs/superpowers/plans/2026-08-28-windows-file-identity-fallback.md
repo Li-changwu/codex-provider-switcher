@@ -4,7 +4,7 @@
 
 **Goal:** Make native Windows storage operations work on volumes with zero inode values without weakening Linux identity checks or link defenses.
 
-**Architecture:** A shared identity-policy module owns the exact inode rule and a narrowly scoped Windows zero-inode File ID path. It queries `SystemRoot\\System32\\fsutil.exe` through an injectable `execFile` boundary, then the four storage layers delegate their repeated local helpers to this module. The activation fixture constructs an OS-consistent layout.
+**Architecture:** Task 1 adds a shared identity-policy module that owns the exact inode rule and a narrowly scoped Windows zero-inode File ID path. Production queries the Extension Host process's `SystemRoot\\System32\\fsutil.exe`; a `systemRoot` override is valid only with an injected test runner. Task 2 will delegate the four storage layers' repeated local helpers to this module, and Task 3 will make the activation fixture OS-consistent.
 
 **Tech Stack:** TypeScript, Node `BigIntStats` and `child_process.execFile`, `node:test`, GitHub Actions Windows and Ubuntu runners.
 

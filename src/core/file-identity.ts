@@ -108,7 +108,14 @@ export async function hydrateWindowsFileIdentity(
     throw new FileIdentityError();
   }
 
-  const systemRoot = options.systemRoot ?? process.env.SystemRoot;
+  const runner = options.runner;
+  if (runner === undefined && options.systemRoot !== undefined) {
+    throw new FileIdentityError();
+  }
+
+  const systemRoot = runner === undefined
+    ? process.env.SystemRoot
+    : options.systemRoot ?? process.env.SystemRoot;
   if (!isValidWindowsSystemRoot(systemRoot)) {
     throw new FileIdentityError();
   }
@@ -119,7 +126,7 @@ export async function hydrateWindowsFileIdentity(
 
   try {
     const targetPath = win32.normalize(path);
-    const result = await (options.runner ?? runWindowsFileIdCommand)(
+    const result = await (runner ?? runWindowsFileIdCommand)(
       fsutilPath,
       ["file", "queryFileID", targetPath],
       {
