@@ -56,6 +56,16 @@ test("accepts zero-inode Windows active Profile storage with canonical file iden
         profileId: "research-proxy",
         updatedAt: "2026-08-25T00:00:00.000Z",
       });
+      assert.deepEqual(await store.clear(), {
+        state: "present",
+        record: {
+          version: 1,
+          profileId: "research-proxy",
+          updatedAt: "2026-08-25T00:00:00.000Z",
+        },
+      });
+      assert.equal(await store.get(), undefined);
+      await assert.rejects(() => readFile(store.path, "utf8"), { code: "ENOENT" });
     });
   });
 });
