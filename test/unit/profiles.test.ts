@@ -306,6 +306,41 @@ test("releases an ordinary zero-inode Windows Profile lock through native delete
   });
 });
 
+test("preserves a replacement zero-inode Windows Profile lock when close-failure cleanup deletes", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  await withZeroInodeProfileStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const lockPath = join(layout.switcherDir, "profiles", ".create.lock");
+      const replacementContents = "replacement lock";
+      const lockFileSystem = new CloseFailureProfileLockFileSystem(lockPath);
+      const windowsFileOperations = new RecordingWindowsFileOperations(
+        [{ matches: (path) => path === lockPath, replacementContents }],
+      );
+      const store = new ProfileStore(layout, {
+        fileIdentityOptions: zeroInodeProfileIdentityOptions(windowsFileOperations),
+        lockOptions: { fileSystem: lockFileSystem },
+      });
+
+      await assert.rejects(
+        () => store.create({
+          name: "Close Failure Lock",
+          kind: "official",
+          configText: 'model_provider = "openai"\n',
+        }),
+        (error: unknown) => error instanceof ProfileStoreError && error.code === "rollback-failed",
+      );
+
+      assert.equal(await readFile(lockPath, "utf8"), replacementContents);
+      assert.deepEqual(lockFileSystem.unlinked, []);
+      assert.equal(windowsFileOperations.deleteRequests.length, 1);
+      assert.equal(windowsFileOperations.deleteRequests[0]?.path, lockPath);
+    });
+  });
+});
+
 test("does not reclaim a zero-inode stale Profile lock replaced during native delete", async (t) => {
   if (process.platform !== "win32") {
     t.skip("Windows File IDs are not available on this platform.");
@@ -2534,6 +2569,27 @@ class NoPostCreationLockReadFileSystem extends RecordingProfileLockFileSystem {
       throw new Error("lock was read after creation");
     }
     return super.readFile(path);
+  }
+}
+
+class CloseFailureProfileLockFileSystem extends RecordingProfileLockFileSystem {
+  constructor(private readonly lockPath: string) {
+    super();
+  }
+
+  override async open(path: string, flags: "wx", mode: number) {
+    const handle = await super.open(path, flags, mode);
+    if (path !== this.lockPath) {
+      return handle;
+    }
+    return {
+      writeFile: (contents: string, encoding: BufferEncoding) =>
+        handle.writeFile(contents, encoding),
+      async close(): Promise<void> {
+        await handle.close();
+        throw new Error("controlled profile lock close failure");
+      },
+    };
   }
 }
 
