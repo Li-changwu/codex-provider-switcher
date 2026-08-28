@@ -1,6 +1,6 @@
 import {
   chmod,
-  lstat,
+  lstat as nativeLstat,
   mkdir,
   open,
   realpath,
@@ -10,6 +10,13 @@ import {
 import type { BigIntStats } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import {
+  hasComparableFileIdentity,
+  hydrateWindowsFileIdentity,
+  sameStableFileIdentity,
+  type FileIdentity,
+  type HydrateWindowsFileIdentityOptions,
+} from "./file-identity";
 import type { CodexLayout } from "./types";
 
 const activeProfileFileName = "active-profile.json";
@@ -46,12 +53,15 @@ export class ActiveProfileStoreError extends Error {
 
 export interface ActiveProfileStoreOptions {
   now?: () => string;
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions;
 }
+
+type FileIdentityStats = BigIntStats & FileIdentity;
 
 interface TrustedDirectory {
   logicalPath: string;
   realPath: string;
-  stats: BigIntStats;
+  stats: FileIdentityStats;
 }
 
 interface TrustedSwitcherDirectory {
@@ -62,7 +72,7 @@ interface TrustedSwitcherDirectory {
 interface InspectedActiveProfileSnapshot {
   snapshot: ActiveProfileSnapshot;
   directory?: TrustedSwitcherDirectory;
-  fileStats?: BigIntStats;
+  fileStats?: FileIdentityStats;
 }
 
 export class ActiveProfileStore {
@@ -70,6 +80,7 @@ export class ActiveProfileStore {
   private readonly codexHome: string;
   private readonly switcherDir: string;
   private readonly now: () => string;
+  private readonly fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined;
 
   constructor(
     layout: CodexLayout,
@@ -80,6 +91,7 @@ export class ActiveProfileStore {
     this.switcherDir = resolve(layout.switcherDir);
     this.path = join(this.switcherDir, activeProfileFileName);
     this.now = options.now ?? (() => new Date().toISOString());
+    this.fileIdentityOptions = options.fileIdentityOptions;
   }
 
   async get(): Promise<ActiveProfileRecord | undefined> {
@@ -109,7 +121,7 @@ export class ActiveProfileStore {
     }
     try {
       await this.verifyTrustedSwitcherDirectory(previous.directory!);
-      const current = await lstat(this.path, { bigint: true });
+      const current = await this.lstat(this.path);
       if (
         !isSafeActiveProfileFile(current) ||
         !sameFileIdentity(current, previous.fileStats!)
@@ -118,7 +130,7 @@ export class ActiveProfileStore {
       }
       await unlink(this.path);
       await this.verifyTrustedSwitcherDirectory(previous.directory!);
-      await syncTrustedParentDirectory(previous.directory!);
+      await syncTrustedParentDirectory(previous.directory!, this.fileIdentityOptions);
       await this.verifyTrustedSwitcherDirectory(previous.directory!);
     } catch (error: unknown) {
       if (error instanceof ActiveProfileStoreError) {
@@ -146,7 +158,7 @@ export class ActiveProfileStore {
     assertActiveProfileRecord(record);
     let directory: TrustedSwitcherDirectory | undefined;
     let temporaryPath: string | undefined;
-    let temporaryStats: BigIntStats | undefined;
+    let temporaryStats: FileIdentityStats | undefined;
     let temporaryHandle: Awaited<ReturnType<typeof open>> | undefined;
     let renamed = false;
     let primaryError: unknown;
@@ -158,7 +170,7 @@ export class ActiveProfileStore {
         `.${basename(this.path)}.tmp-${randomUUID()}`,
       );
       temporaryHandle = await open(temporaryPath, "wx", privateFileMode);
-      temporaryStats = await temporaryHandle.stat({ bigint: true });
+      temporaryStats = await this.stat(temporaryHandle, temporaryPath);
       if (!isSafeActiveProfileFile(temporaryStats)) {
         throw unsafeStateError();
       }
@@ -169,7 +181,7 @@ export class ActiveProfileStore {
       await temporaryHandle.sync();
       await temporaryHandle.close();
       temporaryHandle = undefined;
-      temporaryStats = await lstat(temporaryPath, { bigint: true });
+      temporaryStats = await this.lstat(temporaryPath);
       if (!isSafeActiveProfileFile(temporaryStats)) {
         throw unsafeStateError();
       }
@@ -178,11 +190,11 @@ export class ActiveProfileStore {
       await rename(temporaryPath, this.path);
       renamed = true;
       await this.verifyTrustedSwitcherDirectory(directory);
-      const written = await lstat(this.path, { bigint: true });
+      const written = await this.lstat(this.path);
       if (!isSafeActiveProfileFile(written) || !sameFileIdentity(written, temporaryStats)) {
         throw unsafeStateError();
       }
-      await syncTrustedParentDirectory(directory);
+      await syncTrustedParentDirectory(directory, this.fileIdentityOptions);
       await this.verifyTrustedSwitcherDirectory(directory);
     } catch (error: unknown) {
       primaryError = error;
@@ -225,9 +237,9 @@ export class ActiveProfileStore {
     if (!directory) {
       return { snapshot: { state: "missing" } };
     }
-    let pathStats: BigIntStats;
+    let pathStats: FileIdentityStats;
     try {
-      pathStats = await lstat(this.path, { bigint: true });
+      pathStats = await this.lstat(this.path);
     } catch (error: unknown) {
       if (isMissingFileError(error)) {
         return { snapshot: { state: "missing" } };
@@ -247,13 +259,13 @@ export class ActiveProfileStore {
     let primaryError: unknown;
     try {
       handle = await open(this.path, "r");
-      const opened = await handle.stat({ bigint: true });
+      const opened = await this.stat(handle, this.path);
       if (!isSafeActiveProfileFile(opened) || !sameFileIdentity(pathStats, opened)) {
         throw unsafeStateError();
       }
       contents = await handle.readFile({ encoding: "utf8" });
-      const afterRead = await handle.stat({ bigint: true });
-      const pathAfterRead = await lstat(this.path, { bigint: true });
+      const afterRead = await this.stat(handle, this.path);
+      const pathAfterRead = await this.lstat(this.path);
       if (
         !isSafeActiveProfileFile(afterRead) ||
         !isSafeActiveProfileFile(pathAfterRead) ||
@@ -296,10 +308,10 @@ export class ActiveProfileStore {
     createIfMissing: boolean,
   ): Promise<TrustedSwitcherDirectory | undefined> {
     try {
-      const home = await inspectTrustedDirectory(this.codexHome);
+      const home = await inspectTrustedDirectory(this.codexHome, this.fileIdentityOptions);
       let switcherExists = true;
       try {
-        await lstat(this.switcherDir, { bigint: true });
+        await this.lstat(this.switcherDir);
       } catch (error: unknown) {
         if (!isMissingFileError(error)) {
           throw error;
@@ -312,7 +324,7 @@ export class ActiveProfileStore {
         }
         await mkdir(this.switcherDir);
       }
-      const switcher = await inspectTrustedDirectory(this.switcherDir);
+      const switcher = await inspectTrustedDirectory(this.switcherDir, this.fileIdentityOptions);
       if (!isDirectChild(home.realPath, switcher.realPath)) {
         throw unsafeStateError();
       }
@@ -332,8 +344,8 @@ export class ActiveProfileStore {
   }
 
   private async verifyTrustedSwitcherDirectory(expected: TrustedSwitcherDirectory): Promise<void> {
-    const home = await inspectTrustedDirectory(this.codexHome);
-    const switcher = await inspectTrustedDirectory(this.switcherDir);
+    const home = await inspectTrustedDirectory(this.codexHome, this.fileIdentityOptions);
+    const switcher = await inspectTrustedDirectory(this.switcherDir, this.fileIdentityOptions);
     if (
       !sameFileIdentity(home.stats, expected.home.stats) ||
       !sameFileIdentity(switcher.stats, expected.switcher.stats) ||
@@ -345,9 +357,9 @@ export class ActiveProfileStore {
     }
   }
 
-  private async assertSafeExistingStateFile(): Promise<BigIntStats | undefined> {
+  private async assertSafeExistingStateFile(): Promise<FileIdentityStats | undefined> {
     try {
-      const stats = await lstat(this.path, { bigint: true });
+      const stats = await this.lstat(this.path);
       if (!isSafeActiveProfileFile(stats)) {
         throw unsafeStateError();
       }
@@ -369,15 +381,26 @@ export class ActiveProfileStore {
 
   private async removeTemporaryFile(
     path: string,
-    expectedStats: BigIntStats,
+    expectedStats: FileIdentityStats,
     directory: TrustedSwitcherDirectory,
   ): Promise<void> {
     await this.verifyTrustedSwitcherDirectory(directory);
-    const stats = await lstat(path, { bigint: true });
+    const stats = await this.lstat(path);
     if (!isSafeActiveProfileFile(stats) || !sameFileIdentity(stats, expectedStats)) {
       throw unsafeStateError();
     }
     await unlink(path);
+  }
+
+  private async lstat(path: string): Promise<FileIdentityStats> {
+    return lstatWithFileIdentity(path, this.fileIdentityOptions);
+  }
+
+  private async stat(
+    handle: Awaited<ReturnType<typeof open>>,
+    logicalPath: string,
+  ): Promise<FileIdentityStats> {
+    return statWithFileIdentity(handle, logicalPath, this.fileIdentityOptions);
   }
 }
 
@@ -396,14 +419,53 @@ function assertActiveProfileLocation(layout: CodexLayout): void {
   }
 }
 
-async function inspectTrustedDirectory(path: string): Promise<TrustedDirectory> {
+async function lstatWithFileIdentity(
+  path: string,
+  options: HydrateWindowsFileIdentityOptions | undefined,
+): Promise<FileIdentityStats> {
+  const stats = await nativeLstat(path, { bigint: true });
+  return hydrateFileIdentity(path, stats, options);
+}
+
+async function statWithFileIdentity(
+  handle: Awaited<ReturnType<typeof open>>,
+  logicalPath: string,
+  options: HydrateWindowsFileIdentityOptions | undefined,
+): Promise<FileIdentityStats> {
+  const stats = await handle.stat({ bigint: true });
+  return hydrateFileIdentity(logicalPath, stats, options);
+}
+
+async function hydrateFileIdentity(
+  logicalPath: string,
+  stats: BigIntStats,
+  options: HydrateWindowsFileIdentityOptions | undefined,
+): Promise<FileIdentityStats> {
+  const identity = await hydrateWindowsFileIdentity(logicalPath, stats, options);
+  if (identity.windowsFileId === undefined) {
+    return stats as FileIdentityStats;
+  }
+
+  Object.defineProperty(stats, "windowsFileId", {
+    configurable: false,
+    enumerable: true,
+    value: identity.windowsFileId,
+    writable: false,
+  });
+  return stats as FileIdentityStats;
+}
+
+async function inspectTrustedDirectory(
+  path: string,
+  fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
+): Promise<TrustedDirectory> {
   try {
-    const before = await lstat(path, { bigint: true });
+    const before = await lstatWithFileIdentity(path, fileIdentityOptions);
     if (!isSafeDirectory(before)) {
       throw unsafeStateError();
     }
     const realPath = await realpath(path);
-    const after = await lstat(path, { bigint: true });
+    const after = await lstatWithFileIdentity(path, fileIdentityOptions);
     if (
       !isSafeDirectory(after) ||
       !sameFileIdentity(before, after) ||
@@ -420,16 +482,19 @@ async function inspectTrustedDirectory(path: string): Promise<TrustedDirectory> 
   }
 }
 
-function isSafeDirectory(stats: BigIntStats): boolean {
-  return stats.isDirectory() && !stats.isSymbolicLink() && stats.ino !== 0n;
+function isSafeDirectory(stats: FileIdentityStats): boolean {
+  return stats.isDirectory() && !stats.isSymbolicLink() && hasComparableFileIdentity(stats);
 }
 
-function isSafeActiveProfileFile(stats: BigIntStats): boolean {
-  return stats.isFile() && !stats.isSymbolicLink() && stats.nlink === 1n && stats.ino !== 0n;
+function isSafeActiveProfileFile(stats: FileIdentityStats): boolean {
+  return stats.isFile() &&
+    !stats.isSymbolicLink() &&
+    stats.nlink === 1n &&
+    hasComparableFileIdentity(stats);
 }
 
-function sameFileIdentity(left: BigIntStats, right: BigIntStats): boolean {
-  return left.dev === right.dev && left.ino !== 0n && left.ino === right.ino;
+function sameFileIdentity(left: FileIdentityStats, right: FileIdentityStats): boolean {
+  return sameStableFileIdentity(left, right);
 }
 
 function sameResolvedPath(left: string, right: string): boolean {
@@ -523,7 +588,10 @@ function isCanonicalIsoTimestamp(value: string): boolean {
   return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value;
 }
 
-async function syncTrustedParentDirectory(directory: TrustedSwitcherDirectory): Promise<void> {
+async function syncTrustedParentDirectory(
+  directory: TrustedSwitcherDirectory,
+  fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
+): Promise<void> {
   if (process.platform === "win32") {
     return;
   }
@@ -531,12 +599,20 @@ async function syncTrustedParentDirectory(directory: TrustedSwitcherDirectory): 
   let primaryError: unknown;
   try {
     handle = await open(directory.switcher.logicalPath, "r");
-    const before = await handle.stat({ bigint: true });
+    const before = await statWithFileIdentity(
+      handle,
+      directory.switcher.logicalPath,
+      fileIdentityOptions,
+    );
     if (!isSafeDirectory(before) || !sameFileIdentity(before, directory.switcher.stats)) {
       throw unsafeStateError();
     }
     await handle.sync();
-    const after = await handle.stat({ bigint: true });
+    const after = await statWithFileIdentity(
+      handle,
+      directory.switcher.logicalPath,
+      fileIdentityOptions,
+    );
     if (!isSafeDirectory(after) || !sameFileIdentity(after, directory.switcher.stats)) {
       throw unsafeStateError();
     }

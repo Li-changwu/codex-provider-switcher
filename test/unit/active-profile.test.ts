@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { link, lstat, mkdir, mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, mkdtemp, open, readFile, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,6 +9,8 @@ import {
   ActiveProfileStore,
   ActiveProfileStoreError,
 } from "../../src/core/active-profile";
+
+const nodeRequire = createRequire(import.meta.url);
 
 test("persists a strict non-secret active Profile record inside Codex Home", async () => {
   await withTemporaryLayout(async (layout) => {
@@ -27,6 +30,138 @@ test("persists a strict non-secret active Profile record inside Codex Home", asy
     assert.match(contents, /research-proxy/);
     assert.doesNotMatch(contents, /OPENAI_API_KEY|api.?key/i);
     assert.ok(store.path.startsWith(layout.codexHome));
+  });
+});
+
+test("accepts zero-inode Windows active Profile storage with canonical file identities", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  await withZeroInodeStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const store = new ActiveProfileStore(layout, {
+        now: () => "2026-08-25T00:00:00.000Z",
+        fileIdentityOptions: {
+          platform: "win32",
+          systemRoot: "C:\\Windows",
+          runner: nativeIdentityRunner,
+        },
+      });
+
+      await store.set("research-proxy");
+
+      assert.deepEqual(await store.get(), {
+        version: 1,
+        profileId: "research-proxy",
+        updatedAt: "2026-08-25T00:00:00.000Z",
+      });
+    });
+  });
+});
+
+test("rejects zero-inode active Profile storage without a canonical file identity", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  await withZeroInodeStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const store = new ActiveProfileStore(layout, {
+        fileIdentityOptions: {
+          platform: "win32",
+          systemRoot: "C:\\Windows",
+          runner: async () => ({ stdout: "File ID unavailable" }),
+        },
+      });
+
+      await assert.rejects(
+        () => store.set("research-proxy"),
+        (error: unknown) => error instanceof ActiveProfileStoreError && error.code === "unsafe-state",
+      );
+    });
+  });
+});
+
+test("rejects a replaced zero-inode active Profile file after its path is checked", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  let replaceOnRead = false;
+  let activeProfilePath: string | undefined;
+  await withZeroInodeStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const store = new ActiveProfileStore(layout, {
+        now: () => "2026-08-25T00:00:00.000Z",
+        fileIdentityOptions: {
+          platform: "win32",
+          systemRoot: "C:\\Windows",
+          runner: nativeIdentityRunner,
+        },
+      });
+      activeProfilePath = store.path;
+      await store.set("official");
+      replaceOnRead = true;
+
+      await assert.rejects(
+        () => store.get(),
+        (error: unknown) => error instanceof ActiveProfileStoreError && error.code === "unsafe-state",
+      );
+    });
+  }, {
+    beforeOpen: async (path, flags) => {
+      if (!replaceOnRead || path !== activeProfilePath || flags !== "r") {
+        return;
+      }
+      replaceOnRead = false;
+      const replacementPath = `${path}.replacement`;
+      await writeFile(
+        replacementPath,
+        '{\n  "version": 1,\n  "profileId": "replacement",\n  "updatedAt": "2026-08-25T00:00:00.000Z"\n}\n',
+        "utf8",
+      );
+      await rename(replacementPath, path);
+    },
+  });
+});
+
+test("rejects a zero-inode active Profile file whose link count changes before open", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  let linkOnRead = false;
+  let activeProfilePath: string | undefined;
+  let linkPath: string | undefined;
+  await withZeroInodeStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const store = new ActiveProfileStore(layout, {
+        now: () => "2026-08-25T00:00:00.000Z",
+        fileIdentityOptions: {
+          platform: "win32",
+          systemRoot: "C:\\Windows",
+          runner: nativeIdentityRunner,
+        },
+      });
+      activeProfilePath = store.path;
+      linkPath = join(layout.codexHome, "active-profile-link.json");
+      await store.set("official");
+      linkOnRead = true;
+
+      await assert.rejects(
+        () => store.get(),
+        (error: unknown) => error instanceof ActiveProfileStoreError && error.code === "unsafe-state",
+      );
+    });
+  }, {
+    beforeOpen: async (path, flags) => {
+      if (!linkOnRead || path !== activeProfilePath || flags !== "r") {
+        return;
+      }
+      linkOnRead = false;
+      await link(path, linkPath!);
+    },
   });
 });
 
@@ -191,4 +326,77 @@ async function withTemporaryLayout(
 function isWindowsSymlinkPrivilegeError(error: unknown): boolean {
   return process.platform === "win32" &&
     (error as NodeJS.ErrnoException | undefined)?.code === "EPERM";
+}
+
+interface ZeroInodeStatsHooks {
+  beforeOpen?: (path: string, flags: string | number | undefined) => Promise<void>;
+}
+
+async function withZeroInodeStats(
+  callback: () => Promise<void>,
+  hooks: ZeroInodeStatsHooks = {},
+): Promise<void> {
+  const mutableFs = nodeRequire("node:fs/promises") as {
+    lstat: typeof lstat;
+    open: typeof open;
+  };
+  const originalLstat = mutableFs.lstat;
+  const originalOpen = mutableFs.open;
+  nativeLstatForIdentity = originalLstat;
+  mutableFs.lstat = (async (...args: Parameters<typeof lstat>) => {
+    return withZeroInode(await originalLstat(...args));
+  }) as typeof lstat;
+  mutableFs.open = (async (...args: Parameters<typeof open>) => {
+    const path = args[0];
+    if (typeof path === "string") {
+      await hooks.beforeOpen?.(path, args[1]);
+    }
+    const handle = await originalOpen(...args);
+    return new Proxy(handle, {
+      get(target, property) {
+        if (property === "stat") {
+          return async (...statArgs: Parameters<typeof target.stat>) => {
+            return withZeroInode(await target.stat(...statArgs));
+          };
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  }) as typeof open;
+  syncBuiltinESMExports();
+  try {
+    await callback();
+  } finally {
+    mutableFs.lstat = originalLstat;
+    mutableFs.open = originalOpen;
+    nativeLstatForIdentity = undefined;
+    syncBuiltinESMExports();
+  }
+}
+
+function withZeroInode<T extends Awaited<ReturnType<typeof lstat>>>(stats: T): T {
+  const copy = Object.create(
+    Object.getPrototypeOf(stats),
+    Object.getOwnPropertyDescriptors(stats),
+  ) as T;
+  Object.defineProperty(copy, "ino", {
+    configurable: true,
+    enumerable: true,
+    value: 0n,
+    writable: false,
+  });
+  return copy;
+}
+
+let nativeLstatForIdentity: typeof lstat | undefined;
+
+async function nativeIdentityRunner(
+  _file: string,
+  args: readonly string[],
+): Promise<{ stdout: string }> {
+  const logicalPath = args[2];
+  assert.equal(typeof logicalPath, "string");
+  const stats = await nativeLstatForIdentity!(logicalPath, { bigint: true });
+  return { stdout: `0x${stats.ino.toString(16).padStart(16, "0")}` };
 }
