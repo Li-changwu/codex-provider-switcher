@@ -283,7 +283,7 @@ export async function packageExtension({
       "--out",
       artifacts.temporary,
     ]);
-    await verifyVsix(artifacts.temporary);
+    await verifyVsix(artifacts.temporary, { target });
     await fsOps.rename(artifacts.temporary, artifacts.final);
     return artifacts.final;
   } catch (operationError) {

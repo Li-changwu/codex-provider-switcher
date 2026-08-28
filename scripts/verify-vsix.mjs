@@ -12,6 +12,6 @@ const vsixName =
   process.argv[2] ?? `${packageJson.name}-${packageJson.version}@${target}.vsix`;
 const vsixPath = resolve(projectRoot, vsixName);
 
-const entries = await verifyVsix(vsixPath);
+const entries = await verifyVsix(vsixPath, { target });
 console.log(`Verified ${vsixPath}`);
 console.log(`Verified ${entries.size} VSIX entries, native SQLite, and no source maps`);

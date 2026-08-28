@@ -269,9 +269,9 @@ bool GetExpectedIdentity(
   return true;
 }
 
-std::string FormatVolumeSerial(ULONG serial) {
+std::string FormatVolumeSerial(uint64_t serial) {
   std::string result(16, '0');
-  uint64_t value = static_cast<uint64_t>(serial);
+  uint64_t value = serial;
   for (size_t index = result.size(); index > 0; --index) {
     result[index - 1] = kLowerHex[value & 0x0fU];
     value >>= 4U;

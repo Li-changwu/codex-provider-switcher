@@ -27,7 +27,7 @@ type PackageExtension = (input: {
     args: string[],
     options?: { cwd?: string; env?: NodeJS.ProcessEnv },
   ) => Promise<void>;
-  verifyVsix: (path: string) => Promise<unknown>;
+  verifyVsix: (path: string, options?: { target?: string }) => Promise<unknown>;
   runProductionAudit?: RunProductionAudit;
   prepareLinuxPrebuild?: (input: {
     projectRoot: string;
@@ -557,6 +557,35 @@ test("publishes only the verified target artifact after cleaning stale outputs",
   for (const stalePath of [paths.legacy, paths.final, paths.temporary, paths.vsce]) {
     assert.ok(fileSystem.removed.includes(stalePath));
   }
+});
+
+test("verifies a package with its target-specific payload rules", async () => {
+  assert.equal(typeof packageExtension, "function");
+  const projectRoot = resolve("package-target-specific-verification");
+  const paths = artifactPaths(projectRoot, "win32-x64");
+  const fileSystem = fakeFileSystem([]);
+  let verificationTarget: string | undefined;
+
+  await packageExtension!({
+    projectRoot,
+    manifest: { name: "codex-provider-switcher", version: "0.1.0" },
+    target: "win32-x64",
+    npmCliPath: "npm-cli.js",
+    vsceCliPath: "vsce.js",
+    run: async (_command, args) => {
+      const outputIndex = args.indexOf("--out");
+      if (outputIndex >= 0) {
+        fileSystem.files.add(args[outputIndex + 1]);
+      }
+    },
+    verifyVsix: async (_path, options) => {
+      verificationTarget = options?.target;
+    },
+    fsOps: fileSystem,
+  });
+
+  assert.equal(verificationTarget, "win32-x64");
+  assert.deepEqual(fileSystem.files, new Set([paths.final]));
 });
 
 test("removes temporary and target artifacts when verification fails", async () => {

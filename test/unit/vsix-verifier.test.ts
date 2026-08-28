@@ -9,6 +9,12 @@ import yazl from "yazl";
 import * as vsixVerifier from "../../scripts/vsix-verifier.mjs";
 
 const { verifyVsix } = vsixVerifier;
+const createArchiveRules = vsixVerifier.createArchiveRules as
+  | ((expectedNativeBindingEntry: string, target: string) => unknown)
+  | undefined;
+const validateArchiveEntries = vsixVerifier.validateArchiveEntries as
+  | ((entries: Iterable<string>, archiveRules: unknown) => void)
+  | undefined;
 const extractVsix = vsixVerifier.extractVsix as
   | ((
       vsixPath: string,
@@ -252,6 +258,48 @@ test("rejects unexpected extension files before platform-dependent extraction", 
   await assert.rejects(
     verifyVsix(vsixPath),
     /VSIX contains unexpected archive entry: extension\/unapproved\.js/,
+  );
+});
+
+test("allows the Windows file-operations addon only in a win32-x64 VSIX", () => {
+  assert.equal(typeof createArchiveRules, "function");
+  assert.equal(typeof validateArchiveEntries, "function");
+
+  const addonEntry = "extension/native/windows-file-ops/windows_file_ops.node";
+  const expectedNativeBindingEntry =
+    "extension/node_modules/sqlite3/bindings/current/binding.node";
+  const entries = [...Object.keys(baseEntries()), addonEntry];
+
+  assert.doesNotThrow(() =>
+    validateArchiveEntries!(
+      entries,
+      createArchiveRules!(expectedNativeBindingEntry, "win32-x64"),
+    ),
+  );
+  assert.throws(
+    () =>
+      validateArchiveEntries!(
+        entries,
+        createArchiveRules!(expectedNativeBindingEntry, "linux-x64"),
+      ),
+    new RegExp(`VSIX contains unexpected archive entry: ${escapeRegex(addonEntry)}`),
+  );
+});
+
+test("requires the staged addon in a win32-x64 VSIX", async (context) => {
+  const directory = await mkdtemp(join(tmpdir(), "codex-provider-switcher-vsix-"));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  const vsixPath = join(directory, "missing-windows-addon.vsix");
+
+  await writeVsix(vsixPath, baseEntries());
+
+  await assert.rejects(
+    verifyVsix(vsixPath, {
+      target: "win32-x64",
+      expectedNativeBindingEntry:
+        "extension/node_modules/sqlite3/bindings/current/binding.node",
+    }),
+    /VSIX is missing required entry: extension\/native\/windows-file-ops\/windows_file_ops\.node/,
   );
 });
 

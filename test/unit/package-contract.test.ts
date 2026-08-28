@@ -13,6 +13,10 @@ const vscodeIgnorePath = resolve(
   dirname(fileURLToPath(import.meta.url)),
   "../../.vscodeignore",
 );
+const windowsFileOperationsSourcePath = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  "../../native/windows-file-ops/src/windows_file_ops.cc",
+);
 
 test("packages verified platform-specific native dependencies", async () => {
   const manifest = JSON.parse(await readFile(packagePath, "utf8")) as {
@@ -111,6 +115,19 @@ test("pins the Windows file-operations build and exposes only its staged addon",
   assert.deepEqual(nativeAllowlistEntries, [
     "!native/windows-file-ops/windows_file_ops.node",
   ]);
+});
+
+test("formats the complete 64-bit Windows volume serial in native file identities", async () => {
+  // Real test volumes may have a zero high half, so this source contract prevents
+  // a future narrowing conversion from silently discarding it.
+  const source = await readFile(windowsFileOperationsSourcePath, "utf8");
+
+  assert.match(source, /std::string FormatVolumeSerial\(uint64_t serial\)/);
+  assert.doesNotMatch(source, /std::string FormatVolumeSerial\(ULONG serial\)/);
+  assert.match(
+    source,
+    /identity->volume_serial = FormatVolumeSerial\(file_id\.VolumeSerialNumber\);/,
+  );
 });
 
 test("refuses unsupported Windows-addon hosts before filesystem mutation", async () => {

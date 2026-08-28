@@ -39,7 +39,7 @@ const requiredTomlRuntimeEntries = [
   "extension/node_modules/@iarna/toml/lib/create-time.js",
   "extension/node_modules/@iarna/toml/lib/format-num.js",
 ];
-const requiredVsixEntries = [
+const baseRequiredVsixEntries = [
   "[Content_Types].xml",
   "extension.vsixmanifest",
   "extension/.gitignore",
@@ -47,6 +47,8 @@ const requiredVsixEntries = [
   "extension/package.json",
   "extension/dist/extension.js",
 ];
+const windowsFileOperationsAddonEntry =
+  "extension/native/windows-file-ops/windows_file_ops.node";
 const installerDependencies = ["node-gyp", "prebuild-install", "tar"];
 const typeScriptDeclarationExtensions = [".d.ts", ".d.mts", ".d.cts"];
 const sourceOrArchiveExtensions = [
@@ -73,15 +75,16 @@ const sourceOrArchiveExtensions = [
 export async function verifyVsix(vsixPath, options = {}) {
   const fsOps = { mkdtemp, rm, ...options.fsOps };
   const limits = resolveLimits(options.limits);
+  const requiredEntries = requiredVsixEntriesForTarget(options.target);
   const expectedNativeBindingEntry = await resolveExpectedNativeBindingEntry(
     options.expectedNativeBindingEntry,
   );
-  const archiveRules = createArchiveRules(expectedNativeBindingEntry);
+  const archiveRules = createArchiveRules(expectedNativeBindingEntry, options.target);
   const listedEntries = await listZipEntries(vsixPath, limits);
   validateArchiveEntries(listedEntries, archiveRules);
   const entries = new Set(listedEntries);
 
-  for (const entry of requiredVsixEntries) {
+  for (const entry of requiredEntries) {
     if (!entries.has(entry)) {
       throw new Error(`VSIX is missing required entry: ${entry}`);
     }
@@ -148,9 +151,9 @@ async function resolveExpectedNativeBindingEntry(configuredEntry) {
   )}`;
 }
 
-function createArchiveRules(expectedNativeBindingEntry) {
+export function createArchiveRules(expectedNativeBindingEntry, target) {
   const allowedEntries = [
-    ...requiredVsixEntries,
+    ...requiredVsixEntriesForTarget(target),
     ...requiredSqliteRuntimeEntries,
     ...requiredTomlRuntimeEntries,
     expectedNativeBindingEntry,
@@ -173,7 +176,7 @@ function createArchiveRules(expectedNativeBindingEntry) {
   return { entriesByCanonicalPath, directoriesByCanonicalPath };
 }
 
-function validateArchiveEntries(entries, archiveRules) {
+export function validateArchiveEntries(entries, archiveRules) {
   const sourceMaps = [...entries].filter((entry) =>
     canonicalArchiveEntryPath(entry).endsWith(".map"),
   );
@@ -198,6 +201,12 @@ function validateArchiveEntries(entries, archiveRules) {
     }
     validateArchiveEntry(entry, archiveRules);
   }
+}
+
+function requiredVsixEntriesForTarget(target) {
+  return target === "win32-x64"
+    ? [...baseRequiredVsixEntries, windowsFileOperationsAddonEntry]
+    : baseRequiredVsixEntries;
 }
 
 function validateArchiveEntry(entry, archiveRules) {
