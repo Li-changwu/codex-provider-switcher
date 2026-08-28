@@ -141,6 +141,29 @@ test("hydrates zero-inode Windows identities through the constrained File ID com
   assert.equal(sameStableFileIdentity(original, hydrated, "win32"), false);
 });
 
+test("hydrates through a canonical nondefault Windows system root", async () => {
+  const calls: Array<{ file: string; args: readonly string[]; options: object }> = [];
+  const runner: WindowsFileIdCommandRunner = async (file, args, options) => {
+    calls.push({ file, args, options });
+    return { stdout: FILE_ID };
+  };
+
+  const hydrated = await hydrateWindowsFileIdentity(
+    "C:\\work\\active.toml",
+    identity({ ino: 0n }),
+    { platform: "win32", systemRoot: "C:\\WINNT", runner },
+  );
+
+  assert.equal(hydrated.windowsFileId, FILE_ID);
+  assert.deepEqual(calls, [
+    {
+      file: "C:\\WINNT\\System32\\fsutil.exe",
+      args: ["file", "queryFileID", "C:\\work\\active.toml"],
+      options: { shell: false, windowsHide: true, timeout: 2000, maxBuffer: 8192 },
+    },
+  ]);
+});
+
 test("rejects noncanonical Windows system roots before the File ID runner", async () => {
   let calls = 0;
   const runner: WindowsFileIdCommandRunner = async () => {
@@ -154,7 +177,10 @@ test("rejects noncanonical Windows system roots before the File ID runner", asyn
     "C:\\Windows\\System32\\..\\attacker",
     "C:/Windows",
     "C:\\Windows\\",
-    "C:\\attacker",
+    "C:\\attacker\\",
+    "C:\\",
+    "C:Windows",
+    "Windows",
     "\\\\server\\share\\Windows",
   ]) {
     const result = await hydrateWindowsFileIdentity(

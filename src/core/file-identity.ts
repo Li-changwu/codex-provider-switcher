@@ -173,8 +173,7 @@ function isValidWindowsSystemRoot(value: string | undefined): value is string {
   const segments = normalized.slice(parsed.root.length).split("\\");
   return normalized === value &&
     /^[A-Za-z]:\\$/.test(parsed.root) &&
-    segments.length === 1 &&
-    segments[0].toLowerCase() === "windows";
+    segments.every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
 }
 
 function getWindowsFsutilPath(systemRoot: string): string | undefined {
