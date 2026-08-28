@@ -117,6 +117,16 @@ test("pins the Windows file-operations build and exposes only its staged addon",
   ]);
 });
 
+test("builds the Windows native addon before running Windows CI tests", async () => {
+  const workflowPath = resolve(dirname(packagePath), ".github/workflows/ci.yml");
+  const workflow = await readFile(workflowPath, "utf8");
+  const windowsBuildStep =
+    "- if: matrix.os == 'windows-latest'\n        run: npm run build:windows-file-ops";
+
+  assert.ok(workflow.includes(windowsBuildStep));
+  assert.ok(workflow.indexOf(windowsBuildStep) < workflow.indexOf("- run: npm test"));
+});
+
 test("formats the complete 64-bit Windows volume serial in native file identities", async () => {
   // Real test volumes may have a zero high half, so this source contract prevents
   // a future narrowing conversion from silently discarding it.

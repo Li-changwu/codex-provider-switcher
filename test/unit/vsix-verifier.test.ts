@@ -303,6 +303,34 @@ test("requires the staged addon in a win32-x64 VSIX", async (context) => {
   );
 });
 
+test(
+  "rejects an unloadable Windows file-operations addon from a win32-x64 VSIX",
+  { skip: process.platform !== "win32" },
+  async (context) => {
+    const directory = await mkdtemp(join(tmpdir(), "codex-provider-switcher-vsix-"));
+    context.after(() => rm(directory, { recursive: true, force: true }));
+    const vsixPath = join(directory, "invalid-windows-addon.vsix");
+
+    await writeVsix(vsixPath, {
+      ...baseEntries(),
+      ...sqliteRuntimeEntries(),
+      ...tomlRuntimeEntries(),
+      "extension/node_modules/sqlite3/package.json": '{"main":"./lib/sqlite3.js"}',
+      "extension/node_modules/sqlite3/lib/sqlite3.js": "module.exports = {};",
+      "extension/native/windows-file-ops/windows_file_ops.node": "",
+    });
+
+    await assert.rejects(
+      verifyVsix(vsixPath, {
+        target: "win32-x64",
+        expectedNativeBindingEntry:
+          "extension/node_modules/sqlite3/bindings/current/binding.node",
+      }),
+      /Windows file-operations addon failed to load or validate from extracted VSIX/,
+    );
+  },
+);
+
 test("rejects TypeScript declarations from the sqlite3 runtime package", async (context) => {
   const directory = await mkdtemp(join(tmpdir(), "codex-provider-switcher-vsix-"));
   context.after(() => rm(directory, { recursive: true, force: true }));

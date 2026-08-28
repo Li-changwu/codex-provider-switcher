@@ -22,6 +22,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - if: matrix.os == 'windows-latest'
+        run: npm run build:windows-file-ops
       - run: npm run check
       - run: npm test
       - run: npm run test:integration
