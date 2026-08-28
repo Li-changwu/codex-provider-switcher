@@ -115,13 +115,22 @@ are in progress; an already conflicting handle makes acquisition fail. It
 returns `"identity-mismatch"` without deleting anything when the selected
 object does not match.
 
-`holdFileIfMatches` opens a verified config file with `FILE_READ_ATTRIBUTES`
-and `FILE_SHARE_READ` only. The absence of `FILE_SHARE_WRITE` and
-`FILE_SHARE_DELETE` has two required effects: it refuses to acquire the hold
-when another already-open write/delete handle conflicts, and, once acquired,
-it blocks later write, delete, and rename opens until `releaseFileHold` closes
-the handle. The returned opaque external owns exactly one Windows `HANDLE`;
-explicit release is idempotent.
+`holdFileIfMatches` owns two verified handles. First it opens the config file
+with `FILE_READ_ATTRIBUTES` and `FILE_SHARE_READ` only. Then it opens the
+config's immediate parent directory with `FILE_LIST_DIRECTORY |
+FILE_READ_ATTRIBUTES`, `FILE_SHARE_READ` only,
+`FILE_FLAG_BACKUP_SEMANTICS`, and `FILE_FLAG_OPEN_REPARSE_POINT`; the parent
+must be a non-reparse directory. Finally it reopens the final config path and
+requires the expected File ID before returning the hold.
+
+The file handle rejects direct write/delete opens and replacement-at-target
+operations. Windows can nevertheless rename an open source file through its
+parent directory, so the parent handle is required to reject child mutation
+opens, including source rename, until `releaseFileHold` closes both handles.
+If a conflicting file or parent-directory writer already exists, acquisition
+fails. The returned opaque external owns the two handles; explicit release
+closes each handle, retains a handle whose close fails for retry, and is
+idempotent after both handles are closed.
 
 The helper validates JavaScript arguments before use. It accepts only absolute
 Windows paths without an embedded NUL, exact lowercase hexadecimal identity
@@ -202,9 +211,12 @@ injected operation implementation:
 Windows integration tests build and call the real addon. They verify that the
 identity returned by a handle changes on replacement, final reparse points are
 rejected, `deleteFileIfMatches` never removes a replacement, and a live config
-hold causes write/delete/rename attempts to fail until release. ProfileStore
-integration tests inject a deterministic replacement hook just before deletion
-and before index publication to prove the operation fails closed.
+hold rejects both replacement-at-target and source rename while preserving the
+original path and bytes until release. Windows may surface a sharing violation
+as `EPERM`, `EACCES`, or `EBUSY`; the test accepts those mappings but must prove
+the filesystem state. ProfileStore integration tests inject a deterministic
+replacement hook just before deletion and before index publication to prove the
+operation fails closed.
 
 The full Windows CI run executes native build, type checking, unit tests,
 integration tests, and VSIX verification. The Ubuntu CI run executes the same

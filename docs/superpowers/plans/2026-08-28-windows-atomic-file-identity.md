@@ -159,9 +159,17 @@ the JavaScript expected value and only then calls
 `SetFileInformationByHandle(handle, FileDispositionInfo, ...)`. A mismatch
 returns the literal string `"identity-mismatch"`; a successful disposition
 returns `"deleted"`. The hold exports a N-API external whose finalizer closes
-the handle. `releaseFileHold` closes it once and makes later close/finalizer
-calls harmless. Every failing branch closes any acquired handle before it
-throws a typed JavaScript error.
+both its verified config-file handle and its verified immediate-parent
+directory handle. The parent uses `FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES`,
+`FILE_SHARE_READ`, `FILE_FLAG_BACKUP_SEMANTICS`, and
+`FILE_FLAG_OPEN_REPARSE_POINT`; it must be a non-reparse directory. After the
+parent is held, reopen the final config path and recheck the expected native
+identity before returning the external. This second observation detects a
+rename/replacement during hold acquisition, while the parent handle blocks a
+later source rename. `releaseFileHold` closes both handles, keeps a failed
+close available for retry, and makes later close/finalizer calls harmless.
+Every failing branch closes any acquired handle before it throws a typed
+JavaScript error.
 
 `scripts/build-windows-file-ops.mjs` must reject non-`win32-x64`, remove only
 the resolved addon output below `native/windows-file-ops/`, invoke the
@@ -418,6 +426,8 @@ test("verified deletion preserves a same-content replacement", { skip: process.p
 test("a verified hold blocks config rename until it closes", { skip: process.platform !== "win32" }, () => {
   const hold = operations.holdFileIfMatches(target, operations.captureFileIdentity(target));
   assert.throws(() => renameSync(replacement, target));
+  assert.throws(() => renameSync(target, renamed));
+  assert.equal(readFileSync(target, "utf8"), contents);
   hold.close();
   renameSync(replacement, target);
 });
@@ -426,7 +436,9 @@ test("a verified hold blocks config rename until it closes", { skip: process.pla
 Add a final reparse-point test with an available Windows symlink or junction;
 when creation requires unavailable Windows developer privileges, mark only
 that case skipped with its concrete Windows error code. The deletion and hold
-tests must never be skipped on `windows-latest`.
+tests must never be skipped on `windows-latest`. Sharing violations may be
+reported by Node as `EPERM`, `EACCES`, or `EBUSY`; assert one of those codes and
+also assert that the source path and original bytes remain unchanged.
 
 - [ ] **Step 2: Run the file on the local non-Windows host and verify clean skips**
 
