@@ -13,6 +13,13 @@ import { randomUUID } from "node:crypto";
 import type { BigIntStats } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
+  hasComparableFileIdentity,
+  hydrateWindowsFileIdentity,
+  sameStableFileIdentity,
+  type FileIdentity,
+  type HydrateWindowsFileIdentityOptions,
+} from "./file-identity";
+import {
   parseAndValidateProfileConfig,
   ProfileConfigPolicyError,
 } from "./config-policy";
@@ -73,6 +80,7 @@ export interface UpdateProfileInput {
 
 export interface ProfileStoreOptions {
   fileSystem?: ProfileFileSystem;
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions;
   now?: () => string;
   platform?: NodeJS.Platform;
   lockOptions?: ProfileLockOptions;
@@ -124,21 +132,23 @@ export class ProfileStoreError extends Error {
 
 interface ProfileDirectoryReservation {
   readonly id: string;
-  readonly directory: BigIntStats;
+  readonly directory: ProfileFileIdentityStats;
 }
 
 interface TrustedProfileRoot {
-  readonly home: BigIntStats;
-  readonly switcher: BigIntStats;
-  readonly profiles: BigIntStats;
+  readonly home: ProfileFileIdentityStats;
+  readonly switcher: ProfileFileIdentityStats;
+  readonly profiles: ProfileFileIdentityStats;
 }
 
 interface TrustedProfileConfig {
   readonly root: TrustedProfileRoot;
-  readonly directory: BigIntStats;
-  readonly config: BigIntStats;
+  readonly directory: ProfileFileIdentityStats;
+  readonly config: ProfileFileIdentityStats;
   readonly path: string;
 }
+
+type ProfileFileIdentityStats = BigIntStats & FileIdentity;
 
 export class ProfileStore {
   private readonly fileSystem: ProfileFileSystem;
@@ -147,6 +157,7 @@ export class ProfileStore {
   private readonly platform: NodeJS.Platform;
   private readonly profilesDir: string;
   private readonly lockOptions: ProfileLockOptions;
+  private readonly fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined;
 
   constructor(
     private readonly layout: CodexLayout,
@@ -155,6 +166,7 @@ export class ProfileStore {
     this.fileSystem = options.fileSystem ?? nativeProfileFileSystem;
     this.now = options.now ?? (() => new Date().toISOString());
     this.platform = options.platform ?? process.platform;
+    this.fileIdentityOptions = options.fileIdentityOptions;
     this.lockOptions = options.lockOptions ?? {};
     this.profilesDir = join(layout.switcherDir, profilesDirectoryName);
     this.indexPath = join(this.profilesDir, indexFileName);
@@ -339,18 +351,40 @@ export class ProfileStore {
       dirname(path),
       `.${basename(path)}.tmp-${randomUUID()}`,
     );
+    let temporaryStats: ProfileFileIdentityStats | undefined;
     try {
       await this.fileSystem.mkdir(dirname(path));
       await this.fileSystem.writeFile(temporaryPath, contents);
+      temporaryStats = await lstatBigIntWithFileIdentity(
+        temporaryPath,
+        this.fileIdentityOptions,
+      );
+      if (!isSafeProfileFile(temporaryStats)) {
+        throw profilePersistenceError();
+      }
       if (this.platform === "linux") {
         await this.fileSystem.chmod(temporaryPath, linuxPrivateFileMode);
       }
       await this.ensureTrustedProfileWriteTarget(path);
+      const beforeRename = await lstatBigIntWithFileIdentity(
+        temporaryPath,
+        this.fileIdentityOptions,
+      );
+      if (
+        !isSafeProfileFile(beforeRename) ||
+        !sameProfileFileIdentity(temporaryStats, beforeRename)
+      ) {
+        throw profilePersistenceError();
+      }
       await this.fileSystem.rename(temporaryPath, path);
+      const published = await lstatBigIntWithFileIdentity(path, this.fileIdentityOptions);
+      if (!isSafeProfileFile(published) || !sameProfileFileIdentity(temporaryStats, published)) {
+        throw profilePersistenceError();
+      }
     } catch (error: unknown) {
       let cleanupError: unknown;
       try {
-        await this.removeTemporaryFile(temporaryPath);
+        await this.removeTemporaryFile(temporaryPath, temporaryStats);
       } catch (error: unknown) {
         cleanupError = error;
       }
@@ -386,7 +420,7 @@ export class ProfileStore {
     try {
       await this.fileSystem.mkdir(dirname(path));
       await this.ensureTrustedProfileWriteTarget(path, reservation.directory);
-      if (await lstatBigIntIfPresent(path)) {
+      if (await lstatBigIntIfPresent(path, this.fileIdentityOptions)) {
         throw profilePersistenceError();
       }
       // The Profile is not indexed yet, so exclusive creation avoids overwriting
@@ -406,8 +440,18 @@ export class ProfileStore {
     }
   }
 
-  private async removeTemporaryFile(path: string): Promise<void> {
+  private async removeTemporaryFile(
+    path: string,
+    expectedStats: ProfileFileIdentityStats | undefined,
+  ): Promise<void> {
+    if (!expectedStats) {
+      return;
+    }
     try {
+      const stats = await lstatBigIntWithFileIdentity(path, this.fileIdentityOptions);
+      if (!isSafeProfileFile(stats) || !sameProfileFileIdentity(stats, expectedStats)) {
+        throw profilePersistenceError();
+      }
       await this.fileSystem.unlink(path);
     } catch (error: unknown) {
       if (!isMissingFileError(error)) {
@@ -443,16 +487,18 @@ export class ProfileStore {
     if (!sameResolvedPath(switcher, expectedSwitcher)) {
       throw profilePersistenceError();
     }
-    const home = await inspectTrustedProfileDirectory(codexHome);
+    const home = await inspectTrustedProfileDirectory(codexHome, this.fileIdentityOptions);
     const switcherDirectory = await ensureTrustedProfileDirectory(
       switcher,
       home,
       create,
+      this.fileIdentityOptions,
     );
     const profiles = await ensureTrustedProfileDirectory(
       this.profilesDir,
       switcherDirectory,
       create,
+      this.fileIdentityOptions,
     );
     return { home, switcher: switcherDirectory, profiles };
   }
@@ -464,7 +510,10 @@ export class ProfileStore {
     const baseId = normalizeProfileId(name);
     const indexedIds = new Set(profiles.map((profile) => profile.id));
     await this.ensureTrustedProfileRoot(true);
-    const profilesRoot = await inspectTrustedProfileDirectory(this.profilesDir);
+    const profilesRoot = await inspectTrustedProfileDirectory(
+      this.profilesDir,
+      this.fileIdentityOptions,
+    );
     let suffix = 1;
     while (true) {
       const id = suffix === 1 ? baseId : `${baseId}-${suffix}`;
@@ -487,6 +536,7 @@ export class ProfileStore {
         directory,
         profilesRoot,
         false,
+        this.fileIdentityOptions,
       );
       return { id, directory: reservedDirectory };
     }
@@ -495,7 +545,7 @@ export class ProfileStore {
   private async ensureTrustedProfileConfig(
     id: string,
     requireExisting: boolean,
-    expectedDirectory?: BigIntStats,
+    expectedDirectory?: ProfileFileIdentityStats,
   ): Promise<void> {
     await this.inspectTrustedProfileConfig(id, requireExisting, expectedDirectory);
   }
@@ -503,7 +553,7 @@ export class ProfileStore {
   private async inspectTrustedProfileConfig(
     id: string,
     requireExisting: boolean,
-    expectedDirectory?: BigIntStats,
+    expectedDirectory?: ProfileFileIdentityStats,
   ): Promise<TrustedProfileConfig | undefined> {
     if (!storedProfileIdPattern.test(id)) {
       throw profilePersistenceError();
@@ -514,12 +564,13 @@ export class ProfileStore {
       profileDirectory,
       root.profiles,
       !requireExisting,
+      this.fileIdentityOptions,
     );
     if (expectedDirectory && !sameProfileFileIdentity(directory, expectedDirectory)) {
       throw profilePersistenceError();
     }
     const configPath = join(profileDirectory, "config.toml");
-    const stats = await lstatBigIntIfPresent(configPath);
+    const stats = await lstatBigIntIfPresent(configPath, this.fileIdentityOptions);
     if (!stats) {
       if (requireExisting) {
         throw profilePersistenceError();
@@ -540,12 +591,20 @@ export class ProfileStore {
 
     const handle = await this.fileSystem.openRead(before.path);
     try {
-      const opened = await handle.stat();
+      const opened = await hydrateProfileFileIdentity(
+        before.path,
+        await handle.stat(),
+        this.fileIdentityOptions,
+      );
       if (!isSafeProfileFile(opened) || !sameProfileFileIdentity(before.config, opened)) {
         throw profilePersistenceError();
       }
       const contents = await handle.readFile();
-      const afterRead = await handle.stat();
+      const afterRead = await hydrateProfileFileIdentity(
+        before.path,
+        await handle.stat(),
+        this.fileIdentityOptions,
+      );
       const after = await this.inspectTrustedProfileConfig(id, true);
       if (
         !after ||
@@ -566,7 +625,7 @@ export class ProfileStore {
   }
 
   private async ensureTrustedMetadataFile(path: string): Promise<void> {
-    const stats = await lstatBigIntIfPresent(path);
+    const stats = await lstatBigIntIfPresent(path, this.fileIdentityOptions);
     if (
       stats &&
       (!isSafeProfileFile(stats) || !sameResolvedPath(await nativeRealpath(path), path))
@@ -577,7 +636,7 @@ export class ProfileStore {
 
   private async ensureTrustedProfileWriteTarget(
     path: string,
-    expectedDirectory?: BigIntStats,
+    expectedDirectory?: ProfileFileIdentityStats,
   ): Promise<void> {
     const resolvedPath = resolve(path);
     if (sameResolvedPath(resolvedPath, this.indexPath)) {
@@ -603,11 +662,15 @@ export class ProfileStore {
     reservation: ProfileDirectoryReservation,
   ): Promise<void> {
     await this.ensureTrustedProfileRoot(true);
-    const profilesRoot = await inspectTrustedProfileDirectory(this.profilesDir);
+    const profilesRoot = await inspectTrustedProfileDirectory(
+      this.profilesDir,
+      this.fileIdentityOptions,
+    );
     const directory = await ensureTrustedProfileDirectory(
       join(this.profilesDir, reservation.id),
       profilesRoot,
       false,
+      this.fileIdentityOptions,
     );
     if (!sameProfileFileIdentity(directory, reservation.directory)) {
       throw profilePersistenceError();
@@ -630,19 +693,20 @@ function profileRollbackError(message: string): ProfileStoreError {
 
 async function ensureTrustedProfileDirectory(
   path: string,
-  expectedParent: BigIntStats,
+  expectedParent: ProfileFileIdentityStats,
   create: boolean,
-): Promise<BigIntStats> {
-  let stats = await lstatBigIntIfPresent(path);
+  fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
+): Promise<ProfileFileIdentityStats> {
+  let stats = await lstatBigIntIfPresent(path, fileIdentityOptions);
   if (!stats && create) {
     await nativeMkdir(path);
-    stats = await lstatBigIntIfPresent(path);
+    stats = await lstatBigIntIfPresent(path, fileIdentityOptions);
   }
   if (!stats || !isSafeProfileDirectory(stats)) {
     throw profilePersistenceError();
   }
   const parentPath = dirname(path);
-  const parent = await nativeLstat(parentPath, { bigint: true });
+  const parent = await lstatBigIntWithFileIdentity(parentPath, fileIdentityOptions);
   if (
     !isSafeProfileDirectory(parent) ||
     !sameProfileFileIdentity(parent, expectedParent) ||
@@ -650,35 +714,44 @@ async function ensureTrustedProfileDirectory(
   ) {
     throw profilePersistenceError();
   }
-  const after = await nativeLstat(path, { bigint: true });
+  const after = await lstatBigIntWithFileIdentity(path, fileIdentityOptions);
   if (!isSafeProfileDirectory(after) || !sameProfileFileIdentity(stats, after)) {
     throw profilePersistenceError();
   }
   return after;
 }
 
-async function inspectTrustedProfileDirectory(path: string): Promise<BigIntStats> {
-  const before = await nativeLstat(path, { bigint: true });
+async function inspectTrustedProfileDirectory(
+  path: string,
+  fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
+): Promise<ProfileFileIdentityStats> {
+  const before = await lstatBigIntWithFileIdentity(path, fileIdentityOptions);
   if (!isSafeProfileDirectory(before) || !sameResolvedPath(await nativeRealpath(path), path)) {
     throw profilePersistenceError();
   }
-  const after = await nativeLstat(path, { bigint: true });
+  const after = await lstatBigIntWithFileIdentity(path, fileIdentityOptions);
   if (!isSafeProfileDirectory(after) || !sameProfileFileIdentity(before, after)) {
     throw profilePersistenceError();
   }
   return after;
 }
 
-function isSafeProfileDirectory(stats: BigIntStats): boolean {
-  return stats.isDirectory() && !stats.isSymbolicLink() && stats.ino !== 0n;
+function isSafeProfileDirectory(stats: ProfileFileIdentityStats): boolean {
+  return stats.isDirectory() && !stats.isSymbolicLink() && hasComparableFileIdentity(stats);
 }
 
-function isSafeProfileFile(stats: BigIntStats): boolean {
-  return stats.isFile() && !stats.isSymbolicLink() && stats.nlink === 1n && stats.ino !== 0n;
+function isSafeProfileFile(stats: ProfileFileIdentityStats): boolean {
+  return stats.isFile() &&
+    !stats.isSymbolicLink() &&
+    stats.nlink === 1n &&
+    hasComparableFileIdentity(stats);
 }
 
-function sameProfileFileIdentity(left: BigIntStats, right: BigIntStats): boolean {
-  return left.dev === right.dev && left.ino !== 0n && left.ino === right.ino;
+function sameProfileFileIdentity(
+  left: ProfileFileIdentityStats,
+  right: ProfileFileIdentityStats,
+): boolean {
+  return sameStableFileIdentity(left, right);
 }
 
 function sameResolvedPath(left: string, right: string): boolean {
@@ -689,15 +762,47 @@ function sameResolvedPath(left: string, right: string): boolean {
     : normalizedLeft === normalizedRight;
 }
 
-async function lstatBigIntIfPresent(path: string): Promise<BigIntStats | undefined> {
+async function lstatBigIntIfPresent(
+  path: string,
+  fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
+): Promise<ProfileFileIdentityStats | undefined> {
   try {
-    return await nativeLstat(path, { bigint: true });
+    return await lstatBigIntWithFileIdentity(path, fileIdentityOptions);
   } catch (error: unknown) {
     if (isMissingFileError(error)) {
       return undefined;
     }
     throw error;
   }
+}
+
+async function lstatBigIntWithFileIdentity(
+  path: string,
+  fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
+): Promise<ProfileFileIdentityStats> {
+  return hydrateProfileFileIdentity(
+    path,
+    await nativeLstat(path, { bigint: true }),
+    fileIdentityOptions,
+  );
+}
+
+async function hydrateProfileFileIdentity(
+  path: string,
+  stats: BigIntStats,
+  fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
+): Promise<ProfileFileIdentityStats> {
+  const identity = await hydrateWindowsFileIdentity(path, stats, fileIdentityOptions);
+  if (identity.windowsFileId === undefined) {
+    return stats as ProfileFileIdentityStats;
+  }
+  Object.defineProperty(stats, "windowsFileId", {
+    configurable: false,
+    enumerable: true,
+    value: identity.windowsFileId,
+    writable: false,
+  });
+  return stats as ProfileFileIdentityStats;
 }
 
 interface ProfileLockRecord {

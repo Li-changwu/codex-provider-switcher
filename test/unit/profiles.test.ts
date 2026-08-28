@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import {
   chmod,
+  link,
+  lstat,
   mkdir,
   mkdtemp,
   open,
@@ -11,6 +13,7 @@ import {
   unlink,
   writeFile,
 } from "node:fs/promises";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
@@ -28,6 +31,8 @@ import {
   UnsupportedSecretStorageError,
   type SecretStorageLike,
 } from "../../src/core/secrets";
+
+const nodeRequire = createRequire(import.meta.url);
 
 test("creates normalized profile IDs and deterministic collision suffixes", async () => {
   await withTemporaryLayout(async (layout) => {
@@ -61,6 +66,181 @@ test("creates normalized profile IDs and deterministic collision suffixes", asyn
       ["research-proxy", "research-proxy-2"],
     );
     assert.deepEqual(await store.get(first.id), first);
+  });
+});
+
+test("accepts zero-inode Windows Profile storage with canonical file identities", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  await withZeroInodeProfileStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const store = new ProfileStore(layout, {
+        now: () => "2026-08-28T00:00:00.000Z",
+        fileIdentityOptions: {
+          platform: "win32",
+          systemRoot: "C:\\Windows",
+          runner: nativeProfileIdentityRunner,
+        },
+      });
+      const created = await store.create({
+        name: "Zero Inode Proxy",
+        kind: "custom",
+        configText: 'model_provider = "proxy"\n',
+        providerId: "proxy",
+      });
+
+      assert.equal(await store.readConfig(created.id), 'model_provider = "proxy"\n');
+      const updated = await store.update(created.id, {
+        name: "Zero Inode Updated",
+        kind: "custom",
+        configText: 'model_provider = "updated"\n',
+        providerId: "updated",
+      });
+
+      assert.equal(updated?.name, "Zero Inode Updated");
+      assert.equal(await store.readConfig(created.id), 'model_provider = "updated"\n');
+      assert.deepEqual((await store.list()).map((profile) => profile.id), [created.id]);
+    });
+  });
+});
+
+test("rejects zero-inode Profile storage without a canonical file identity", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  await withZeroInodeProfileStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const store = new ProfileStore(layout, {
+        fileIdentityOptions: {
+          platform: "win32",
+          systemRoot: "C:\\Windows",
+          runner: async () => ({ stdout: "File ID unavailable" }),
+        },
+      });
+
+      await assert.rejects(() => store.create({
+        name: "Missing Identity",
+        kind: "official",
+        configText: 'model_provider = "openai"\n',
+      }));
+    });
+  });
+});
+
+test("preserves externally replaced zero-inode config when index publication fails", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  await withZeroInodeProfileStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const identityOptions = {
+        platform: "win32" as const,
+        systemRoot: "C:\\Windows",
+        runner: nativeProfileIdentityRunner,
+      };
+      const initialStore = new ProfileStore(layout, { fileIdentityOptions: identityOptions });
+      const created = await initialStore.create({
+        name: "Replaced Zero Inode",
+        kind: "official",
+        configText: 'model_provider = "openai"\n',
+      });
+      const externalConfig = 'model_provider = "external"\n';
+      const indexPath = join(layout.switcherDir, "profiles", "index.json");
+      const indexBefore = await readFile(indexPath, "utf8");
+      const store = new ProfileStore(layout, {
+        fileIdentityOptions: identityOptions,
+        fileSystem: new ExternalConfigEditOnIndexFailureProfileFileSystem(
+          created.configFile,
+          externalConfig,
+        ),
+      });
+
+      await assert.rejects(
+        () => store.update(created.id, {
+          name: "Replaced Zero Inode",
+          kind: "official",
+          configText: 'model_provider = "updated"\n',
+        }),
+        (error: unknown) => error instanceof ProfileStoreError && error.code === "rollback-failed",
+      );
+
+      assert.equal(await readFile(created.configFile, "utf8"), externalConfig);
+      assert.equal(await readFile(indexPath, "utf8"), indexBefore);
+    });
+  });
+});
+
+test("rejects zero-inode Profile config whose hard-link count changes", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  await withZeroInodeProfileStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const store = new ProfileStore(layout, {
+        fileIdentityOptions: {
+          platform: "win32",
+          systemRoot: "C:\\Windows",
+          runner: nativeProfileIdentityRunner,
+        },
+      });
+      const created = await store.create({
+        name: "Linked Zero Inode",
+        kind: "official",
+        configText: 'model_provider = "openai"\n',
+      });
+      const hardLinkPath = `${created.configFile}.link`;
+      await link(created.configFile, hardLinkPath);
+
+      await assert.rejects(
+        () => store.update(created.id, {
+          name: "Linked Zero Inode",
+          kind: "official",
+          configText: 'model_provider = "updated"\n',
+        }),
+        (error: unknown) => error instanceof ProfileStoreError && error.code === "persistence-failed",
+      );
+      assert.equal(await readFile(created.configFile, "utf8"), 'model_provider = "openai"\n');
+    });
+  });
+});
+
+test("preserves a replaced zero-inode index temporary file during failed publication", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  await withZeroInodeProfileStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const externalContents = '{"profiles":"external"}\n';
+      const fileSystem = new ReplaceTemporaryIndexBeforeCleanupProfileFileSystem(
+        externalContents,
+      );
+      const store = new ProfileStore(layout, {
+        fileSystem,
+        fileIdentityOptions: {
+          platform: "win32",
+          systemRoot: "C:\\Windows",
+          runner: nativeProfileIdentityRunner,
+        },
+      });
+
+      await assert.rejects(
+        () => store.create({
+          name: "Temporary Replacement",
+          kind: "official",
+          configText: 'model_provider = "openai"\n',
+        }),
+        (error: unknown) => error instanceof ProfileStoreError && error.code === "rollback-failed",
+      );
+
+      assert.notEqual(fileSystem.replacementPath, undefined);
+      assert.equal(await readFile(fileSystem.replacementPath!, "utf8"), externalContents);
+    });
   });
 });
 
@@ -1751,6 +1931,70 @@ async function withTemporaryLayout(
   }
 }
 
+async function withZeroInodeProfileStats(callback: () => Promise<void>): Promise<void> {
+  const mutableFs = nodeRequire("node:fs/promises") as {
+    lstat: typeof lstat;
+    open: typeof open;
+  };
+  const originalLstat = mutableFs.lstat;
+  const originalOpen = mutableFs.open;
+  nativeProfileLstatForIdentity = originalLstat;
+  mutableFs.lstat = (async (...args: Parameters<typeof lstat>) => {
+    return withZeroInodeProfileStatsValue(await originalLstat(...args));
+  }) as typeof lstat;
+  mutableFs.open = (async (...args: Parameters<typeof open>) => {
+    const handle = await originalOpen(...args);
+    return new Proxy(handle, {
+      get(target, property) {
+        if (property === "stat") {
+          return async (...statArgs: Parameters<typeof target.stat>) => {
+            return withZeroInodeProfileStatsValue(await target.stat(...statArgs));
+          };
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  }) as typeof open;
+  syncBuiltinESMExports();
+  try {
+    await callback();
+  } finally {
+    mutableFs.lstat = originalLstat;
+    mutableFs.open = originalOpen;
+    nativeProfileLstatForIdentity = undefined;
+    syncBuiltinESMExports();
+  }
+}
+
+function withZeroInodeProfileStatsValue<T extends Awaited<ReturnType<typeof lstat>>>(
+  stats: T,
+): T {
+  const copy = Object.create(
+    Object.getPrototypeOf(stats),
+    Object.getOwnPropertyDescriptors(stats),
+  ) as T;
+  Object.defineProperty(copy, "ino", {
+    configurable: true,
+    enumerable: true,
+    value: 0n,
+    writable: false,
+  });
+  return copy;
+}
+
+let nativeProfileLstatForIdentity: typeof lstat | undefined;
+
+async function nativeProfileIdentityRunner(
+  _file: string,
+  args: readonly string[],
+): Promise<{ stdout: string }> {
+  const logicalPath = args[2];
+  assert.equal(typeof logicalPath, "string");
+  const stats = await nativeProfileLstatForIdentity!(logicalPath, { bigint: true });
+  return { stdout: `0x${stats.ino.toString(16).padStart(16, "0")}` };
+}
+
 class RecordingProfileFileSystem implements ProfileFileSystem {
   readonly exclusiveWrites: Array<{ path: string; mode: number }> = [];
   readonly renames: Array<{ from: string; to: string }> = [];
@@ -2212,6 +2456,27 @@ class ExternalConfigEditOnIndexFailureProfileFileSystem
   override async rename(from: string, to: string): Promise<void> {
     if (to.endsWith("index.json")) {
       await writeFile(this.configPath, this.externalConfig, "utf8");
+      throw new Error("index persistence failed");
+    }
+    await super.rename(from, to);
+  }
+}
+
+class ReplaceTemporaryIndexBeforeCleanupProfileFileSystem
+  extends RecordingProfileFileSystem
+{
+  replacementPath: string | undefined;
+
+  constructor(private readonly externalContents: string) {
+    super();
+  }
+
+  override async rename(from: string, to: string): Promise<void> {
+    if (to.endsWith("index.json")) {
+      const retainedPath = `${from}.retained`;
+      await rename(from, retainedPath);
+      await writeFile(from, this.externalContents, "utf8");
+      this.replacementPath = from;
       throw new Error("index persistence failed");
     }
     await super.rename(from, to);
