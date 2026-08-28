@@ -6,7 +6,7 @@
 
 **Architecture:** The extension runs in the active VS Code Extension Host, so Remote SSH operations stay on the Linux server. Small core modules own Profile storage, Codex Home discovery, TOML/auth materialization, rollout metadata, SQLite updates, transaction journals, progress, and native `codex resume`/`codex fork` invocation. The extension never stores full conversation copies; its state database contains only Profile and branch mappings.
 
-**Tech Stack:** TypeScript, VS Code Extension API, Node.js `node:test`, `@iarna/toml`, `@vscode/sqlite3`, `esbuild`, `tsx`, `@vscode/test-electron`, and GitHub Actions on Windows and Ubuntu.
+**Tech Stack:** TypeScript, VS Code Extension API (VS Code `^1.98.0`, Node >=20.17), Node.js `node:test`, `@iarna/toml`, `sqlite3` `^6.0.1`, `esbuild`, `tsx`, `@vscode/test-electron`, and GitHub Actions on Windows and Ubuntu.
 
 ---
 
@@ -52,7 +52,7 @@ docs/superpowers/specs/*     Confirmed design specification
 
 - [ ] **Step 1: Write the manifest contract test.**
 
-The test reads `package.json` and asserts that the extension declares VS Code `^1.92.0`, Node-compatible activation, the commands `codexProvider.createProfile`, `codexProvider.switchProfile`, `codexProvider.syncSessions`, `codexProvider.continueSession`, and `codexProvider.restoreBackup`, plus a status-bar activation entry.
+The test reads `package.json` and asserts that the extension declares VS Code `^1.98.0` (required by SQLite 6's Node >=20.17 runtime), Node-compatible activation, the commands `codexProvider.createProfile`, `codexProvider.switchProfile`, `codexProvider.syncSessions`, `codexProvider.continueSession`, and `codexProvider.restoreBackup`, plus a status-bar activation entry.
 
 - [ ] **Step 2: Run the contract test and verify it fails.**
 
@@ -70,7 +70,7 @@ Expected: FAIL because the manifest and test file do not yet exist.
   "displayName": "Codex Provider Switcher",
   "version": "0.1.0",
   "private": true,
-  "engines": { "vscode": "^1.92.0" },
+  "engines": { "vscode": "^1.98.0" },
   "main": "./dist/extension.js",
   "activationEvents": ["onStartupFinished"],
   "scripts": {
@@ -78,15 +78,19 @@ Expected: FAIL because the manifest and test file do not yet exist.
     "check": "tsc --noEmit",
     "test": "tsx --test test/unit/*.test.ts",
     "test:integration": "tsx --test test/integration/*.test.ts",
-    "package": "npm run check && npm run build && npx @vscode/vsce package --no-dependencies"
+    "package": "node scripts/package-extension.mjs",
+    "package:win32-x64": "node scripts/package-extension.mjs win32-x64",
+    "package:linux-x64": "node scripts/package-extension.mjs linux-x64",
+    "verify:binding": "node scripts/verify-sqlite-binding.mjs",
+    "verify:package": "node scripts/verify-vsix.mjs"
   },
   "dependencies": {
     "@iarna/toml": "^3.0.0",
-    "@vscode/sqlite3": "5.1.14-vscode"
+    "sqlite3": "^6.0.1"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
-    "@types/vscode": "^1.92.0",
+    "@types/vscode": "^1.98.0",
     "@vscode/test-electron": "^2.4.1",
     "@vscode/vsce": "^2.26.1",
     "esbuild": "^0.24.0",
@@ -97,6 +101,10 @@ Expected: FAIL because the manifest and test file do not yet exist.
 ```
 
 The bundle must externalize `vscode`, target the current Node runtime, and write `dist/extension.js`. `src/extension.ts` registers the five commands, creates one status-bar item, and disposes every registration through `context.subscriptions`.
+
+Packaging is host-targeted: Windows x64 may produce only `@win32-x64` and Linux x64 only `@linux-x64`; cross-compilation is not claimed. A generic Linux artifact additionally requires a glibc Linux x64 host. Before its SQLite preflight, the Linux target runs the lockfile-pinned local `prebuild-install` from sqlite3's package directory with explicit N-API, linux, x64, and glibc arguments plus a URL derived from the installed sqlite3 version and its highest compatible N-API declaration. It runs in a TLS-verified, injection-free OS/proxy whitelist with a fresh temporary npm cache, removes sqlite3's previous `build` directory first, disables package-local prebuild overrides, and cleans that cache on every outcome. It must obtain sqlite3's official matching prebuild and never falls back to `node-gyp`; any cleanup, download, extraction, or binding-discovery failure aborts before the ordinary SQLite preflight. The target script removes only exact root-resolved stale legacy, target, VSCE, and temporary artifact names, then runs `check`, `build`, that Linux-only prebuild gate, the clean-child SQLite N-API preflight (minimal environment without Node loader variables and a bounded timeout), and a controlled production audit with explicit `https://registry.npmjs.org/`, strict SSL, an isolated temporary cache, and the TLS-verified OS/proxy whitelist. It packages to a hidden nonpublishable temporary VSIX, verifies that archive and its extracted clean-child `require("sqlite3")`, and only then renames it to `<name>-<version>@<target>.vsix`. Any failure removes the exact temporary and final target artifacts. Task 8's Ubuntu glibc job provides the actual Linux package-load evidence.
+
+The VSIX packages an explicit runtime closure only: extension output, `@iarna/toml` runtime JavaScript, sqlite3's package manifest and runtime loaders, the native `.node` selected by the installed sqlite3 layout, and the `bindings`/`file-uri-to-path` loader dependencies. It excludes install/build tooling such as `node-gyp`, `prebuild-install`, and `tar`, as well as declarations, source/archive content, and source maps. Verification retains normal VSIX metadata such as `[Content_Types].xml` and `extension.vsixmanifest`, requires the extension manifest and bundle plus the SQLite runtime closure, rejects unsafe or oversized archives, and performs the extracted-package native load.
 
 - [ ] **Step 4: Run the contract test and type check.**
 
@@ -296,7 +304,7 @@ export async function inspectStateDatabase(layout: CodexLayout): Promise<SqliteI
 export async function updateProviderMetadata(layout: CodexLayout, targetProvider: string, signal?: AbortSignal): Promise<SqliteUpdateResult>;
 ```
 
-Use `@vscode/sqlite3`, serialized database operations, `BEGIN IMMEDIATE`, targeted `UPDATE` statements for the known fixture schema, `COMMIT`, and `ROLLBACK` on any error. Set a bounded busy timeout and return `locked` rather than waiting indefinitely. The adapter must fail closed for an unknown schema and never use a full transcript table as a copy store.
+Use `sqlite3`, serialized database operations, `BEGIN IMMEDIATE`, targeted `UPDATE` statements for the known fixture schema, `COMMIT`, and `ROLLBACK` on any error. Wrap its callback API in a focused Promise adapter so the public storage API remains asynchronous. Set a bounded busy timeout and return `locked` rather than waiting indefinitely. The adapter must fail closed for an unknown schema and never use a full transcript table as a copy store.
 
 - [ ] **Step 5: Run storage tests and integration tests.**
 

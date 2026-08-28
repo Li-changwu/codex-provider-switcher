@@ -61,6 +61,8 @@ Profile 分为两类：
 
 封装会话文件、归档会话和 SQLite 索引的读写。适配器只修改 Provider 相关元数据，不修改消息正文、会话标题或时间戳。它必须识别不支持的 Codex 数据库布局并安全失败。
 
+SQLite 访问使用 `sqlite3` `^6.0.1` 的 N-API 绑定，而不是依赖特定 Visual Studio 工具链版本的 `@vscode/sqlite3`。该版本要求 Node 20.17 及以上，因此扩展最低支持 VS Code `^1.98.0`。发布包仍按 Windows x64 和 Linux x64 分别生成；每个 VSIX 必须包含其目标平台可加载的 `sqlite3` 原生模块。验证器必须解压 VSIX，并在最小化且不含 Node 加载器变量的子 Node 进程中实际执行 `require("sqlite3")`，而不是只检查目录或假定绑定文件路径。VSIX 仅包含 SQLite 的运行时加载器、必要依赖和原生模块，不能包含 `node-gyp`、`prebuild-install`、`tar` 或源代码归档。预构建绑定不可用、加载超时、加载失败或 `npm audit --omit=dev` 检出漏洞时，打包失败，不能发布缺少数据库能力或带有已知生产依赖漏洞的扩展。
+
 ### 4.4 SwitchTransaction
 
 把 Profile 切换和会话同步作为一个事务管理。它负责锁、备份、暂存、提交、验证、回滚和恢复日志。
