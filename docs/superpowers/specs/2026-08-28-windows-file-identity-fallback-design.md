@@ -26,10 +26,14 @@ The policy has two modes:
 
 1. On Linux, and whenever both objects have nonzero inode values, identity is
    exactly `dev + ino`; regular files also require exactly one link.
-2. Only on `win32`, when both inode values are zero, identity may fall back to
-   `dev + birthtimeNs`. The fallback requires a nonzero, matching birth time
-   and matching link count. It never activates if either inode is nonzero, a
-   birth time is missing or zero, or the platform is not Windows.
+2. Only on `win32`, when both inode values are zero, identity requires a stable
+   Windows File ID. The extension invokes the Windows built-in
+   `SystemRoot\\System32\\fsutil.exe file queryFileID` through `execFile` with
+   an argument vector, bounded timeout, and bounded output. The parsed
+   hexadecimal File ID must be present for both objects and match along with
+   device and link count. It never activates if either inode is nonzero, a File
+   ID is missing or malformed, the command fails, or the platform is not
+   Windows.
 
 Callers retain their existing object-kind and link checks. In particular, a
 fallback file must still be regular, non-symbolic, and have `nlink === 1n`.
@@ -40,16 +44,17 @@ in addition to the identity helper.
 ## Security Boundary
 
 The fallback is deliberately limited to Windows volumes that provide no inode.
-It distinguishes ordinary replacement by the stable creation time and device
-while retaining the existing symlink and hard-link rejection. If a volume also
-cannot supply a stable nonzero creation time, the extension fails closed.
+`fsutil` returns the filesystem File ID, which this implementation verified is
+stable across a hard link and rename but changes for a replacement file at the
+same path. If Windows cannot expose the ID, the extension fails closed instead
+of treating timestamps as identity.
 
-This is weaker than an inode-bearing filesystem against a hostile local actor
-able to reproduce creation-time metadata. Node exposes no portable Windows file
-handle identifier for such a volume. The extension preserves every stronger
-guard available through Node: no-link checks, canonical-path checks, repeated
-pre/post-operation verification, file handle checks, content hashes for byte
-mutations, and atomic rename publication. Linux never uses this fallback.
+The path query cannot be tied to a Node FileHandle, so it does not eliminate
+every race an active local attacker could create around all observations. The
+extension preserves the existing defenses around it: no-link checks, canonical
+path checks, repeated pre/post-operation verification, file handle checks,
+content hashes for byte mutations, and atomic rename publication. Linux never
+uses this fallback and retains strict handle-verifiable `dev + ino` identity.
 
 ## Test Strategy
 
@@ -57,10 +62,15 @@ mutations, and atomic rename publication. Linux never uses this fallback.
 the host filesystem:
 
 - Linux accepts only equal nonzero `dev + ino` identities.
-- Windows accepts equal zero-inode identities only with equal nonzero
-  `birthtimeNs` and link count.
-- A different device, birth time, link count, a mixed zero/nonzero inode pair,
-  or missing creation time is rejected.
+- Windows accepts equal zero-inode identities only with equal parsed File ID
+  and link count.
+- A different device, File ID, link count, a mixed zero/nonzero inode pair, or
+  missing File ID is rejected.
+
+The unit tests inject the File-ID query function and check the system command's
+argument vector, timeout and output parsing separately. A Windows integration
+test exercises `fsutil` on a real temporary file and proves that a hard link
+shares the ID while a replacement file does not.
 
 Existing active Profile, ProfileStore, orchestrator, and transaction tests run
 against real temporary files. Windows CI proves that those layers operate on a

@@ -4,9 +4,9 @@
 
 **Goal:** Make native Windows storage operations work on volumes with zero inode values without weakening Linux identity checks or link defenses.
 
-**Architecture:** A pure identity-policy module owns the exact inode rule and the narrowly scoped Windows `dev + birthtimeNs` fallback. The four storage layers delegate their repeated local helpers to this module. The activation fixture constructs an OS-consistent layout.
+**Architecture:** A shared identity-policy module owns the exact inode rule and a narrowly scoped Windows zero-inode File ID path. It queries `SystemRoot\\System32\\fsutil.exe` through an injectable `execFile` boundary, then the four storage layers delegate their repeated local helpers to this module. The activation fixture constructs an OS-consistent layout.
 
-**Tech Stack:** TypeScript, Node `BigIntStats`, `node:test`, GitHub Actions Windows and Ubuntu runners.
+**Tech Stack:** TypeScript, Node `BigIntStats` and `child_process.execFile`, `node:test`, GitHub Actions Windows and Ubuntu runners.
 
 ---
 
@@ -15,12 +15,16 @@
 **Files:**
 - Create: `src/core/file-identity.ts`
 - Create: `test/unit/file-identity.test.ts`
+- Create: `test/integration/windows-file-id.test.ts`
 
 - [ ] **Step 1: Write the failing platform-injected identity tests.**
 
-Test exact Linux identity, equal zero-inode Windows fallback identity, and failed
-fallback identity after changing birth time, device, link count, or one inode to
-nonzero. The test helper must build explicit bigint records, not use host stats.
+Test exact Linux identity, equal zero-inode Windows File ID identity, and failed
+fallback identity after changing the File ID, device, link count, or one inode
+to nonzero. Test File-ID query parsing with an injected execFile function: only
+a bounded hexadecimal `0x...` result succeeds; command failure, oversized or
+missing output, and non-Windows invocation fail closed. The identity helper
+must build explicit bigint records, not use host stats.
 
 - [ ] **Step 2: Verify RED.**
 
@@ -30,12 +34,16 @@ Expected: fail because `file-identity.ts` does not exist.
 
 - [ ] **Step 3: Implement the minimal shared policy.**
 
-Expose `FileIdentity`, `hasComparableFileIdentity`, and
-`sameStableFileIdentity`. Preserve nonzero `dev + ino` equality on every
-platform. Permit only a `win32` pair whose inode values are both zero and whose
-device, link count, and nonzero `birthtimeNs` match. Reject mixed exact/fallback
-identity, missing creation times, zero creation times, and non-safe numeric
-identities.
+Expose `FileIdentity`, `hasComparableFileIdentity`,
+`sameStableFileIdentity`, and async `hydrateWindowsFileIdentity`. Preserve
+nonzero `dev + ino` equality on every platform. Permit only a `win32` pair
+whose inode values are both zero and whose device, link count, and validated
+Windows File ID match. `hydrateWindowsFileIdentity` must use an injected
+execFile-like function in tests; production passes an absolute path inside the
+validated `SystemRoot\\System32` and invokes `fsutil.exe file queryFileID` with
+the target path as a separate argument. It must use no shell, redacted errors,
+a timeout, and a maximum buffer. Reject mixed exact/File-ID identity, missing
+or malformed IDs, command errors, and non-safe numeric identities.
 
 - [ ] **Step 4: Verify GREEN and type safety.**
 
@@ -63,7 +71,12 @@ before changing production consumers.
 
 - [ ] **Step 2: Replace duplicated inode predicates and equality helpers.**
 
-Each layer imports `hasComparableFileIdentity` and `sameStableFileIdentity`.
+Each layer imports `hasComparableFileIdentity`, `sameStableFileIdentity`, and
+the async identity hydrator. Rename its `lstat` import to `nativeLstat` and
+provide a local `lstat` wrapper that hydrates a zero-inode Windows stat before
+it reaches a trust comparison. Before each `FileHandle.stat()` comparison,
+hydrate the returned stat with the same known logical path. The wrapper must
+not invoke `fsutil` when inode is nonzero or on Linux.
 Keep `isFile`, `isDirectory`, `isSymbolicLink`, `nlink === 1n`, `realpath`,
 source-hash, journal, lock-content, and backup-version checks unchanged.
 Replace only local `ino !== 0n` predicates and local `dev + ino` equality
@@ -113,9 +126,10 @@ Expected: pass.
 
 - [ ] **Step 1: Document the bounded Windows fallback.**
 
-Add one concise security note: Windows volumes without inode data use a
-creation-time identity fallback; unsupported identity data still disables unsafe
-operations. Do not claim equivalent verification across all Windows volumes.
+Add one concise security note: Windows volumes without inode data require a
+Windows filesystem File ID through the built-in `fsutil` utility; unavailable
+identity data still disables unsafe operations. Do not claim equivalent
+verification across all Windows volumes.
 
 - [ ] **Step 2: Run complete local verification.**
 
@@ -149,5 +163,5 @@ links `Closes #15` and triggers Windows and Ubuntu verification.
 - Placeholder scan: every production change names the exact files, invariant,
   and verification command; no deferred behavior is unspecified.
 - Type consistency: `FileIdentity` keeps `dev`, `ino`, and `nlink` compatible
-  with the transaction API, adding optional `birthtimeNs` only for fallback
-  callers.
+  with the transaction API, adding an optional canonical Windows File ID only
+  for the zero-inode fallback.
