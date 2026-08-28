@@ -5,11 +5,13 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   activateExtensionWithStartupPrerequisites,
+  commandAvailabilityContextKey,
   commandIds,
   getStartupProfilePrerequisites,
   registerExtensionLifecycle,
   type ExtensionHostApi,
 } from "../../src/activation";
+import { ActiveProfileStore } from "../../src/core/active-profile";
 import { UnsupportedHostError } from "../../src/core/codex-home";
 import { profileApiKeySecretId } from "../../src/core/profiles";
 import { UnsupportedSecretStorageError } from "../../src/core/secrets";
@@ -28,7 +30,7 @@ import type { ProfileRecord } from "../../src/core/types";
 const startupRecoveryWarning =
   "Codex Provider Switcher could not safely complete startup recovery. Provider switching commands are disabled.";
 
-test("registers commands and status bar disposal with the extension context", () => {
+test("registers only status bar lifecycle functionality without command handlers", () => {
   const commandDisposables = commandIds.map((command) => ({
     command,
     dispose: () => undefined,
@@ -60,12 +62,132 @@ test("registers commands and status bar disposal with the extension context", ()
 
   registerExtensionLifecycle({ subscriptions }, vscode);
 
-  assert.deepEqual(registeredCommands, [...commandIds]);
-  assert.equal(subscriptions.length, commandDisposables.length + 1);
-  for (const disposable of [...commandDisposables, statusBarDisposable]) {
-    assert.ok(subscriptions.includes(disposable));
-  }
-  assert.equal(statusBarDisposable.command, "codexProvider.switchProfile");
+  assert.deepEqual(registeredCommands, []);
+  assert.deepEqual(subscriptions, [statusBarDisposable]);
+  assert.equal(statusBarDisposable.command, undefined);
+  assert.match(statusBarDisposable.tooltip ?? "", /unavailable/i);
+});
+
+test("registers functional startup commands and refreshes the active Profile status", async () => {
+  await withAuthRecoveryFixture(async (fixture) => {
+    const activeProfile = {
+      ...customProfile("research"),
+      name: "Research",
+    };
+    fixture.profiles.set(activeProfile.id, activeProfile);
+    await new ActiveProfileStore(fixture.layout).set(activeProfile.id);
+    const prompts: string[] = [];
+    const extensionWindow = fixture.api.window as unknown as {
+      showInputBox(options: { prompt: string }): Promise<string | undefined>;
+    };
+    extensionWindow.showInputBox = async (options) => {
+      prompts.push(options.prompt);
+      return undefined;
+    };
+
+    await activateExtensionWithStartupPrerequisites(
+      fixture.context,
+      fixture.host,
+      fixture.api,
+      () => fixture.prerequisites,
+      async () => recoveryResult(),
+    );
+
+    assert.deepEqual(fixture.registeredCommands, [...commandIds]);
+    assert.deepEqual(fixture.contextValues, [
+      [commandAvailabilityContextKey, false],
+      [commandAvailabilityContextKey, true],
+    ]);
+    assert.equal(fixture.statusBarItem.text, "$(account) Codex: Research");
+    assert.equal(fixture.statusBarItem.command, "codexProvider.switchProfile");
+    fixture.profiles.set(activeProfile.id, {
+      ...activeProfile,
+      name: "Updated Research",
+    });
+    const createProfile = fixture.registeredHandlers.get("codexProvider.createProfile");
+    assert.ok(createProfile);
+    await createProfile?.();
+
+    assert.deepEqual(prompts, ["Profile name"]);
+    assert.equal(fixture.statusBarItem.text, "$(account) Codex: Updated Research");
+  });
+});
+
+test("compensates when publishing command availability fails", async () => {
+  const fixture = activationFixture();
+  const publicationError = new Error("context publication failed");
+  const commands = fixture.api.commands as unknown as {
+    executeCommand(command: string, contextKey: string, value: boolean): Promise<void>;
+  };
+  commands.executeCommand = async (_command, contextKey, value) => {
+    fixture.contextValues.push([contextKey, value]);
+    if (contextKey === commandAvailabilityContextKey && value) {
+      throw publicationError;
+    }
+  };
+
+  await assert.rejects(
+    () => activateExtensionWithStartupPrerequisites(
+      fixture.context,
+      fixture.host,
+      fixture.api,
+      () => fixture.prerequisites,
+      async () => recoveryResult(),
+    ),
+    (error: unknown) => error === publicationError,
+  );
+
+  assert.deepEqual(fixture.contextValues, [
+    [commandAvailabilityContextKey, false],
+    [commandAvailabilityContextKey, true],
+    [commandAvailabilityContextKey, false],
+  ]);
+  assert.deepEqual(fixture.registeredCommands, [...commandIds]);
+  assert.equal(fixture.registeredHandlers.size, 0);
+  assert.ok(fixture.commandDisposables.every((disposable) => disposable.disposed));
+  assert.deepEqual(fixture.context.subscriptions, []);
+  assert.equal(fixture.statusBarItem.disposed, true);
+  assert.equal(fixture.statusBarItem.command, undefined);
+});
+
+test("preserves publication failure when compensation disposal throws", async () => {
+  const fixture = activationFixture();
+  const publicationError = new Error("context publication failed");
+  let statusDisposeAttempted = false;
+  fixture.statusBarItem.dispose = () => {
+    statusDisposeAttempted = true;
+    throw new Error("status disposal failed");
+  };
+  const commands = fixture.api.commands as unknown as {
+    executeCommand(command: string, contextKey: string, value: boolean): Promise<void>;
+  };
+  commands.executeCommand = async (_command, contextKey, value) => {
+    fixture.contextValues.push([contextKey, value]);
+    if (contextKey === commandAvailabilityContextKey && value) {
+      throw publicationError;
+    }
+  };
+
+  await assert.rejects(
+    () => activateExtensionWithStartupPrerequisites(
+      fixture.context,
+      fixture.host,
+      fixture.api,
+      () => fixture.prerequisites,
+      async () => recoveryResult(),
+    ),
+    (error: unknown) => error === publicationError,
+  );
+
+  assert.equal(statusDisposeAttempted, true);
+  assert.deepEqual(fixture.contextValues, [
+    [commandAvailabilityContextKey, false],
+    [commandAvailabilityContextKey, true],
+    [commandAvailabilityContextKey, false],
+  ]);
+  assert.ok(fixture.commandDisposables.every((disposable) => disposable.disposed));
+  assert.deepEqual(fixture.context.subscriptions, []);
+  assert.equal(fixture.statusBarItem.command, undefined);
 });
 
 test("awaits startup recovery once before registering commands", async () => {
@@ -113,6 +235,10 @@ test("does not register commands when startup recovery remains required", async 
 
   assert.deepEqual(fixture.registeredCommands, []);
   assert.deepEqual(fixture.warnings, [startupRecoveryWarning]);
+  assert.deepEqual(fixture.context.subscriptions, []);
+  assert.deepEqual(fixture.contextValues, [[commandAvailabilityContextKey, false]]);
+  assert.equal(fixture.statusBarCreated, 0);
+  assert.equal(fixture.statusBarItem.command, undefined);
   assert.doesNotMatch(fixture.warnings[0], /operation-containing-secret-value/);
 });
 
@@ -293,13 +419,14 @@ test("fails closed without exposing keys when the previous custom secret is miss
   });
 });
 
-test("registers the lifecycle when typed startup prerequisites are unavailable", async () => {
+test("registers no command handlers when typed startup prerequisites are unavailable", async () => {
   for (const startupError of [
     new UnsupportedHostError("wsl", "WSL is unavailable."),
     new UnsupportedSecretStorageError("SecretStorage is unavailable."),
   ]) {
     const subscriptions: Array<{ dispose(): unknown }> = [];
     const registeredCommands: string[] = [];
+    const contextValues: Array<[string, boolean]> = [];
     let recoveryCalls = 0;
     const statusBarItem = {
       dispose: () => undefined,
@@ -313,6 +440,14 @@ test("registers the lifecycle when typed startup prerequisites are unavailable",
         registerCommand: (command: string) => {
           registeredCommands.push(command);
           return { dispose: () => undefined };
+        },
+        executeCommand: async (
+          _command: string,
+          contextKey: string,
+          value: boolean,
+        ) => {
+          contextValues.push([contextKey, value]);
+          return undefined;
         },
       },
       window: {
@@ -352,9 +487,11 @@ test("registers the lifecycle when typed startup prerequisites are unavailable",
         },
       ),
     );
-    assert.deepEqual(registeredCommands, [...commandIds]);
-    assert.equal(subscriptions.length, commandIds.length + 1);
-    assert.equal(statusBarItem.command, "codexProvider.switchProfile");
+    assert.deepEqual(registeredCommands, []);
+    assert.equal(subscriptions.length, 1);
+    assert.equal(statusBarItem.command, undefined);
+    assert.match(statusBarItem.tooltip ?? "", /unavailable/i);
+    assert.deepEqual(contextValues, [[commandAvailabilityContextKey, false]]);
     assert.equal(getStartupProfilePrerequisites(), undefined);
     assert.equal(recoveryCalls, 0);
   }
@@ -391,7 +528,9 @@ test("disposes earlier registrations when a later command registration throws", 
   } as unknown as ExtensionHostApi;
 
   assert.throws(
-    () => registerExtensionLifecycle({ subscriptions }, vscode),
+    () => registerExtensionLifecycle({ subscriptions }, vscode, {
+      createCommandHandlers: () => lifecycleCommandHandlers(),
+    }),
     /registration failed/,
   );
   assert.equal(disposables.length, 2);
@@ -425,7 +564,9 @@ test("disposes registrations and status bar when showing it throws", () => {
   } as unknown as ExtensionHostApi;
 
   assert.throws(
-    () => registerExtensionLifecycle({ subscriptions }, vscode),
+    () => registerExtensionLifecycle({ subscriptions }, vscode, {
+      createCommandHandlers: () => lifecycleCommandHandlers(),
+    }),
     /status show failed/,
   );
   assert.ok(commandDisposables.every((disposable) => disposable.disposed));
@@ -466,7 +607,9 @@ test("disposes every rollback value without masking the activation error", () =>
   } as unknown as ExtensionHostApi;
 
   assert.throws(
-    () => registerExtensionLifecycle({ subscriptions }, vscode),
+    () => registerExtensionLifecycle({ subscriptions }, vscode, {
+      createCommandHandlers: () => lifecycleCommandHandlers(),
+    }),
     /registration failed/,
   );
   assert.equal(secondDisposable.disposed, true);
@@ -482,11 +625,33 @@ function trackedDisposable() {
   };
 }
 
+function lifecycleCommandHandlers() {
+  return {
+    "codexProvider.createProfile": async () => undefined,
+    "codexProvider.editProfile": async () => undefined,
+    "codexProvider.switchProfile": async () => undefined,
+    "codexProvider.syncSessions": async () => undefined,
+    "codexProvider.continueSession": async () => undefined,
+    "codexProvider.restoreBackup": async () => undefined,
+  };
+}
+
 function activationFixture() {
   const registeredCommands: string[] = [];
+  const registeredHandlers = new Map<string, () => unknown>();
+  const commandDisposables: Array<{
+    command: string;
+    disposed: boolean;
+    dispose(): void;
+  }> = [];
+  const contextValues: Array<[string, boolean]> = [];
   const warnings: string[] = [];
+  let statusBarCreated = 0;
   const statusBarItem = {
-    dispose: () => undefined,
+    disposed: false,
+    dispose() {
+      this.disposed = true;
+    },
     show: () => undefined,
     text: "",
     command: undefined as string | undefined,
@@ -494,13 +659,34 @@ function activationFixture() {
   };
   const api = {
     commands: {
-      registerCommand: (command: string) => {
+      registerCommand: (command: string, handler: () => unknown) => {
         registeredCommands.push(command);
-        return { dispose: () => undefined };
+        registeredHandlers.set(command, handler);
+        const disposable = {
+          command,
+          disposed: false,
+          dispose() {
+            this.disposed = true;
+            registeredHandlers.delete(command);
+          },
+        };
+        commandDisposables.push(disposable);
+        return disposable;
+      },
+      executeCommand: async (
+        _command: string,
+        contextKey: string,
+        value: boolean,
+      ) => {
+        contextValues.push([contextKey, value]);
+        return undefined;
       },
     },
     window: {
-      createStatusBarItem: () => statusBarItem,
+      createStatusBarItem: () => {
+        statusBarCreated += 1;
+        return statusBarItem;
+      },
       showWarningMessage: async (message: string) => {
         warnings.push(message);
         return undefined;
@@ -531,10 +717,17 @@ function activationFixture() {
   return {
     api,
     context,
+    commandDisposables,
+    contextValues,
     host,
     layout: prerequisites.layout,
     prerequisites,
     registeredCommands,
+    registeredHandlers,
+    statusBarItem,
+    get statusBarCreated() {
+      return statusBarCreated;
+    },
     warnings,
   };
 }

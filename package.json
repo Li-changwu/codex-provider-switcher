@@ -22,30 +22,66 @@
     "commands": [
       {
         "command": "codexProvider.createProfile",
-        "title": "Codex: Create Profile"
+        "title": "Codex: Create Profile",
+        "enablement": "codexProvider.commandsAvailable"
+      },
+      {
+        "command": "codexProvider.editProfile",
+        "title": "Codex: Edit Profile",
+        "enablement": "codexProvider.commandsAvailable"
       },
       {
         "command": "codexProvider.switchProfile",
-        "title": "Codex: Switch Profile"
+        "title": "Codex: Switch Profile",
+        "enablement": "codexProvider.commandsAvailable"
       },
       {
         "command": "codexProvider.syncSessions",
-        "title": "Codex: Sync Sessions"
+        "title": "Codex: Sync Sessions",
+        "enablement": "codexProvider.commandsAvailable"
       },
       {
         "command": "codexProvider.continueSession",
-        "title": "Codex: Continue Session"
+        "title": "Codex: Continue Session",
+        "enablement": "codexProvider.commandsAvailable"
       },
       {
         "command": "codexProvider.restoreBackup",
-        "title": "Codex: Restore Backup"
+        "title": "Codex: Restore Backup",
+        "enablement": "codexProvider.commandsAvailable"
       }
     ],
     "menus": {
+      "commandPalette": [
+        {
+          "command": "codexProvider.createProfile",
+          "when": "codexProvider.commandsAvailable"
+        },
+        {
+          "command": "codexProvider.editProfile",
+          "when": "codexProvider.commandsAvailable"
+        },
+        {
+          "command": "codexProvider.switchProfile",
+          "when": "codexProvider.commandsAvailable"
+        },
+        {
+          "command": "codexProvider.syncSessions",
+          "when": "codexProvider.commandsAvailable"
+        },
+        {
+          "command": "codexProvider.continueSession",
+          "when": "codexProvider.commandsAvailable"
+        },
+        {
+          "command": "codexProvider.restoreBackup",
+          "when": "codexProvider.commandsAvailable"
+        }
+      ],
       "statusBar": [
         {
           "command": "codexProvider.switchProfile",
-          "when": "true",
+          "when": "codexProvider.commandsAvailable",
           "group": "navigation"
         }
       ]

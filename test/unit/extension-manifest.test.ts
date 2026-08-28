@@ -8,6 +8,15 @@ const packagePath = resolve(
   dirname(fileURLToPath(import.meta.url)),
   "../../package.json",
 );
+const commandAvailabilityContextKey = "codexProvider.commandsAvailable";
+const expectedCommandIds = [
+  "codexProvider.continueSession",
+  "codexProvider.createProfile",
+  "codexProvider.editProfile",
+  "codexProvider.restoreBackup",
+  "codexProvider.switchProfile",
+  "codexProvider.syncSessions",
+].sort();
 
 test("declares the VS Code extension manifest contract", async () => {
   const manifest = JSON.parse(await readFile(packagePath, "utf8")) as {
@@ -18,9 +27,10 @@ test("declares the VS Code extension manifest contract", async () => {
     browser?: string;
     activationEvents?: string[];
     contributes?: {
-      commands?: Array<{ command?: string }>;
+      commands?: Array<{ command?: string; enablement?: string }>;
       menus?: {
-        statusBar?: Array<{ command?: string }>;
+        commandPalette?: Array<{ command?: string; when?: string }>;
+        statusBar?: Array<{ command?: string; when?: string }>;
       };
     };
   };
@@ -35,20 +45,27 @@ test("declares the VS Code extension manifest contract", async () => {
   const commands = new Set(
     manifest.contributes?.commands?.map((entry) => entry.command),
   );
+  assert.deepEqual([...commands].sort(), expectedCommandIds);
+  assert.ok(
+    manifest.contributes?.commands?.every(
+      (entry) => entry.enablement === commandAvailabilityContextKey,
+    ),
+  );
+  const commandPalette = manifest.contributes?.menus?.commandPalette ?? [];
   assert.deepEqual(
-    [...commands].sort(),
-    [
-      "codexProvider.continueSession",
-      "codexProvider.createProfile",
-      "codexProvider.restoreBackup",
-      "codexProvider.syncSessions",
-      "codexProvider.switchProfile",
-    ].sort(),
+    commandPalette.map((entry) => entry.command).sort(),
+    expectedCommandIds,
+  );
+  assert.ok(
+    commandPalette.every((entry) => entry.when === commandAvailabilityContextKey),
   );
 
   assert.ok(
     manifest.contributes?.menus?.statusBar?.some(
-      (entry) => entry.command === "codexProvider.switchProfile",
+      (entry) => (
+        entry.command === "codexProvider.switchProfile"
+        && entry.when === commandAvailabilityContextKey
+      ),
     ),
   );
 });

@@ -42,11 +42,18 @@ const publicProfileRecordKeys = new Set([
 export interface ProfileFileSystem {
   mkdir(path: string): Promise<void>;
   readFile(path: string): Promise<string>;
+  openRead(path: string): Promise<ProfileReadFileHandle>;
   writeFile(path: string, contents: string): Promise<void>;
   writeFileExclusive(path: string, contents: string, mode: number): Promise<void>;
   rename(from: string, to: string): Promise<void>;
   chmod(path: string, mode: number): Promise<void>;
   unlink(path: string): Promise<void>;
+}
+
+export interface ProfileReadFileHandle {
+  stat(): Promise<BigIntStats>;
+  readFile(): Promise<string>;
+  close(): Promise<void>;
 }
 
 export interface CreateProfileInput {
@@ -120,6 +127,19 @@ interface ProfileDirectoryReservation {
   readonly directory: BigIntStats;
 }
 
+interface TrustedProfileRoot {
+  readonly home: BigIntStats;
+  readonly switcher: BigIntStats;
+  readonly profiles: BigIntStats;
+}
+
+interface TrustedProfileConfig {
+  readonly root: TrustedProfileRoot;
+  readonly directory: BigIntStats;
+  readonly config: BigIntStats;
+  readonly path: string;
+}
+
 export class ProfileStore {
   private readonly fileSystem: ProfileFileSystem;
   private readonly indexPath: string;
@@ -184,6 +204,36 @@ export class ProfileStore {
 
   async get(id: string): Promise<ProfileRecord | undefined> {
     return (await this.list()).find((profile) => profile.id === id);
+  }
+
+  /**
+   * Returns a managed Profile's TOML only after revalidating its trusted path.
+   * UI callers must not read Profile files independently.
+   */
+  async readConfig(id: string): Promise<string | undefined> {
+    if (!(await this.get(id))) {
+      return undefined;
+    }
+    return this.withProfileLock(async () => {
+      const profile = await this.get(id);
+      if (!profile) {
+        return undefined;
+      }
+      try {
+        const configText = await this.readTrustedProfileConfig(profile.id);
+        assertNoCredentialAssignments(configText);
+        return configText;
+      } catch (error: unknown) {
+        if (error instanceof ProfileStoreError) {
+          throw error;
+        }
+        throw new ProfileStoreError(
+          "persistence-failed",
+          "Could not read the managed Profile configuration.",
+          { cause: error },
+        );
+      }
+    });
   }
 
   async update(
@@ -383,6 +433,10 @@ export class ProfileStore {
   }
 
   private async ensureTrustedProfileRoot(create: boolean): Promise<void> {
+    await this.inspectTrustedProfileRoot(create);
+  }
+
+  private async inspectTrustedProfileRoot(create: boolean): Promise<TrustedProfileRoot> {
     const codexHome = resolve(this.layout.codexHome);
     const switcher = resolve(this.layout.switcherDir);
     const expectedSwitcher = join(codexHome, "provider-switcher");
@@ -395,7 +449,12 @@ export class ProfileStore {
       home,
       create,
     );
-    await ensureTrustedProfileDirectory(this.profilesDir, switcherDirectory, create);
+    const profiles = await ensureTrustedProfileDirectory(
+      this.profilesDir,
+      switcherDirectory,
+      create,
+    );
+    return { home, switcher: switcherDirectory, profiles };
   }
 
   private async reserveAvailableProfileId(
@@ -438,15 +497,22 @@ export class ProfileStore {
     requireExisting: boolean,
     expectedDirectory?: BigIntStats,
   ): Promise<void> {
+    await this.inspectTrustedProfileConfig(id, requireExisting, expectedDirectory);
+  }
+
+  private async inspectTrustedProfileConfig(
+    id: string,
+    requireExisting: boolean,
+    expectedDirectory?: BigIntStats,
+  ): Promise<TrustedProfileConfig | undefined> {
     if (!storedProfileIdPattern.test(id)) {
       throw profilePersistenceError();
     }
-    await this.ensureTrustedProfileRoot(true);
+    const root = await this.inspectTrustedProfileRoot(true);
     const profileDirectory = join(this.profilesDir, id);
-    const profilesRoot = await inspectTrustedProfileDirectory(this.profilesDir);
     const directory = await ensureTrustedProfileDirectory(
       profileDirectory,
-      profilesRoot,
+      root.profiles,
       !requireExisting,
     );
     if (expectedDirectory && !sameProfileFileIdentity(directory, expectedDirectory)) {
@@ -458,10 +524,44 @@ export class ProfileStore {
       if (requireExisting) {
         throw profilePersistenceError();
       }
-      return;
+      return undefined;
     }
     if (!isSafeProfileFile(stats) || !sameResolvedPath(await nativeRealpath(configPath), configPath)) {
       throw profilePersistenceError();
+    }
+    return { root, directory, config: stats, path: configPath };
+  }
+
+  private async readTrustedProfileConfig(id: string): Promise<string> {
+    const before = await this.inspectTrustedProfileConfig(id, true);
+    if (!before) {
+      throw profilePersistenceError();
+    }
+
+    const handle = await this.fileSystem.openRead(before.path);
+    try {
+      const opened = await handle.stat();
+      if (!isSafeProfileFile(opened) || !sameProfileFileIdentity(before.config, opened)) {
+        throw profilePersistenceError();
+      }
+      const contents = await handle.readFile();
+      const afterRead = await handle.stat();
+      const after = await this.inspectTrustedProfileConfig(id, true);
+      if (
+        !after ||
+        !isSafeProfileFile(afterRead) ||
+        !sameProfileFileIdentity(before.config, afterRead) ||
+        !sameProfileFileIdentity(before.root.home, after.root.home) ||
+        !sameProfileFileIdentity(before.root.switcher, after.root.switcher) ||
+        !sameProfileFileIdentity(before.root.profiles, after.root.profiles) ||
+        !sameProfileFileIdentity(before.directory, after.directory) ||
+        !sameProfileFileIdentity(before.config, after.config)
+      ) {
+        throw profilePersistenceError();
+      }
+      return contents;
+    } finally {
+      await handle.close();
     }
   }
 
@@ -1253,6 +1353,14 @@ const nativeProfileFileSystem: ProfileFileSystem = {
     await nativeMkdir(path, { recursive: true });
   },
   readFile: (path) => nativeReadFile(path, "utf8"),
+  async openRead(path) {
+    const handle = await nativeOpen(path, "r");
+    return {
+      stat: () => handle.stat({ bigint: true }),
+      readFile: () => handle.readFile({ encoding: "utf8" }),
+      close: () => handle.close(),
+    };
+  },
   async writeFile(path, contents) {
     await nativeWriteFile(path, contents, "utf8");
   },

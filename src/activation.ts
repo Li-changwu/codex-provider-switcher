@@ -1,4 +1,5 @@
 import type * as vscode from "vscode";
+import { ActiveProfileStore } from "./core/active-profile";
 import { UnsupportedHostError } from "./core/codex-home";
 import {
   removeActiveCustomAuth,
@@ -15,18 +16,27 @@ import type {
   RecoveryDependencies,
   RecoveryResult,
 } from "./core/transaction";
+import {
+  createProfileCommandHandlers,
+  createVscodeProfileCommandUi,
+  type ProfileCommandHandlers,
+} from "./ui/commands";
+import type { ActiveProfileState, ProfileLookup } from "./core/profile-switch-orchestrator";
 
 export const commandIds = [
   "codexProvider.createProfile",
+  "codexProvider.editProfile",
   "codexProvider.switchProfile",
   "codexProvider.syncSessions",
   "codexProvider.continueSession",
   "codexProvider.restoreBackup",
 ] as const;
 
+export const commandAvailabilityContextKey = "codexProvider.commandsAvailable";
+
 export type ExtensionHostApi = Pick<
   typeof vscode,
-  "commands" | "window" | "StatusBarAlignment"
+  "commands" | "window" | "StatusBarAlignment" | "ProgressLocation"
 >;
 
 export interface ExtensionActivationContext extends StartupExtensionContext {
@@ -43,6 +53,21 @@ export type StartupRecovery = (
   dependencies: RecoveryDependencies,
 ) => Promise<Pick<RecoveryResult, "recoveryRequiredOperationIds">>;
 
+type CommandId = typeof commandIds[number];
+type ExtensionCommandHandlers = Partial<Record<CommandId, () => Promise<void>>>;
+
+export interface ExtensionLifecycleOptions {
+  readonly createCommandHandlers?: (
+    refreshStatus: () => Promise<void>,
+  ) => ExtensionCommandHandlers;
+  readonly getStatusText?: () => Promise<string>;
+}
+
+export interface ExtensionLifecycleRegistration {
+  refreshStatus(): Promise<void>;
+  dispose(): void;
+}
+
 const startupRecoveryWarning =
   "Codex Provider Switcher could not safely complete startup recovery. Provider switching commands are disabled.";
 
@@ -56,6 +81,7 @@ export async function activateExtensionWithStartupPrerequisites(
   recover: StartupRecovery,
 ): Promise<void> {
   startupProfilePrerequisites = undefined;
+  await api.commands.executeCommand("setContext", commandAvailabilityContextKey, false);
   try {
     startupProfilePrerequisites = createPrerequisites(context, host);
   } catch (error: unknown) {
@@ -79,7 +105,42 @@ export async function activateExtensionWithStartupPrerequisites(
       return;
     }
   }
-  registerExtensionLifecycle(context, api);
+  if (!startupProfilePrerequisites) {
+    registerExtensionLifecycle(context, api);
+    return;
+  }
+
+  const prerequisites = startupProfilePrerequisites;
+  const activeProfiles = new ActiveProfileStore(prerequisites.layout);
+  const lifecycle = registerExtensionLifecycle(context, api, {
+    getStatusText: createActiveProfileStatusText(
+      activeProfiles,
+      prerequisites.profiles,
+    ),
+    createCommandHandlers: (refresh) => toExtensionCommandHandlers(
+      createProfileCommandHandlers({
+        layout: prerequisites.layout,
+        profiles: prerequisites.profiles,
+        secrets: prerequisites.secrets,
+        activeProfiles,
+        ui: createVscodeProfileCommandUi(api),
+        restoreAuthMode: createStartupAuthModeRestorer(prerequisites),
+        refreshStatus: refresh,
+      }),
+    ),
+  });
+  await lifecycle.refreshStatus();
+  try {
+    await api.commands.executeCommand("setContext", commandAvailabilityContextKey, true);
+  } catch (error) {
+    lifecycle.dispose();
+    try {
+      await api.commands.executeCommand("setContext", commandAvailabilityContextKey, false);
+    } catch {
+      // Preserve the failed availability publication as the activation error.
+    }
+    throw error;
+  }
 }
 
 export function getStartupProfilePrerequisites():
@@ -91,32 +152,87 @@ export function getStartupProfilePrerequisites():
 export function registerExtensionLifecycle(
   context: Pick<vscode.ExtensionContext, "subscriptions">,
   api: ExtensionHostApi,
-): void {
+  options: ExtensionLifecycleOptions = {},
+): ExtensionLifecycleRegistration {
   const initialSubscriptionCount = context.subscriptions.length;
-  try {
-    for (const commandId of commandIds) {
-      context.subscriptions.push(api.commands.registerCommand(commandId, () => undefined));
+  let statusBarItem: vscode.StatusBarItem | undefined;
+  const dispose = (): void => {
+    if (statusBarItem) {
+      statusBarItem.command = undefined;
+      statusBarItem.tooltip = "Codex Provider Switcher is unavailable.";
     }
-    const statusBarItem = api.window.createStatusBarItem(
-      api.StatusBarAlignment.Left,
-      100,
-    );
-    context.subscriptions.push(statusBarItem);
-    statusBarItem.text = "$(account) Codex";
-    statusBarItem.command = "codexProvider.switchProfile";
-    statusBarItem.tooltip = "Codex Provider Switcher";
-    statusBarItem.show();
-  } catch (error) {
     const createdDisposables = context.subscriptions.splice(initialSubscriptionCount);
     for (const disposable of createdDisposables) {
       try {
         disposable.dispose();
       } catch {
-        // Preserve the activation failure while disposing every created value.
+        // Preserve the primary activation failure while disposing every created value.
       }
     }
+  };
+  try {
+    const refreshStatus = async (): Promise<void> => {
+      let text = "$(account) Codex";
+      try {
+        text = await options.getStatusText?.() ?? text;
+      } catch {
+        // Profile state is advisory and must not expose storage errors.
+      }
+      if (statusBarItem) {
+        statusBarItem.text = text;
+      }
+    };
+    const handlers = options.createCommandHandlers?.(refreshStatus);
+    const hasSwitchHandler = handlers?.["codexProvider.switchProfile"] !== undefined;
+    for (const commandId of commandIds) {
+      const handler = handlers?.[commandId];
+      if (handler) {
+        context.subscriptions.push(api.commands.registerCommand(commandId, handler));
+      }
+    }
+    statusBarItem = api.window.createStatusBarItem(
+      api.StatusBarAlignment.Left,
+      100,
+    );
+    context.subscriptions.push(statusBarItem);
+    statusBarItem.text = "$(account) Codex";
+    statusBarItem.command = hasSwitchHandler ? "codexProvider.switchProfile" : undefined;
+    statusBarItem.tooltip = hasSwitchHandler
+      ? "Codex Provider Switcher"
+      : "Codex Provider Switcher is unavailable.";
+    statusBarItem.show();
+    return { refreshStatus, dispose };
+  } catch (error) {
+    dispose();
     throw error;
   }
+}
+
+function toExtensionCommandHandlers(
+  handlers: ProfileCommandHandlers,
+): ExtensionCommandHandlers {
+  return {
+    "codexProvider.createProfile": handlers.createProfile,
+    "codexProvider.editProfile": handlers.editProfile,
+    "codexProvider.switchProfile": handlers.switchProfile,
+    "codexProvider.syncSessions": handlers.syncSessions,
+    "codexProvider.continueSession": handlers.continueSession,
+    "codexProvider.restoreBackup": handlers.restoreBackup,
+  };
+}
+
+function createActiveProfileStatusText(
+  activeProfiles: ActiveProfileState,
+  profiles: ProfileLookup,
+): () => Promise<string> {
+  return async () => {
+    const snapshot = await activeProfiles.snapshot();
+    if (snapshot.state !== "present") {
+      return "$(account) Codex";
+    }
+    const profile = await profiles.get(snapshot.record.profileId);
+    return profile ? `$(account) Codex: ${profile.name}` : "$(account) Codex";
+  };
 }
 
 function isExpectedStartupPrerequisiteError(error: unknown): boolean {
