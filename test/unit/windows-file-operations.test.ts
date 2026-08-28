@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { resolve } from "node:path";
+import { win32 } from "node:path";
 import test from "node:test";
 import {
   createWindowsFileOperations,
@@ -7,7 +7,7 @@ import {
   type WindowsFileIdentity,
 } from "../../src/core/windows-file-operations";
 
-const EXTENSION_ROOT = resolve("C:\\codex-provider-switcher");
+const EXTENSION_ROOT = win32.resolve("C:\\codex-provider-switcher");
 const CONFIG_PATH = "C:\\profiles\\config.toml";
 const IDENTITY: WindowsFileIdentity = {
   volumeSerial: "0123456789abcdef",
@@ -73,42 +73,82 @@ test("rejects malformed native identities", () => {
   }
 });
 
-test("passes canonical values to the binding and releases a hold exactly once", () => {
-  const calls: Array<{ path: string; expected: WindowsFileIdentity }> = [];
+test("uses owned immutable identity snapshots at the native binding boundary", () => {
+  const nativeIdentity = { ...IDENTITY };
+  const callerIdentity = { ...IDENTITY };
+  const calls: WindowsFileIdentity[] = [];
+  const holdToken = {};
+  const operations = createWindowsFileOperations({
+    platform: "win32",
+    arch: "x64",
+    extensionRoot: EXTENSION_ROOT,
+    loadBinding: () => ({
+      captureFileIdentity: () => nativeIdentity,
+      deleteFileIfMatches: (_path, expected) => {
+        calls.push(expected);
+        return "deleted";
+      },
+      holdFileIfMatches: (_path, expected) => {
+        calls.push(expected);
+        return holdToken;
+      },
+      releaseFileHold: (hold) => {
+        assert.strictEqual(hold, holdToken);
+      },
+    }),
+  });
+
+  const captured = operations.captureFileIdentity(CONFIG_PATH);
+  assert.deepEqual(captured, IDENTITY);
+  assert.notStrictEqual(captured, nativeIdentity);
+  assert.ok(Object.isFrozen(captured));
+  nativeIdentity.fileId = "fedcba9876543210fedcba9876543210";
+  assert.deepEqual(captured, IDENTITY);
+
+  assert.equal(operations.deleteFileIfMatches(CONFIG_PATH, callerIdentity), "deleted");
+  const hold = operations.holdFileIfMatches(CONFIG_PATH, callerIdentity);
+  assert.equal(calls.length, 2);
+  for (const expected of calls) {
+    assert.notStrictEqual(expected, callerIdentity);
+    assert.deepEqual(expected, IDENTITY);
+    assert.ok(Object.isFrozen(expected));
+  }
+
+  callerIdentity.fileId = "fedcba9876543210fedcba9876543210";
+  for (const expected of calls) {
+    assert.deepEqual(expected, IDENTITY);
+  }
+  hold.close();
+});
+
+test("retries a failed hold release and releases no more than once after success", () => {
   const holdToken = {};
   let releases = 0;
   const operations = createWindowsFileOperations({
     platform: "win32",
     arch: "x64",
     extensionRoot: EXTENSION_ROOT,
-    loadBinding: () => ({
-      captureFileIdentity: () => IDENTITY,
-      deleteFileIfMatches: (path, expected) => {
-        calls.push({ path, expected });
-        return "deleted";
-      },
-      holdFileIfMatches: (path, expected) => {
-        calls.push({ path, expected });
-        return holdToken;
-      },
+    loadBinding: () => validBinding({
+      holdFileIfMatches: () => holdToken,
       releaseFileHold: (hold) => {
         assert.strictEqual(hold, holdToken);
         releases += 1;
+        if (releases === 1) {
+          throw new Error("native release failed");
+        }
       },
     }),
   });
 
-  assert.deepEqual(operations.captureFileIdentity(CONFIG_PATH), IDENTITY);
-  assert.equal(operations.deleteFileIfMatches(CONFIG_PATH, IDENTITY), "deleted");
   const hold = operations.holdFileIfMatches(CONFIG_PATH, IDENTITY);
-  hold.close();
-  hold.close();
-
-  assert.deepEqual(calls, [
-    { path: CONFIG_PATH, expected: IDENTITY },
-    { path: CONFIG_PATH, expected: IDENTITY },
-  ]);
+  assertWindowsError(() => hold.close(), "WINDOWS_FILE_OPERATIONS_INVALID");
   assert.equal(releases, 1);
+
+  hold.close();
+  assert.equal(releases, 2);
+
+  hold.close();
+  assert.equal(releases, 2);
 });
 
 test("normalizes loader and binding failures", () => {
@@ -141,7 +181,7 @@ test("normalizes loader and binding failures", () => {
   );
 });
 
-test("rejects an addon resolution that escapes the extension root", () => {
+test("rejects a Windows backslash traversal root on every host", () => {
   let loads = 0;
   const operations = createWindowsFileOperations({
     platform: "win32",
@@ -158,6 +198,25 @@ test("rejects an addon resolution that escapes the extension root", () => {
     "WINDOWS_FILE_OPERATIONS_INVALID",
   );
   assert.equal(loads, 0);
+});
+
+test("constructs the addon path with Windows semantics when win32 is mocked", () => {
+  let addonPath: string | undefined;
+  const operations = createWindowsFileOperations({
+    platform: "win32",
+    arch: "x64",
+    extensionRoot: EXTENSION_ROOT,
+    loadBinding: (path) => {
+      addonPath = path;
+      return validBinding();
+    },
+  });
+
+  assert.deepEqual(operations.captureFileIdentity(CONFIG_PATH), IDENTITY);
+  assert.equal(
+    addonPath,
+    win32.resolve(EXTENSION_ROOT, "native", "windows-file-ops", "windows_file_ops.node"),
+  );
 });
 
 test("rejects invalid paths before calling the native binding", () => {

@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, isAbsolute, join, relative, resolve, sep, win32 } from "node:path";
+import { dirname, join, resolve, win32 } from "node:path";
 
 const ADDON_PATH_SEGMENTS = ["native", "windows-file-ops", "windows_file_ops.node"] as const;
 const VOLUME_SERIAL_PATTERN = /^[0-9a-f]{16}$/;
@@ -90,15 +90,17 @@ export function createWindowsFileOperations(
   return {
     captureFileIdentity(path): WindowsFileIdentity {
       assertWindowsPath(path);
-      return validateIdentity(callBinding(getBinding, (native) => native.captureFileIdentity(path)));
+      return createIdentitySnapshot(
+        callBinding(getBinding, (native) => native.captureFileIdentity(path)),
+      );
     },
 
     deleteFileIfMatches(path, expected): "deleted" | "identity-mismatch" {
       assertWindowsPath(path);
-      assertIdentity(expected);
+      const expectedSnapshot = createIdentitySnapshot(expected);
       const result = callBinding(
         getBinding,
-        (native) => native.deleteFileIfMatches(path, expected),
+        (native) => native.deleteFileIfMatches(path, expectedSnapshot),
       );
       if (result !== "deleted" && result !== "identity-mismatch") {
         throw invalidError();
@@ -108,11 +110,11 @@ export function createWindowsFileOperations(
 
     holdFileIfMatches(path, expected): WindowsFileHold {
       assertWindowsPath(path);
-      assertIdentity(expected);
+      const expectedSnapshot = createIdentitySnapshot(expected);
       const native = getBinding();
       const token = callBinding(
         () => native,
-        (current) => current.holdFileIfMatches(path, expected),
+        (current) => current.holdFileIfMatches(path, expectedSnapshot),
       );
       if (!isObject(token)) {
         throw invalidError();
@@ -124,8 +126,12 @@ export function createWindowsFileOperations(
           if (closed) {
             return;
           }
+          try {
+            native.releaseFileHold(token);
+          } catch {
+            throw invalidError();
+          }
           closed = true;
-          callBinding(() => native, (current) => current.releaseFileHold(token));
         },
       };
     },
@@ -148,22 +154,22 @@ function resolveAddonPath(extensionRoot: string): string {
   if (
     typeof extensionRoot !== "string" ||
     extensionRoot.includes("\0") ||
-    !isAbsolute(extensionRoot)
+    !win32.isAbsolute(extensionRoot)
   ) {
     throw invalidError();
   }
 
-  const resolvedRoot = resolve(extensionRoot);
+  const resolvedRoot = win32.resolve(extensionRoot);
   if (resolvedRoot !== extensionRoot) {
     throw invalidError();
   }
-  const addonPath = resolve(resolvedRoot, ...ADDON_PATH_SEGMENTS);
-  const addonRelativePath = relative(resolvedRoot, addonPath);
+  const addonPath = win32.resolve(resolvedRoot, ...ADDON_PATH_SEGMENTS);
+  const addonRelativePath = win32.relative(resolvedRoot, addonPath);
   if (
     addonRelativePath.length === 0 ||
     addonRelativePath === ".." ||
-    addonRelativePath.startsWith(`..${sep}`) ||
-    isAbsolute(addonRelativePath)
+    addonRelativePath.startsWith(`..${win32.sep}`) ||
+    win32.isAbsolute(addonRelativePath)
   ) {
     throw invalidError();
   }
@@ -205,20 +211,25 @@ function isNativeBinding(value: unknown): value is NativeWindowsFileOperationsBi
   }
 }
 
-function validateIdentity(value: unknown): WindowsFileIdentity {
+function createIdentitySnapshot(value: unknown): WindowsFileIdentity {
   if (!isObject(value)) {
     throw invalidError();
   }
 
   try {
-    assertIdentity(value);
+    const snapshot = {
+      volumeSerial: value.volumeSerial,
+      fileId: value.fileId,
+      linkCount: value.linkCount,
+    };
+    assertIdentity(snapshot);
+    return Object.freeze(snapshot);
   } catch (error: unknown) {
     if (error instanceof WindowsFileOperationsError) {
       throw error;
     }
     throw invalidError();
   }
-  return value;
 }
 
 function assertIdentity(value: unknown): asserts value is WindowsFileIdentity {
