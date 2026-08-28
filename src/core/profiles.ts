@@ -886,13 +886,13 @@ async function hydrateProfileFileIdentity(
   fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
 ): Promise<ProfileFileIdentityStats> {
   const identity = await hydrateWindowsFileIdentity(path, stats, fileIdentityOptions);
-  if (identity.windowsFileId === undefined) {
+  if (identity.windowsFileIdentity === undefined) {
     return stats as ProfileFileIdentityStats;
   }
-  Object.defineProperty(stats, "windowsFileId", {
+  Object.defineProperty(stats, "windowsFileIdentity", {
     configurable: false,
     enumerable: true,
-    value: identity.windowsFileId,
+    value: identity.windowsFileIdentity,
     writable: false,
   });
   return stats as ProfileFileIdentityStats;

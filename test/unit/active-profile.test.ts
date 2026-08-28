@@ -9,6 +9,7 @@ import {
   ActiveProfileStore,
   ActiveProfileStoreError,
 } from "../../src/core/active-profile";
+import type { WindowsFileOperations } from "../../src/core/windows-file-operations";
 
 const nodeRequire = createRequire(import.meta.url);
 
@@ -44,8 +45,7 @@ test("accepts zero-inode Windows active Profile storage with canonical file iden
         now: () => "2026-08-25T00:00:00.000Z",
         fileIdentityOptions: {
           platform: "win32",
-          systemRoot: "C:\\Windows",
-          runner: nativeIdentityRunner,
+          windowsFileOperations: nativeWindowsFileOperations(),
         },
       });
 
@@ -80,8 +80,7 @@ test("rejects zero-inode active Profile storage without a canonical file identit
       const store = new ActiveProfileStore(layout, {
         fileIdentityOptions: {
           platform: "win32",
-          systemRoot: "C:\\Windows",
-          runner: async () => ({ stdout: "File ID unavailable" }),
+          windowsFileOperations: unavailableWindowsFileOperations(),
         },
       });
 
@@ -106,8 +105,7 @@ test("rejects a replaced zero-inode active Profile file after its path is checke
         now: () => "2026-08-25T00:00:00.000Z",
         fileIdentityOptions: {
           platform: "win32",
-          systemRoot: "C:\\Windows",
-          runner: nativeIdentityRunner,
+          windowsFileOperations: nativeWindowsFileOperations(),
         },
       });
       activeProfilePath = store.path;
@@ -150,8 +148,7 @@ test("rejects a zero-inode active Profile file whose link count changes before o
         now: () => "2026-08-25T00:00:00.000Z",
         fileIdentityOptions: {
           platform: "win32",
-          systemRoot: "C:\\Windows",
-          runner: nativeIdentityRunner,
+          windowsFileOperations: nativeWindowsFileOperations(),
         },
       });
       activeProfilePath = store.path;
@@ -352,11 +349,13 @@ async function withZeroInodeStats(
   };
   const originalLstat = mutableFs.lstat;
   const originalOpen = mutableFs.open;
-  nativeLstatForIdentity = originalLstat;
   mutableFs.lstat = (async (...args: Parameters<typeof lstat>) => {
-    return withZeroInode(await originalLstat(...args));
+    const stats = await originalLstat(...args);
+    rememberNativeIdentity(args[0], stats);
+    return withZeroInode(stats);
   }) as typeof lstat;
   mutableFs.open = (async (...args: Parameters<typeof open>) => {
+    const logicalPath = args[0];
     const path = args[0];
     if (typeof path === "string") {
       await hooks.beforeOpen?.(path, args[1]);
@@ -366,7 +365,9 @@ async function withZeroInodeStats(
       get(target, property) {
         if (property === "stat") {
           return async (...statArgs: Parameters<typeof target.stat>) => {
-            return withZeroInode(await target.stat(...statArgs));
+            const stats = await target.stat(...statArgs);
+            rememberNativeIdentity(logicalPath, stats);
+            return withZeroInode(stats);
           };
         }
         const value = Reflect.get(target, property, target);
@@ -380,7 +381,7 @@ async function withZeroInodeStats(
   } finally {
     mutableFs.lstat = originalLstat;
     mutableFs.open = originalOpen;
-    nativeLstatForIdentity = undefined;
+    nativeIdentityStats.clear();
     syncBuiltinESMExports();
   }
 }
@@ -399,14 +400,59 @@ function withZeroInode<T extends Awaited<ReturnType<typeof lstat>>>(stats: T): T
   return copy;
 }
 
-let nativeLstatForIdentity: typeof lstat | undefined;
+const nativeIdentityStats = new Map<string, {
+  readonly dev: bigint;
+  readonly ino: bigint;
+  readonly nlink: bigint;
+}>();
 
-async function nativeIdentityRunner(
-  _file: string,
-  args: readonly string[],
-): Promise<{ stdout: string }> {
-  const logicalPath = args[2];
-  assert.equal(typeof logicalPath, "string");
-  const stats = await nativeLstatForIdentity!(logicalPath, { bigint: true });
-  return { stdout: `0x${stats.ino.toString(16).padStart(16, "0")}` };
+function nativeWindowsFileOperations(): WindowsFileOperations {
+  return {
+    captureFileIdentity(path) {
+      const stats = nativeIdentityStats.get(path);
+      if (stats === undefined || stats.nlink !== 1n) {
+        throw new Error("native identity is unavailable");
+      }
+      return {
+        volumeSerial: "0000000000000001",
+        fileId: `${stats.dev.toString(16)}${stats.ino.toString(16)}`
+          .padStart(32, "0")
+          .slice(-32),
+        linkCount: stats.nlink,
+      };
+    },
+    deleteFileIfMatches() {
+      throw new Error("unused");
+    },
+    holdFileIfMatches() {
+      throw new Error("unused");
+    },
+  };
+}
+
+function unavailableWindowsFileOperations(): WindowsFileOperations {
+  return {
+    captureFileIdentity() {
+      throw new Error("native identity is unavailable");
+    },
+    deleteFileIfMatches() {
+      throw new Error("unused");
+    },
+    holdFileIfMatches() {
+      throw new Error("unused");
+    },
+  };
+}
+
+function rememberNativeIdentity(
+  path: unknown,
+  stats: { dev: bigint; ino: bigint; nlink: bigint },
+): void {
+  if (typeof path === "string") {
+    nativeIdentityStats.set(path, {
+      dev: stats.dev,
+      ino: stats.ino,
+      nlink: stats.nlink,
+    });
+  }
 }

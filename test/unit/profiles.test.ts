@@ -31,6 +31,7 @@ import {
   UnsupportedSecretStorageError,
   type SecretStorageLike,
 } from "../../src/core/secrets";
+import type { WindowsFileOperations } from "../../src/core/windows-file-operations";
 
 const nodeRequire = createRequire(import.meta.url);
 
@@ -78,11 +79,7 @@ test("accepts zero-inode Windows Profile storage with canonical file identities"
     await withTemporaryLayout(async (layout) => {
       const store = new ProfileStore(layout, {
         now: () => "2026-08-28T00:00:00.000Z",
-        fileIdentityOptions: {
-          platform: "win32",
-          systemRoot: "C:\\Windows",
-          runner: nativeProfileIdentityRunner,
-        },
+        fileIdentityOptions: zeroInodeProfileIdentityOptions(),
       });
       const created = await store.create({
         name: "Zero Inode Proxy",
@@ -116,8 +113,7 @@ test("rejects zero-inode Profile storage without a canonical file identity", asy
       const store = new ProfileStore(layout, {
         fileIdentityOptions: {
           platform: "win32",
-          systemRoot: "C:\\Windows",
-          runner: async () => ({ stdout: "File ID unavailable" }),
+          windowsFileOperations: unavailableProfileWindowsFileOperations(),
         },
       });
 
@@ -139,8 +135,7 @@ test("preserves externally replaced zero-inode config when index publication fai
     await withTemporaryLayout(async (layout) => {
       const identityOptions = {
         platform: "win32" as const,
-        systemRoot: "C:\\Windows",
-        runner: nativeProfileIdentityRunner,
+        windowsFileOperations: nativeProfileWindowsFileOperations(),
       };
       const initialStore = new ProfileStore(layout, { fileIdentityOptions: identityOptions });
       const created = await initialStore.create({
@@ -182,11 +177,7 @@ test("rejects zero-inode Profile config whose hard-link count changes", async (t
   await withZeroInodeProfileStats(async () => {
     await withTemporaryLayout(async (layout) => {
       const store = new ProfileStore(layout, {
-        fileIdentityOptions: {
-          platform: "win32",
-          systemRoot: "C:\\Windows",
-          runner: nativeProfileIdentityRunner,
-        },
+        fileIdentityOptions: zeroInodeProfileIdentityOptions(),
       });
       const created = await store.create({
         name: "Linked Zero Inode",
@@ -222,11 +213,7 @@ test("preserves a replaced zero-inode index temporary file during failed publica
       );
       const store = new ProfileStore(layout, {
         fileSystem,
-        fileIdentityOptions: {
-          platform: "win32",
-          systemRoot: "C:\\Windows",
-          runner: nativeProfileIdentityRunner,
-        },
+        fileIdentityOptions: zeroInodeProfileIdentityOptions(),
       });
 
       await assert.rejects(
@@ -2193,17 +2180,21 @@ async function withZeroInodeProfileStats(callback: () => Promise<void>): Promise
   };
   const originalLstat = mutableFs.lstat;
   const originalOpen = mutableFs.open;
-  nativeProfileLstatForIdentity = originalLstat;
   mutableFs.lstat = (async (...args: Parameters<typeof lstat>) => {
-    return withZeroInodeProfileStatsValue(await originalLstat(...args));
+    const stats = await originalLstat(...args);
+    rememberNativeProfileIdentity(args[0], stats);
+    return withZeroInodeProfileStatsValue(stats);
   }) as typeof lstat;
   mutableFs.open = (async (...args: Parameters<typeof open>) => {
+    const logicalPath = args[0];
     const handle = await originalOpen(...args);
     return new Proxy(handle, {
       get(target, property) {
         if (property === "stat") {
           return async (...statArgs: Parameters<typeof target.stat>) => {
-            return withZeroInodeProfileStatsValue(await target.stat(...statArgs));
+            const stats = await target.stat(...statArgs);
+            rememberNativeProfileIdentity(logicalPath, stats);
+            return withZeroInodeProfileStatsValue(stats);
           };
         }
         const value = Reflect.get(target, property, target);
@@ -2217,7 +2208,7 @@ async function withZeroInodeProfileStats(callback: () => Promise<void>): Promise
   } finally {
     mutableFs.lstat = originalLstat;
     mutableFs.open = originalOpen;
-    nativeProfileLstatForIdentity = undefined;
+    nativeProfileIdentityStats.clear();
     syncBuiltinESMExports();
   }
 }
@@ -2238,24 +2229,68 @@ function withZeroInodeProfileStatsValue<T extends Awaited<ReturnType<typeof lsta
   return copy;
 }
 
-let nativeProfileLstatForIdentity: typeof lstat | undefined;
-
-async function nativeProfileIdentityRunner(
-  _file: string,
-  args: readonly string[],
-): Promise<{ stdout: string }> {
-  const logicalPath = args[2];
-  assert.equal(typeof logicalPath, "string");
-  const stats = await nativeProfileLstatForIdentity!(logicalPath, { bigint: true });
-  return { stdout: `0x${stats.ino.toString(16).padStart(16, "0")}` };
-}
+const nativeProfileIdentityStats = new Map<string, {
+  readonly dev: bigint;
+  readonly ino: bigint;
+  readonly nlink: bigint;
+}>();
 
 function zeroInodeProfileIdentityOptions() {
   return {
     platform: "win32" as const,
-    systemRoot: "C:\\Windows",
-    runner: nativeProfileIdentityRunner,
+    windowsFileOperations: nativeProfileWindowsFileOperations(),
   };
+}
+
+function nativeProfileWindowsFileOperations(): WindowsFileOperations {
+  return {
+    captureFileIdentity(path) {
+      const stats = nativeProfileIdentityStats.get(path);
+      if (stats === undefined || stats.nlink !== 1n) {
+        throw new Error("native identity is unavailable");
+      }
+      return {
+        volumeSerial: "0000000000000001",
+        fileId: `${stats.dev.toString(16)}${stats.ino.toString(16)}`
+          .padStart(32, "0")
+          .slice(-32),
+        linkCount: stats.nlink,
+      };
+    },
+    deleteFileIfMatches() {
+      throw new Error("unused");
+    },
+    holdFileIfMatches() {
+      throw new Error("unused");
+    },
+  };
+}
+
+function unavailableProfileWindowsFileOperations(): WindowsFileOperations {
+  return {
+    captureFileIdentity() {
+      throw new Error("native identity is unavailable");
+    },
+    deleteFileIfMatches() {
+      throw new Error("unused");
+    },
+    holdFileIfMatches() {
+      throw new Error("unused");
+    },
+  };
+}
+
+function rememberNativeProfileIdentity(
+  path: unknown,
+  stats: { dev: bigint; ino: bigint; nlink: bigint },
+): void {
+  if (typeof path === "string") {
+    nativeProfileIdentityStats.set(path, {
+      dev: stats.dev,
+      ino: stats.ino,
+      nlink: stats.nlink,
+    });
+  }
 }
 
 class RecordingProfileFileSystem implements ProfileFileSystem {

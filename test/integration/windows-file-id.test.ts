@@ -5,12 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  FileIdentityError,
   hydrateWindowsFileIdentity,
   sameStableFileIdentity,
   type FileIdentity,
 } from "../../src/core/file-identity";
 
-test("hydrates real Windows File IDs across hard links, renames, and replacements", async (t) => {
+test("hydrates native Windows identities across rename and rejects hard links", async (t) => {
   if (process.platform !== "win32") {
     t.skip("Windows File IDs require Windows");
     return;
@@ -18,33 +19,46 @@ test("hydrates real Windows File IDs across hard links, renames, and replacement
 
   const directory = await mkdtemp(join(tmpdir(), "codex-file-id-"));
   const originalPath = join(directory, "original.txt");
-  const hardLinkPath = join(directory, "hard-link.txt");
   const renamedPath = join(directory, "renamed.txt");
-  const replacementLinkPath = join(directory, "replacement-link.txt");
+  const hardLinkPath = join(directory, "renamed-link.txt");
 
   try {
-    await writeFile(originalPath, "original", "utf8");
-    await link(originalPath, hardLinkPath);
+    await writeFile(originalPath, "same contents", "utf8");
+    const hydratedOriginal = await hydrateWindowsFileIdentity(
+      originalPath,
+      zeroInodeIdentity(await lstat(originalPath, { bigint: true })),
+    );
+
     await rename(originalPath, renamedPath);
-    await writeFile(originalPath, "replacement", "utf8");
-    await link(originalPath, replacementLinkPath);
+    await writeFile(originalPath, "same contents", "utf8");
+    const hydratedRenamed = await hydrateWindowsFileIdentity(
+      renamedPath,
+      zeroInodeIdentity(await lstat(renamedPath, { bigint: true })),
+    );
+    const hydratedReplacement = await hydrateWindowsFileIdentity(
+      originalPath,
+      zeroInodeIdentity(await lstat(originalPath, { bigint: true })),
+    );
 
-    const hardLinkIdentity = zeroInodeIdentity(await lstat(hardLinkPath, { bigint: true }));
-    const renamedIdentity = zeroInodeIdentity(await lstat(renamedPath, { bigint: true }));
-    const replacementIdentity = zeroInodeIdentity(await lstat(originalPath, { bigint: true }));
+    assert.equal(sameStableFileIdentity(hydratedOriginal, hydratedRenamed, "win32"), true);
+    assert.equal(sameStableFileIdentity(hydratedRenamed, hydratedReplacement, "win32"), false);
+    assert.deepEqual(
+      hydratedOriginal.windowsFileIdentity,
+      hydratedRenamed.windowsFileIdentity,
+    );
+    assert.notDeepEqual(
+      hydratedRenamed.windowsFileIdentity,
+      hydratedReplacement.windowsFileIdentity,
+    );
 
-    const [hydratedHardLink, hydratedRenamed, hydratedReplacement] = await Promise.all([
-      hydrateWindowsFileIdentity(hardLinkPath, hardLinkIdentity),
-      hydrateWindowsFileIdentity(renamedPath, renamedIdentity),
-      hydrateWindowsFileIdentity(originalPath, replacementIdentity),
-    ]);
-
-    assert.equal(hardLinkIdentity.nlink, renamedIdentity.nlink);
-    assert.equal(hardLinkIdentity.nlink, replacementIdentity.nlink);
-    assert.equal(sameStableFileIdentity(hydratedHardLink, hydratedRenamed, "win32"), true);
-    assert.equal(sameStableFileIdentity(hydratedHardLink, hydratedReplacement, "win32"), false);
-    assert.equal(hydratedHardLink.windowsFileId, hydratedRenamed.windowsFileId);
-    assert.notEqual(hydratedHardLink.windowsFileId, hydratedReplacement.windowsFileId);
+    await link(renamedPath, hardLinkPath);
+    await assert.rejects(
+      async () => hydrateWindowsFileIdentity(
+        hardLinkPath,
+        zeroInodeIdentity(await lstat(hardLinkPath, { bigint: true })),
+      ),
+      FileIdentityError,
+    );
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

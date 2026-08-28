@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { createRequire, syncBuiltinESMExports } from "node:module";
 import test from "node:test";
 import {
   FileIdentityError,
@@ -7,13 +6,17 @@ import {
   hydrateWindowsFileIdentity,
   sameStableFileIdentity,
   type FileIdentity,
-  type WindowsFileIdCommandRunner,
 } from "../../src/core/file-identity";
+import type {
+  WindowsFileIdentity,
+  WindowsFileOperations,
+} from "../../src/core/windows-file-operations";
 
-const FILE_ID = "0x0123456789abcdef";
-const OTHER_FILE_ID = "0xfedcba9876543210";
-const nodeRequire = createRequire(import.meta.url);
-const childProcess = nodeRequire("node:child_process") as typeof import("node:child_process");
+const NATIVE_IDENTITY: WindowsFileIdentity = {
+  volumeSerial: "000000000000002a",
+  fileId: "0123456789abcdef0123456789abcdef",
+  linkCount: 1n,
+};
 
 function identity(overrides: Partial<FileIdentity> = {}): FileIdentity {
   return {
@@ -21,6 +24,26 @@ function identity(overrides: Partial<FileIdentity> = {}): FileIdentity {
     ino: 2n,
     nlink: 1n,
     ...overrides,
+  };
+}
+
+function nativeIdentity(
+  overrides: Partial<WindowsFileIdentity> = {},
+): WindowsFileIdentity {
+  return { ...NATIVE_IDENTITY, ...overrides };
+}
+
+function fakeOperations(
+  capture: (path: string) => WindowsFileIdentity,
+): WindowsFileOperations {
+  return {
+    captureFileIdentity: capture,
+    deleteFileIfMatches: () => {
+      throw new Error("not used by file identity hydration");
+    },
+    holdFileIfMatches: () => {
+      throw new Error("not used by file identity hydration");
+    },
   };
 }
 
@@ -37,62 +60,144 @@ test("compares exact nonzero inode identities by value on every platform", () =>
   assert.equal(sameStableFileIdentity(expected, identity({ nlink: 2n }), "win32"), true);
 });
 
-test("uses only canonical Windows File IDs for zero-inode fallback", () => {
-  const expected = identity({ ino: 0n, windowsFileId: FILE_ID });
-  const matchingNumbers: FileIdentity = {
-    dev: 1,
-    ino: 0,
-    nlink: 1,
-    windowsFileId: FILE_ID,
-  };
-
-  assert.equal(hasComparableFileIdentity(expected, "win32"), true);
-  assert.equal(hasComparableFileIdentity(expected, "linux"), false);
-  assert.equal(sameStableFileIdentity(expected, matchingNumbers, "win32"), true);
-  assert.equal(sameStableFileIdentity(expected, matchingNumbers, "linux"), false);
-  assert.equal(sameStableFileIdentity(expected, identity({ windowsFileId: FILE_ID }), "win32"), false);
-  assert.equal(sameStableFileIdentity(expected, identity({ ino: 0n, windowsFileId: OTHER_FILE_ID }), "win32"), false);
-  assert.equal(sameStableFileIdentity(expected, identity({ ino: 0n, dev: 2n, windowsFileId: FILE_ID }), "win32"), false);
-  assert.equal(sameStableFileIdentity(expected, identity({ ino: 0n, nlink: 2n, windowsFileId: FILE_ID }), "win32"), false);
-
-  for (const malformed of [
-    undefined,
-    "0x1234",
-    `0x${"a".repeat(65)}`,
-    "not-a-file-id",
-  ]) {
-    assert.equal(
-      hasComparableFileIdentity(identity({ ino: 0n, windowsFileId: malformed }), "win32"),
-      false,
-    );
-  }
-});
-
-test("canonicalizes Windows File IDs on the identity instead of retaining them out of band", async () => {
+test("hydrates a Windows zero inode observation from the native file identity", async () => {
+  const calls: string[] = [];
   const original = identity({ ino: 0n });
   const hydrated = await hydrateWindowsFileIdentity(
-    "C:\\work\\active.toml",
+    "C:\\codex\\config.toml",
     original,
     {
       platform: "win32",
-      systemRoot: "C:\\Windows",
-      runner: async () => ({ stdout: "File ID is 0X0123456789ABCDEF\r\n" }),
+      windowsFileOperations: fakeOperations((path) => {
+        calls.push(path);
+        return nativeIdentity();
+      }),
     },
   );
-  const canonical = identity({ ino: 0n, windowsFileId: FILE_ID });
-  const canonicalizable = identity({ ino: 0n, windowsFileId: "0X0123456789ABCDEF" });
-  const timestampOnly = {
-    ...identity({ ino: 0n }),
-    birthtimeNs: 1n,
-  } as FileIdentity;
 
-  assert.equal(original.windowsFileId, undefined);
-  assert.equal(hydrated.windowsFileId, FILE_ID);
-  assert.equal(hasComparableFileIdentity(original, "win32"), false);
-  assert.equal(sameStableFileIdentity(original, hydrated, "win32"), false);
-  assert.equal(hasComparableFileIdentity(canonicalizable, "win32"), true);
-  assert.equal(sameStableFileIdentity(canonical, canonicalizable, "win32"), true);
-  assert.equal(hasComparableFileIdentity(timestampOnly, "win32"), false);
+  assert.deepEqual(calls, ["C:\\codex\\config.toml"]);
+  assert.equal(original.windowsFileIdentity, undefined);
+  assert.deepEqual(hydrated.windowsFileIdentity, NATIVE_IDENTITY);
+  assert.equal(hasComparableFileIdentity(hydrated, "win32"), true);
+});
+
+test("compares complete native Windows identities for zero inode observations", () => {
+  const first = identity({ ino: 0n, windowsFileIdentity: nativeIdentity() });
+  const sameFileOnDifferentDeviceNumber = identity({
+    dev: 999n,
+    ino: 0n,
+    windowsFileIdentity: nativeIdentity(),
+  });
+  const differentVolume = identity({
+    ino: 0n,
+    windowsFileIdentity: nativeIdentity({ volumeSerial: "0000000000000042" }),
+  });
+  const differentFile = identity({
+    ino: 0n,
+    windowsFileIdentity: nativeIdentity({ fileId: "fedcba9876543210fedcba9876543210" }),
+  });
+  const differentLinkCount = identity({
+    ino: 0n,
+    nlink: 2n,
+    windowsFileIdentity: nativeIdentity({ linkCount: 2n }),
+  });
+
+  assert.equal(sameStableFileIdentity(first, sameFileOnDifferentDeviceNumber, "win32"), true);
+  assert.equal(sameStableFileIdentity(first, differentVolume, "win32"), false);
+  assert.equal(sameStableFileIdentity(first, differentFile, "win32"), false);
+  assert.equal(sameStableFileIdentity(first, differentLinkCount, "win32"), false);
+});
+
+test("rejects missing native identities and mixed zero and nonzero inode observations", () => {
+  const nativeZeroInode = identity({ ino: 0n, windowsFileIdentity: nativeIdentity() });
+  const missingNativeIdentity = identity({ ino: 0n });
+  const nonzeroInode = identity();
+
+  assert.equal(hasComparableFileIdentity(missingNativeIdentity, "win32"), false);
+  assert.equal(hasComparableFileIdentity(nativeZeroInode, "linux"), false);
+  assert.equal(sameStableFileIdentity(nativeZeroInode, missingNativeIdentity, "win32"), false);
+  assert.equal(sameStableFileIdentity(nativeZeroInode, nonzeroInode, "win32"), false);
+});
+
+test("rejects hand-crafted zero inode native identities outside the one-link boundary", () => {
+  const trusted = identity({ ino: 0n, windowsFileIdentity: nativeIdentity() });
+  const mismatchedLinkCount = identity({
+    ino: 0n,
+    nlink: 1n,
+    windowsFileIdentity: nativeIdentity({ linkCount: 2n }),
+  });
+  const multipleLinks = identity({
+    ino: 0n,
+    nlink: 2n,
+    windowsFileIdentity: nativeIdentity({ linkCount: 2n }),
+  });
+
+  assert.equal(hasComparableFileIdentity(mismatchedLinkCount, "win32"), false);
+  assert.equal(hasComparableFileIdentity(multipleLinks, "win32"), false);
+  assert.equal(sameStableFileIdentity(trusted, mismatchedLinkCount, "win32"), false);
+  assert.equal(sameStableFileIdentity(trusted, multipleLinks, "win32"), false);
+});
+
+test("fails closed when native and Node link counts differ", async () => {
+  let calls = 0;
+  await assertRedactedFileIdentityFailure(
+    () => hydrateWindowsFileIdentity(
+      "C:\\sensitive\\config.toml",
+      identity({ ino: 0n, nlink: 1n }),
+      {
+        platform: "win32",
+        windowsFileOperations: fakeOperations(() => {
+          calls += 1;
+          return nativeIdentity({ linkCount: 2n });
+        }),
+      },
+    ),
+    "C:\\sensitive\\config.toml",
+  );
+  assert.equal(calls, 1);
+});
+
+test("does not invoke the native addon outside the zero inode Windows path", async () => {
+  let calls = 0;
+  const operations = fakeOperations(() => {
+    calls += 1;
+    return nativeIdentity();
+  });
+  const zeroInode = identity({ ino: 0n });
+  const nonzeroInode = identity();
+
+  assert.strictEqual(
+    await hydrateWindowsFileIdentity("C:\\codex\\config.toml", zeroInode, {
+      platform: "linux",
+      windowsFileOperations: operations,
+    }),
+    zeroInode,
+  );
+  assert.strictEqual(
+    await hydrateWindowsFileIdentity("C:\\codex\\config.toml", nonzeroInode, {
+      platform: "win32",
+      windowsFileOperations: operations,
+    }),
+    nonzeroInode,
+  );
+  assert.equal(calls, 0);
+});
+
+test("redacts native Windows identity failures", async () => {
+  const targetPath = "C:\\sensitive\\config.toml";
+  let calls = 0;
+  await assertRedactedFileIdentityFailure(
+    () => hydrateWindowsFileIdentity(targetPath, identity({ ino: 0n }), {
+      platform: "win32",
+      windowsFileOperations: fakeOperations(() => {
+        calls += 1;
+        throw new Error(`${targetPath} leaked-native-error`);
+      }),
+    }),
+    targetPath,
+    "leaked-native-error",
+  );
+  assert.equal(calls, 1);
 });
 
 test("rejects unsafe or negative numeric identity values", () => {
@@ -115,185 +220,6 @@ test("rejects unsafe or negative numeric identity values", () => {
     assert.equal(hasComparableFileIdentity(identity({ dev: negative }), "linux"), false);
     assert.equal(hasComparableFileIdentity(identity({ ino: negative }), "linux"), false);
     assert.equal(hasComparableFileIdentity(identity({ nlink: negative }), "linux"), false);
-  }
-});
-
-test("hydrates zero-inode Windows identities through the constrained File ID command", async () => {
-  const calls: Array<{ file: string; args: readonly string[]; options: object }> = [];
-  const runner: WindowsFileIdCommandRunner = async (file, args, options) => {
-    calls.push({ file, args, options });
-    return { stdout: "File ID is 0x0123456789ABCDEF\r\n" };
-  };
-  const original = identity({ ino: 0n });
-
-  const hydrated = await hydrateWindowsFileIdentity(
-    "C:\\work\\profiles\\..\\active.toml",
-    original,
-    { platform: "win32", systemRoot: "C:\\Windows", runner },
-  );
-
-  assert.deepEqual(calls, [
-    {
-      file: "C:\\Windows\\System32\\fsutil.exe",
-      args: ["file", "queryFileID", "C:\\work\\active.toml"],
-      options: { shell: false, windowsHide: true, timeout: 2000, maxBuffer: 8192 },
-    },
-  ]);
-  assert.equal(original.windowsFileId, undefined);
-  assert.equal(hydrated.windowsFileId, FILE_ID);
-  assert.equal(sameStableFileIdentity(original, hydrated, "win32"), false);
-});
-
-test("hydrates through a canonical nondefault Windows system root", async () => {
-  const calls: Array<{ file: string; args: readonly string[]; options: object }> = [];
-  const runner: WindowsFileIdCommandRunner = async (file, args, options) => {
-    calls.push({ file, args, options });
-    return { stdout: FILE_ID };
-  };
-
-  const hydrated = await hydrateWindowsFileIdentity(
-    "C:\\work\\active.toml",
-    identity({ ino: 0n }),
-    { platform: "win32", systemRoot: "C:\\WINNT", runner },
-  );
-
-  assert.equal(hydrated.windowsFileId, FILE_ID);
-  assert.deepEqual(calls, [
-    {
-      file: "C:\\WINNT\\System32\\fsutil.exe",
-      args: ["file", "queryFileID", "C:\\work\\active.toml"],
-      options: { shell: false, windowsHide: true, timeout: 2000, maxBuffer: 8192 },
-    },
-  ]);
-});
-
-test("does not permit a production SystemRoot override to launch the default command", async () => {
-  let calls = 0;
-  const originalExecFile = childProcess.execFile;
-  childProcess.execFile = ((...args: unknown[]) => {
-    calls += 1;
-    const callback = args.at(-1);
-    if (typeof callback === "function") {
-      callback(new Error("controlled default command runner"), "");
-    }
-    return undefined;
-  }) as typeof childProcess.execFile;
-  syncBuiltinESMExports();
-
-  try {
-    await assertRedactedFileIdentityFailure(
-      () => hydrateWindowsFileIdentity(
-        "C:\\work\\active.toml",
-        identity({ ino: 0n }),
-        { platform: "win32", systemRoot: "C:\\attacker" },
-      ),
-    );
-  } finally {
-    childProcess.execFile = originalExecFile;
-    syncBuiltinESMExports();
-  }
-
-  assert.equal(calls, 0);
-});
-
-test("rejects noncanonical Windows system roots before the File ID runner", async () => {
-  let calls = 0;
-  const runner: WindowsFileIdCommandRunner = async () => {
-    calls += 1;
-    return { stdout: FILE_ID };
-  };
-
-  for (const systemRoot of [
-    "C:\\Windows\\..\\attacker",
-    "C:\\Windows\\.\\attacker",
-    "C:\\Windows\\System32\\..\\attacker",
-    "C:/Windows",
-    "C:\\Windows\\",
-    "C:\\attacker\\",
-    "C:\\",
-    "C:Windows",
-    "Windows",
-    "\\\\server\\share\\Windows",
-  ]) {
-    const result = await hydrateWindowsFileIdentity(
-      "C:\\work\\active.toml",
-      identity({ ino: 0n }),
-      { platform: "win32", systemRoot, runner },
-    ).then(
-      () => undefined,
-      (error: unknown) => error,
-    );
-
-    assert.equal(result instanceof FileIdentityError, true, systemRoot);
-  }
-
-  assert.equal(calls, 0);
-});
-
-test("does not query File IDs outside the zero-inode Windows path", async () => {
-  let calls = 0;
-  const runner: WindowsFileIdCommandRunner = async () => {
-    calls += 1;
-    return { stdout: FILE_ID };
-  };
-  const zeroInode = identity({ ino: 0n });
-  const nonzeroInode = identity();
-
-  assert.strictEqual(
-    await hydrateWindowsFileIdentity("C:\\work\\active.toml", zeroInode, {
-      platform: "linux",
-      systemRoot: "C:\\Windows",
-      runner,
-    }),
-    zeroInode,
-  );
-  assert.strictEqual(
-    await hydrateWindowsFileIdentity("C:\\work\\active.toml", nonzeroInode, {
-      platform: "win32",
-      systemRoot: "C:\\Windows",
-      runner,
-    }),
-    nonzeroInode,
-  );
-  assert.equal(calls, 0);
-});
-
-test("redacts Windows File ID root, query, and parser failures", async () => {
-  const targetPath = "C:\\sensitive\\active.toml";
-  const baseOptions = { platform: "win32" as const, systemRoot: "C:\\Windows" };
-
-  await assertRedactedFileIdentityFailure(
-    () => hydrateWindowsFileIdentity(targetPath, identity({ ino: 0n }), {
-      ...baseOptions,
-      systemRoot: "not-an-absolute-windows-root",
-      runner: async () => ({ stdout: FILE_ID }),
-    }),
-    targetPath,
-  );
-  await assertRedactedFileIdentityFailure(
-    () => hydrateWindowsFileIdentity(targetPath, identity({ ino: 0n }), {
-      ...baseOptions,
-      runner: async () => {
-        throw new Error(`${targetPath} leaked-command-output`);
-      },
-    }),
-    targetPath,
-    "leaked-command-output",
-  );
-
-  for (const stdout of [
-    "missing file id",
-    `${FILE_ID}\n${OTHER_FILE_ID}`,
-    "0x0123456789abcdeg",
-    "x".repeat(8193),
-  ]) {
-    await assertRedactedFileIdentityFailure(
-      () => hydrateWindowsFileIdentity(targetPath, identity({ ino: 0n }), {
-        ...baseOptions,
-        runner: async () => ({ stdout }),
-      }),
-      targetPath,
-    );
   }
 });
 

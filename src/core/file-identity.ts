@@ -1,39 +1,22 @@
-import { execFile } from "node:child_process";
-import { win32 } from "node:path";
+import {
+  createWindowsFileOperations,
+  type WindowsFileIdentity,
+  type WindowsFileOperations,
+} from "./windows-file-operations";
 
-const FILE_ID_PATTERN = /(?<![0-9A-Za-z])0[xX][0-9A-Fa-f]{16,64}(?![0-9A-Za-z])/g;
-const CANONICALIZABLE_FILE_ID_PATTERN = /^0[xX][0-9A-Fa-f]{16,64}$/;
-const FILE_ID_TIMEOUT_MS = 2_000;
-const FILE_ID_MAX_BUFFER = 8_192;
+const VOLUME_SERIAL_PATTERN = /^[0-9a-f]{16}$/;
+const FILE_ID_PATTERN = /^[0-9a-f]{32}$/;
 
 export interface FileIdentity {
   readonly dev: number | bigint;
   readonly ino: number | bigint;
   readonly nlink: number | bigint;
-  readonly windowsFileId?: string;
+  readonly windowsFileIdentity?: WindowsFileIdentity;
 }
-
-export interface WindowsFileIdCommandOptions {
-  readonly shell: false;
-  readonly windowsHide: true;
-  readonly timeout: number;
-  readonly maxBuffer: number;
-}
-
-export interface WindowsFileIdCommandResult {
-  readonly stdout: string;
-}
-
-export type WindowsFileIdCommandRunner = (
-  file: string,
-  args: readonly string[],
-  options: WindowsFileIdCommandOptions,
-) => Promise<WindowsFileIdCommandResult>;
 
 export interface HydrateWindowsFileIdentityOptions {
   readonly platform?: NodeJS.Platform;
-  readonly systemRoot?: string;
-  readonly runner?: WindowsFileIdCommandRunner;
+  readonly windowsFileOperations?: WindowsFileOperations;
 }
 
 export class FileIdentityError extends Error {
@@ -59,7 +42,9 @@ export function hasComparableFileIdentity(
     return true;
   }
 
-  return platform === "win32" && getCanonicalWindowsFileId(identity) !== undefined;
+  return platform === "win32" &&
+    hasNativeWindowsFileIdentity(identity.windowsFileIdentity) &&
+    sameIdentityValue(identity.nlink, identity.windowsFileIdentity.linkCount);
 }
 
 export function sameStableFileIdentity(
@@ -78,20 +63,17 @@ export function sameStableFileIdentity(
     return sameIdentityValue(left.dev, right.dev) && sameIdentityValue(left.ino, right.ino);
   }
 
-  if (
-    platform !== "win32" ||
-    !isZero(left.ino) ||
-    !isZero(right.ino) ||
-    !sameIdentityValue(left.dev, right.dev)
-  ) {
+  if (platform !== "win32" || !isZero(left.ino) || !isZero(right.ino)) {
     return false;
   }
 
-  const leftFileId = getCanonicalWindowsFileId(left);
-  const rightFileId = getCanonicalWindowsFileId(right);
-  return leftFileId !== undefined &&
-    leftFileId === rightFileId &&
-    sameIdentityValue(left.nlink, right.nlink);
+  const leftWindowsIdentity = left.windowsFileIdentity;
+  const rightWindowsIdentity = right.windowsFileIdentity;
+  return leftWindowsIdentity !== undefined &&
+    rightWindowsIdentity !== undefined &&
+    leftWindowsIdentity.volumeSerial === rightWindowsIdentity.volumeSerial &&
+    leftWindowsIdentity.fileId === rightWindowsIdentity.fileId &&
+    leftWindowsIdentity.linkCount === rightWindowsIdentity.linkCount;
 }
 
 export async function hydrateWindowsFileIdentity(
@@ -104,40 +86,17 @@ export async function hydrateWindowsFileIdentity(
     return identity;
   }
 
-  if (typeof path !== "string" || !win32.isAbsolute(path)) {
-    throw new FileIdentityError();
-  }
-
-  const runner = options.runner;
-  if (runner === undefined && options.systemRoot !== undefined) {
-    throw new FileIdentityError();
-  }
-
-  const systemRoot = runner === undefined
-    ? process.env.SystemRoot
-    : options.systemRoot ?? process.env.SystemRoot;
-  if (!isValidWindowsSystemRoot(systemRoot)) {
-    throw new FileIdentityError();
-  }
-  const fsutilPath = getWindowsFsutilPath(systemRoot);
-  if (fsutilPath === undefined) {
-    throw new FileIdentityError();
-  }
-
   try {
-    const targetPath = win32.normalize(path);
-    const result = await (runner ?? runWindowsFileIdCommand)(
-      fsutilPath,
-      ["file", "queryFileID", targetPath],
-      {
-        shell: false,
-        windowsHide: true,
-        timeout: FILE_ID_TIMEOUT_MS,
-        maxBuffer: FILE_ID_MAX_BUFFER,
-      },
-    );
-    const windowsFileId = parseWindowsFileId(result.stdout);
-    return { ...identity, windowsFileId };
+    const captured = (options.windowsFileOperations ?? createWindowsFileOperations())
+      .captureFileIdentity(path);
+    const windowsFileIdentity = snapshotWindowsFileIdentity(captured);
+    if (
+      windowsFileIdentity === undefined ||
+      !sameIdentityValue(identity.nlink, windowsFileIdentity.linkCount)
+    ) {
+      throw new FileIdentityError();
+    }
+    return { ...identity, windowsFileIdentity };
   } catch (error: unknown) {
     if (error instanceof FileIdentityError) {
       throw error;
@@ -163,58 +122,31 @@ function isZero(value: number | bigint): boolean {
   return value === 0 || value === 0n;
 }
 
-function getCanonicalWindowsFileId(identity: FileIdentity): string | undefined {
-  return typeof identity.windowsFileId === "string" &&
-    CANONICALIZABLE_FILE_ID_PATTERN.test(identity.windowsFileId)
-    ? identity.windowsFileId.toLowerCase()
-    : undefined;
+function snapshotWindowsFileIdentity(value: unknown): WindowsFileIdentity | undefined {
+  if (!hasNativeWindowsFileIdentity(value)) {
+    return undefined;
+  }
+
+  return Object.freeze({
+    volumeSerial: value.volumeSerial,
+    fileId: value.fileId,
+    linkCount: value.linkCount,
+  });
 }
 
-function isValidWindowsSystemRoot(value: string | undefined): value is string {
-  if (typeof value !== "string" || value.includes("/") || !win32.isAbsolute(value)) {
+function hasNativeWindowsFileIdentity(value: unknown): value is WindowsFileIdentity {
+  if (!isRecord(value)) {
     return false;
   }
 
-  const normalized = win32.normalize(value);
-  const parsed = win32.parse(normalized);
-  const segments = normalized.slice(parsed.root.length).split("\\");
-  return normalized === value &&
-    /^[A-Za-z]:\\$/.test(parsed.root) &&
-    segments.every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
+  return typeof value.volumeSerial === "string" &&
+    VOLUME_SERIAL_PATTERN.test(value.volumeSerial) &&
+    typeof value.fileId === "string" &&
+    FILE_ID_PATTERN.test(value.fileId) &&
+    typeof value.linkCount === "bigint" &&
+    value.linkCount === 1n;
 }
 
-function getWindowsFsutilPath(systemRoot: string): string | undefined {
-  const fsutilPath = win32.join(systemRoot, "System32", "fsutil.exe");
-  return win32.relative(systemRoot, fsutilPath).toLowerCase() === "system32\\fsutil.exe"
-    ? fsutilPath
-    : undefined;
-}
-
-function parseWindowsFileId(stdout: string): string {
-  if (Buffer.byteLength(stdout, "utf8") > FILE_ID_MAX_BUFFER) {
-    throw new FileIdentityError();
-  }
-
-  const matches = stdout.match(FILE_ID_PATTERN);
-  if (matches === null || matches.length !== 1) {
-    throw new FileIdentityError();
-  }
-
-  return matches[0].toLowerCase();
-}
-
-function runWindowsFileIdCommand(
-  file: string,
-  args: readonly string[],
-  options: WindowsFileIdCommandOptions,
-): Promise<WindowsFileIdCommandResult> {
-  return new Promise((resolve, reject) => {
-    execFile(file, [...args], options, (error, stdout) => {
-      if (error !== null) {
-        reject(error);
-        return;
-      }
-      resolve({ stdout });
-    });
-  });
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }

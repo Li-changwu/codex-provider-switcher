@@ -442,14 +442,14 @@ async function hydrateFileIdentity(
   options: HydrateWindowsFileIdentityOptions | undefined,
 ): Promise<FileIdentityStats> {
   const identity = await hydrateWindowsFileIdentity(logicalPath, stats, options);
-  if (identity.windowsFileId === undefined) {
+  if (identity.windowsFileIdentity === undefined) {
     return stats as FileIdentityStats;
   }
 
-  Object.defineProperty(stats, "windowsFileId", {
+  Object.defineProperty(stats, "windowsFileIdentity", {
     configurable: false,
     enumerable: true,
-    value: identity.windowsFileId,
+    value: identity.windowsFileIdentity,
     writable: false,
   });
   return stats as FileIdentityStats;
