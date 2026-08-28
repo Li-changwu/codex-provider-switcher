@@ -871,14 +871,13 @@ async function deleteTrustedProfileFile(
     try {
       result = windowsFileOperations.deleteFileIfMatches(path, expectedWindowsIdentity);
     } catch {
-      let afterNativeFailure: ProfileFileIdentityStats | undefined;
       try {
-        afterNativeFailure = await lstatBigIntIfPresent(path, fileIdentityOptions);
-      } catch {
+        await nativeLstat(path, { bigint: true });
+      } catch (error: unknown) {
+        if (isMissingFileError(error)) {
+          throw missingProfileFileError();
+        }
         throw profilePersistenceError();
-      }
-      if (afterNativeFailure === undefined) {
-        throw missingProfileFileError();
       }
       throw profilePersistenceError();
     }

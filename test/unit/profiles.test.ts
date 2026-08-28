@@ -255,7 +255,7 @@ test("treats a missing zero-inode index temporary file after native delete failu
       const windowsFileOperations = new RecordingWindowsFileOperations([
         {
           matches: (path) => basename(path).startsWith(".index.json.tmp-"),
-          action: "remove-and-throw",
+          action: "disappear-and-throw",
         },
       ]);
       const store = new ProfileStore(layout, {
@@ -278,6 +278,47 @@ test("treats a missing zero-inode index temporary file after native delete failu
       assert.notEqual(temporaryDelete, undefined);
       await assert.rejects(() => lstat(temporaryDelete!.path), { code: "ENOENT" });
       assert.deepEqual(fileSystem.unlinked, []);
+    });
+  });
+});
+
+test("preserves a present zero-inode index temporary file after native delete failure without rereading it", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  await withZeroInodeProfileStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const fileSystem = new NoPostFailureReadFileSystem();
+      const windowsFileOperations = new RecordingWindowsFileOperations([
+        {
+          matches: (path) => basename(path).startsWith(".index.json.tmp-"),
+          action: "throw-and-keep",
+        },
+      ]);
+      const store = new ProfileStore(layout, {
+        fileSystem,
+        fileIdentityOptions: zeroInodeProfileIdentityOptions(windowsFileOperations),
+      });
+      const indexPath = join(layout.switcherDir, "profiles", "index.json");
+      const writeAtomically = Reflect.get(store, "writeAtomically") as (
+        path: string,
+        contents: string,
+      ) => Promise<unknown>;
+
+      await assert.rejects(
+        () => writeAtomically.call(store, indexPath, "{}\n"),
+        (error: unknown) => error instanceof ProfileStoreError && error.code === "rollback-failed",
+      );
+
+      const temporaryDelete = windowsFileOperations.deleteRequests.find(({ path }) =>
+        basename(path).startsWith(".index.json.tmp-"),
+      );
+      assert.notEqual(temporaryDelete, undefined);
+      assert.equal(await readFile(temporaryDelete!.path, "utf8"), "{}\n");
+      assert.deepEqual(fileSystem.unlinked, []);
+      assert.deepEqual(fileSystem.temporaryReads, []);
+      assert.deepEqual(windowsFileOperations.capturesAfterDeleteFailure, []);
     });
   });
 });
@@ -435,7 +476,7 @@ test("continues stale zero-inode Profile lock recovery after native delete obser
       await writeFile(lockPath, JSON.stringify({ pid: 999999, createdAt: 0 }), "utf8");
       const lockFileSystem = new RecordingProfileLockFileSystem();
       const windowsFileOperations = new RecordingWindowsFileOperations([
-        { matches: (path) => path === lockPath, action: "remove-and-throw" },
+        { matches: (path) => path === lockPath, action: "disappear-and-throw" },
       ]);
       const store = new ProfileStore(layout, {
         fileIdentityOptions: zeroInodeProfileIdentityOptions(windowsFileOperations),
@@ -2457,26 +2498,31 @@ interface WindowsReplacementRule {
   readonly replacementContents: string;
 }
 
-interface WindowsRemoveAndThrowRule {
+interface WindowsDeleteFailureRule {
   readonly matches: (path: string) => boolean;
-  readonly action: "remove-and-throw";
+  readonly action: "disappear-and-throw" | "throw-and-keep";
 }
 
-type WindowsDeleteRule = WindowsReplacementRule | WindowsRemoveAndThrowRule;
+type WindowsDeleteRule = WindowsReplacementRule | WindowsDeleteFailureRule;
 
 class RecordingWindowsFileOperations implements WindowsFileOperations {
   readonly capturedPaths: string[] = [];
+  readonly capturesAfterDeleteFailure: string[] = [];
   readonly deleteRequests: Array<{
     path: string;
     expected: WindowsFileIdentity;
   }> = [];
   readonly replacements: Array<{ path: string; contents: string }> = [];
   private readonly processedRules = new Set<WindowsDeleteRule>();
+  private deleteFailureObserved = false;
 
   constructor(private readonly deletionRules: readonly WindowsDeleteRule[] = []) {}
 
   captureFileIdentity(path: string): WindowsFileIdentity {
     this.capturedPaths.push(path);
+    if (this.deleteFailureObserved) {
+      this.capturesAfterDeleteFailure.push(path);
+    }
     return captureProfileWindowsFileIdentity(path);
   }
 
@@ -2501,8 +2547,11 @@ class RecordingWindowsFileOperations implements WindowsFileOperations {
       (candidate) => !this.processedRules.has(candidate) && candidate.matches(path),
     );
     if (rule !== undefined && "action" in rule) {
-      unlinkSync(path);
       this.processedRules.add(rule);
+      this.deleteFailureObserved = true;
+      if (rule.action === "disappear-and-throw") {
+        unlinkSync(path);
+      }
       throw new Error("controlled native delete failure");
     }
     if (rule !== undefined) {
@@ -3129,6 +3178,18 @@ class FailingIndexProfileFileSystem extends RecordingProfileFileSystem {
       throw new Error("temporary cleanup failed");
     }
     await unlink(path);
+  }
+}
+
+class NoPostFailureReadFileSystem extends FailingIndexProfileFileSystem {
+  readonly temporaryReads: string[] = [];
+
+  override async readFile(path: string): Promise<string> {
+    if (basename(path).startsWith(".index.json.tmp-")) {
+      this.temporaryReads.push(path);
+      throw new Error("temporary contents must not be read after native delete failure");
+    }
+    return super.readFile(path);
   }
 }
 
