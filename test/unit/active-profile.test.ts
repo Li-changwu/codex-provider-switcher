@@ -135,12 +135,13 @@ test("rejects a replaced zero-inode active Profile file after its path is checke
   });
 });
 
-test("rejects an opened zero-inode active Profile file after its path is replaced", async (t) => {
+test("keeps an opened zero-inode active Profile file authoritative when replacement is denied", async (t) => {
   if (process.platform !== "win32") {
     t.skip("Windows File IDs are not available on this platform.");
     return;
   }
   let replaceAfterOpen = false;
+  let replacementError: NodeJS.ErrnoException | undefined;
   let activeProfilePath: string | undefined;
   await withZeroInodeStats(async () => {
     await withTemporaryLayout(async (layout) => {
@@ -155,9 +156,17 @@ test("rejects an opened zero-inode active Profile file after its path is replace
       await store.set("official");
       replaceAfterOpen = true;
 
-      await assert.rejects(
-        () => store.get(),
-        (error: unknown) => error instanceof ActiveProfileStoreError && error.code === "unsafe-state",
+      assert.deepEqual(await store.get(), {
+        version: 1,
+        profileId: "official",
+        updatedAt: "2026-08-25T00:00:00.000Z",
+      });
+      assert.ok(replacementError);
+      assert.ok(
+        replacementError.code === "EPERM" ||
+          replacementError.code === "EACCES" ||
+          replacementError.code === "EBUSY",
+        `unexpected replacement error: ${replacementError.code}`,
       );
     });
   }, {
@@ -172,7 +181,13 @@ test("rejects an opened zero-inode active Profile file after its path is replace
         '{\n  "version": 1,\n  "profileId": "replacement",\n  "updatedAt": "2026-08-25T00:00:00.000Z"\n}\n',
         "utf8",
       );
-      await rename(replacementPath, path);
+      try {
+        await rename(replacementPath, path);
+      } catch (error: unknown) {
+        replacementError = error as NodeJS.ErrnoException;
+      } finally {
+        await rm(replacementPath, { force: true });
+      }
     },
   });
 });
@@ -403,8 +418,13 @@ async function withZeroInodeStats(
       await hooks.beforeOpen?.(path, args[1]);
     }
     const handle = await originalOpen(...args);
-    if (typeof path === "string") {
-      await hooks.afterOpen?.(path, args[1]);
+    try {
+      if (typeof path === "string") {
+        await hooks.afterOpen?.(path, args[1]);
+      }
+    } catch (error: unknown) {
+      await handle.close();
+      throw error;
     }
     return new Proxy(handle, {
       get(target, property) {

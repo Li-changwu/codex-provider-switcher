@@ -138,10 +138,13 @@ git commit -m "fix: adopt native Windows file identities"
 
 The fake `captureFileIdentity(path)` must synchronously read the current path's real
 `BigIntStats` with `lstatSync`, rather than accepting a map populated by a file
-handle's `stat`. Add a zero-inode ActiveProfile test that opens file A, atomically
-renames file B onto the logical path before the first handle stat, and asserts the
-read rejects with `unsafe-state`. This test establishes the reviewed race's actual
-observable result: the retained pre-open snapshot for A cannot equal B.
+handle's `stat`. Add a Windows zero-inode ActiveProfile test that opens file A and
+then attempts to atomically rename file B onto the logical path before the first
+handle stat. Node's opened Windows read handle denies that replacement, so assert
+the replacement reports an allowed sharing-violation code (`EPERM`, `EACCES`, or
+`EBUSY`) and that the original record remains readable. The fixture must also close
+the newly created handle before rethrowing an `afterOpen` hook failure, preventing a
+FileHandle resource leak.
 
 Run:
 
@@ -149,8 +152,8 @@ Run:
 npx tsx --test test/unit/active-profile.test.ts --test-name-pattern "opened zero-inode"
 ```
 
-Expected: PASS before any production change; it demonstrates the alleged bypass
-does not reproduce with a path-faithful native identity source.
+Expected: PASS; it records the Windows sharing behavior that prevents the attempted
+replacement and proves the opened original record remains authoritative.
 
 - [x] **Step 2: Add a failing mutable-accessor identity test**
 
