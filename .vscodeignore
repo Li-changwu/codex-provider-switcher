@@ -8,6 +8,8 @@ esbuild.mjs
 tsconfig.json
 *.ts
 **/*.map
+native/**
+!native/windows-file-ops/windows_file_ops.node
 
 # Ship only the runtime dependency closure. sqlite3 install/build tooling is excluded.
 node_modules/**

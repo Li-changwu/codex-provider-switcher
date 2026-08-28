@@ -2,3 +2,5 @@
 node_modules/
 dist/
 *.vsix
+native/windows-file-ops/build/
+native/windows-file-ops/windows_file_ops.node

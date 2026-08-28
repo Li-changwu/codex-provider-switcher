@@ -3,6 +3,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { buildWindowsFileOps } from "../../scripts/build-windows-file-ops.mjs";
 
 const packagePath = resolve(
   dirname(fileURLToPath(import.meta.url)),
@@ -82,4 +83,68 @@ test("packages verified platform-specific native dependencies", async () => {
   assert.match(vscodeIgnore, /^!node_modules\/bindings\/bindings\.js$/m);
   assert.match(vscodeIgnore, /^!node_modules\/file-uri-to-path\/index\.js$/m);
 
+});
+
+test("pins the Windows file-operations build and exposes only its staged addon", async () => {
+  const manifest = JSON.parse(await readFile(packagePath, "utf8")) as {
+    devDependencies?: Record<string, string | undefined>;
+    scripts?: Record<string, string | undefined>;
+  };
+  const gitIgnore = await readFile(
+    resolve(dirname(vscodeIgnorePath), ".gitignore"),
+    "utf8",
+  );
+  const vscodeIgnore = await readFile(vscodeIgnorePath, "utf8");
+
+  assert.equal(manifest.devDependencies?.["node-gyp"], "12.4.0");
+  assert.equal(
+    manifest.scripts?.["build:windows-file-ops"],
+    "node scripts/build-windows-file-ops.mjs",
+  );
+  assert.match(gitIgnore, /^native\/windows-file-ops\/build\/$/m);
+  assert.match(gitIgnore, /^native\/windows-file-ops\/windows_file_ops\.node$/m);
+  assert.match(vscodeIgnore, /^native\/\*\*$/m);
+
+  const nativeAllowlistEntries = vscodeIgnore
+    .split(/\r?\n/)
+    .filter((entry) => entry.startsWith("!native/"));
+  assert.deepEqual(nativeAllowlistEntries, [
+    "!native/windows-file-ops/windows_file_ops.node",
+  ]);
+});
+
+test("refuses unsupported Windows-addon hosts before filesystem mutation", async () => {
+  let filesystemMutations = 0;
+  const fsOps = {
+    async rm(): Promise<void> {
+      filesystemMutations += 1;
+      throw new Error("filesystem mutation occurred");
+    },
+    async stat(): Promise<never> {
+      throw new Error("stat should not run");
+    },
+    async copyFile(): Promise<never> {
+      throw new Error("copy should not run");
+    },
+  };
+
+  for (const [platform, arch] of [
+    ["linux", "x64"],
+    ["win32", "arm64"],
+  ] as const) {
+    await assert.rejects(
+      buildWindowsFileOps({
+        platform,
+        arch,
+        projectRoot: "C:\\extension-root",
+        fsOps,
+        run: async () => {
+          throw new Error("node-gyp should not run");
+        },
+      }),
+      /requires a win32-x64 host/,
+    );
+  }
+
+  assert.equal(filesystemMutations, 0);
 });
