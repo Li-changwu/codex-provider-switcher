@@ -191,7 +191,7 @@ export class ProfileStore {
       };
 
       await this.ensureTrustedProfileConfig(profile.id, false, reservation.directory);
-      await this.writeNewConfigExclusively(
+      const config = await this.writeNewConfigExclusively(
         profile.configFile,
         input.configText,
         reservation,
@@ -204,6 +204,11 @@ export class ProfileStore {
             undefined,
             2,
           )}\n`,
+          () => this.assertTrustedProfileConfigIdentity(
+            profile.id,
+            config,
+            reservation.directory,
+          ),
         );
       } catch {
         throw profileRollbackError(
@@ -283,7 +288,7 @@ export class ProfileStore {
         providerId: input.providerId,
         updatedAt: this.now(),
       };
-      await this.writeAtomically(updated.configFile, input.configText);
+      const config = await this.writeAtomically(updated.configFile, input.configText);
       try {
         const nextProfiles = [...profiles];
         nextProfiles[index] = updated;
@@ -294,6 +299,7 @@ export class ProfileStore {
             undefined,
             2,
           )}\n`,
+          () => this.assertTrustedProfileConfigIdentity(current.id, config),
         );
       } catch {
         throw profileRollbackError(
@@ -313,12 +319,12 @@ export class ProfileStore {
     let contents: string;
     try {
       await this.ensureTrustedProfileRoot(false);
-      await this.ensureTrustedMetadataFile(this.indexPath);
-      contents = await this.fileSystem.readFile(this.indexPath);
-    } catch (error: unknown) {
-      if (isMissingFileError(error)) {
+      const trustedContents = await this.readTrustedMetadataFile(this.indexPath);
+      if (trustedContents === undefined) {
         return [];
       }
+      contents = trustedContents;
+    } catch (error: unknown) {
       throw new ProfileStoreError(
         "index-read-failed",
         "Could not read the profile index.",
@@ -345,7 +351,11 @@ export class ProfileStore {
     }
   }
 
-  private async writeAtomically(path: string, contents: string): Promise<void> {
+  private async writeAtomically(
+    path: string,
+    contents: string,
+    beforePublish?: () => Promise<void>,
+  ): Promise<ProfileFileIdentityStats> {
     await this.ensureTrustedProfileWriteTarget(path);
     const temporaryPath = join(
       dirname(path),
@@ -376,11 +386,13 @@ export class ProfileStore {
       ) {
         throw profilePersistenceError();
       }
+      await beforePublish?.();
       await this.fileSystem.rename(temporaryPath, path);
       const published = await lstatBigIntWithFileIdentity(path, this.fileIdentityOptions);
       if (!isSafeProfileFile(published) || !sameProfileFileIdentity(temporaryStats, published)) {
         throw profilePersistenceError();
       }
+      return published;
     } catch (error: unknown) {
       let cleanupError: unknown;
       try {
@@ -415,7 +427,7 @@ export class ProfileStore {
     path: string,
     contents: string,
     reservation: ProfileDirectoryReservation,
-  ): Promise<void> {
+  ): Promise<ProfileFileIdentityStats> {
     await this.ensureTrustedProfileWriteTarget(path, reservation.directory);
     try {
       await this.fileSystem.mkdir(dirname(path));
@@ -426,8 +438,17 @@ export class ProfileStore {
       // The Profile is not indexed yet, so exclusive creation avoids overwriting
       // another writer while no visible saved Profile can observe a partial file.
       await this.fileSystem.writeFileExclusive(path, contents, linuxPrivateFileMode);
+      const written = await lstatBigIntWithFileIdentity(path, this.fileIdentityOptions);
+      if (!isSafeProfileFile(written)) {
+        throw profilePersistenceError();
+      }
       await this.assertReservedProfileDirectory(reservation);
       await this.ensureTrustedProfileWriteTarget(path, reservation.directory);
+      const published = await lstatBigIntWithFileIdentity(path, this.fileIdentityOptions);
+      if (!isSafeProfileFile(published) || !sameProfileFileIdentity(written, published)) {
+        throw profilePersistenceError();
+      }
+      return published;
     } catch (error: unknown) {
       if (error instanceof ProfileStoreError && error.code === "rollback-failed") {
         throw error;
@@ -467,6 +488,7 @@ export class ProfileStore {
     const releaseLock = await acquireProfileFileLock(
       this.profilesDir,
       this.lockOptions,
+      this.fileIdentityOptions,
     );
     try {
       await this.ensureTrustedProfileRoot(true);
@@ -624,13 +646,84 @@ export class ProfileStore {
     }
   }
 
+  private async assertTrustedProfileConfigIdentity(
+    id: string,
+    expectedConfig: ProfileFileIdentityStats,
+    expectedDirectory?: ProfileFileIdentityStats,
+  ): Promise<void> {
+    const current = await this.inspectTrustedProfileConfig(
+      id,
+      true,
+      expectedDirectory,
+    );
+    if (!current || !sameProfileFileIdentity(expectedConfig, current.config)) {
+      throw profilePersistenceError();
+    }
+  }
+
   private async ensureTrustedMetadataFile(path: string): Promise<void> {
+    await this.inspectTrustedMetadataFile(path);
+  }
+
+  private async inspectTrustedMetadataFile(
+    path: string,
+  ): Promise<ProfileFileIdentityStats | undefined> {
     const stats = await lstatBigIntIfPresent(path, this.fileIdentityOptions);
     if (
       stats &&
       (!isSafeProfileFile(stats) || !sameResolvedPath(await nativeRealpath(path), path))
     ) {
       throw profilePersistenceError();
+    }
+    return stats;
+  }
+
+  private async readTrustedMetadataFile(path: string): Promise<string | undefined> {
+    let before = await this.inspectTrustedMetadataFile(path);
+    let handle: ProfileReadFileHandle;
+    try {
+      handle = await this.fileSystem.openRead(path);
+    } catch (error: unknown) {
+      if (before === undefined && isMissingFileError(error)) {
+        return undefined;
+      }
+      throw error;
+    }
+    try {
+      const opened = await hydrateProfileFileIdentity(
+        path,
+        await handle.stat(),
+        this.fileIdentityOptions,
+      );
+      if (!isSafeProfileFile(opened)) {
+        throw profilePersistenceError();
+      }
+      if (before === undefined) {
+        before = await this.inspectTrustedMetadataFile(path);
+        if (!before || !sameProfileFileIdentity(before, opened)) {
+          throw profilePersistenceError();
+        }
+      } else if (!sameProfileFileIdentity(before, opened)) {
+        throw profilePersistenceError();
+      }
+      const contents = await handle.readFile();
+      const afterRead = await hydrateProfileFileIdentity(
+        path,
+        await handle.stat(),
+        this.fileIdentityOptions,
+      );
+      const after = await this.inspectTrustedMetadataFile(path);
+      if (
+        !after ||
+        !isSafeProfileFile(afterRead) ||
+        !sameProfileFileIdentity(before, afterRead) ||
+        !sameProfileFileIdentity(before, after)
+      ) {
+        throw profilePersistenceError();
+      }
+      return contents;
+    } finally {
+      await handle.close();
     }
   }
 
@@ -814,12 +907,22 @@ type ProfileLockRelease = () => Promise<void>;
 
 interface ProfileLockLease {
   contents: string;
+  identity: ProfileFileIdentityStats;
   release: ProfileLockRelease;
 }
+
+interface ProfileLockSnapshot {
+  contents: string;
+  identity: ProfileFileIdentityStats;
+  state: ProfileLockReadState;
+}
+
+type ProfileLockReadState = "stable" | "changed-to-different-owner" | "unstable";
 
 async function acquireProfileFileLock(
   profilesDir: string,
   options: ProfileLockOptions,
+  fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
 ): Promise<ProfileLockRelease> {
   const lockPath = join(profilesDir, profileLockFileName);
   const fileSystem = options.fileSystem ?? nativeProfileLockFileSystem;
@@ -845,9 +948,10 @@ async function acquireProfileFileLock(
       fileSystem,
       lockPath,
       clock(),
+      fileIdentityOptions,
     );
     if (acquired) {
-      return acquired;
+      return acquired.release;
     }
 
     await recoverStaleProfileFileLock(
@@ -856,6 +960,7 @@ async function acquireProfileFileLock(
       clock,
       staleLockMs,
       isProcessAlive,
+      fileIdentityOptions,
     );
     if (attempt + 1 < attempts) {
       await delay(retryMs);
@@ -872,19 +977,21 @@ async function tryAcquireProfileFileLock(
   fileSystem: ProfileLockFileSystem,
   lockPath: string,
   createdAt: number,
-): Promise<ProfileLockRelease | undefined> {
-  const lease = await tryAcquireProfileLockLease(
+  fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
+): Promise<ProfileLockLease | undefined> {
+  return tryAcquireProfileLockLease(
     fileSystem,
     lockPath,
     createdAt,
+    fileIdentityOptions,
   );
-  return lease?.release;
 }
 
 async function tryAcquireProfileLockLease(
   fileSystem: ProfileLockFileSystem,
   lockPath: string,
   createdAt: number,
+  fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
 ): Promise<ProfileLockLease | undefined> {
   let handle: ProfileLockFileHandle;
   try {
@@ -901,9 +1008,11 @@ async function tryAcquireProfileLockLease(
   }
 
   const contents = JSON.stringify({ pid: process.pid, createdAt });
+  let identity: ProfileFileIdentityStats | undefined;
   let writeError: unknown;
   try {
     await handle.writeFile(contents, "utf8");
+    identity = await inspectTrustedProfileLock(lockPath, fileIdentityOptions);
   } catch (error: unknown) {
     writeError = error;
   }
@@ -913,14 +1022,21 @@ async function tryAcquireProfileLockLease(
     writeError ??= error;
   }
   if (writeError !== undefined) {
-    try {
-      await fileSystem.unlink(lockPath);
-    } catch (cleanupError: unknown) {
-      throw new ProfileStoreError(
-        "rollback-failed",
-        "Could not remove an incomplete profile lock.",
-        { cause: cleanupError },
-      );
+    if (identity !== undefined) {
+      try {
+        await removeTrustedProfileLock(
+          fileSystem,
+          lockPath,
+          { contents, identity, state: "stable" },
+          fileIdentityOptions,
+        );
+      } catch (cleanupError: unknown) {
+        throw new ProfileStoreError(
+          "rollback-failed",
+          "Could not remove an incomplete profile lock.",
+          { cause: cleanupError },
+        );
+      }
     }
     throw new ProfileStoreError(
       "persistence-failed",
@@ -931,21 +1047,25 @@ async function tryAcquireProfileLockLease(
 
   return {
     contents,
-    release: createProfileLockRelease(fileSystem, lockPath, contents),
+    identity: identity!,
+    release: createProfileLockRelease(
+      fileSystem,
+      lockPath,
+      { contents, identity: identity!, state: "stable" },
+      fileIdentityOptions,
+    ),
   };
 }
 
 function createProfileLockRelease(
   fileSystem: ProfileLockFileSystem,
   lockPath: string,
-  contents: string,
+  snapshot: ProfileLockSnapshot,
+  fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
 ): ProfileLockRelease {
   return async () => {
     try {
-      if ((await fileSystem.readFile(lockPath)) !== contents) {
-        throw new Error("Profile lock ownership changed.");
-      }
-      await fileSystem.unlink(lockPath);
+      await removeTrustedProfileLock(fileSystem, lockPath, snapshot, fileIdentityOptions);
     } catch (error: unknown) {
       throw new ProfileStoreError(
         "persistence-failed",
@@ -956,12 +1076,78 @@ function createProfileLockRelease(
   };
 }
 
+async function inspectTrustedProfileLock(
+  path: string,
+  fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
+): Promise<ProfileFileIdentityStats> {
+  const stats = await lstatBigIntWithFileIdentity(path, fileIdentityOptions);
+  if (!isSafeProfileFile(stats)) {
+    throw profilePersistenceError();
+  }
+  return stats;
+}
+
+async function readTrustedProfileLock(
+  fileSystem: ProfileLockFileSystem,
+  path: string,
+  fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
+): Promise<ProfileLockSnapshot> {
+  const before = await inspectTrustedProfileLock(path, fileIdentityOptions);
+  const contents = await fileSystem.readFile(path);
+  const after = await inspectTrustedProfileLock(path, fileIdentityOptions);
+  if (sameProfileFileIdentity(before, after)) {
+    return { contents, identity: after, state: "stable" };
+  }
+
+  const replacementBefore = await inspectTrustedProfileLock(path, fileIdentityOptions);
+  const replacementContents = await fileSystem.readFile(path);
+  const replacementAfter = await inspectTrustedProfileLock(path, fileIdentityOptions);
+  if (
+    sameProfileFileIdentity(replacementBefore, replacementAfter) &&
+    replacementContents !== contents
+  ) {
+    return {
+      contents: replacementContents,
+      identity: replacementAfter,
+      state: "changed-to-different-owner",
+    };
+  }
+  return {
+    contents,
+    identity: after,
+    state: "unstable",
+  };
+}
+
+async function removeTrustedProfileLock(
+  fileSystem: ProfileLockFileSystem,
+  path: string,
+  expected: ProfileLockSnapshot,
+  fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
+  stale = false,
+): Promise<void> {
+  const current = await readTrustedProfileLock(fileSystem, path, fileIdentityOptions);
+  if (
+    current.state !== "stable" ||
+    current.contents !== expected.contents ||
+    !sameProfileFileIdentity(current.identity, expected.identity)
+  ) {
+    throw profilePersistenceError();
+  }
+  if (stale) {
+    await fileSystem.unlinkStaleLock(path, expected.contents);
+    return;
+  }
+  await fileSystem.unlink(path);
+}
+
 async function recoverStaleProfileFileLock(
   fileSystem: ProfileLockFileSystem,
   lockPath: string,
   clock: () => number,
   staleLockMs: number,
   isProcessAlive: (pid: number) => boolean | undefined,
+  fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
 ): Promise<void> {
   const recoveryLockPath = join(dirname(lockPath), profileLockRecoveryFileName);
   const releaseRecoveryGuard = await acquireRecoveryGuard(
@@ -971,6 +1157,7 @@ async function recoverStaleProfileFileLock(
     clock,
     staleLockMs,
     isProcessAlive,
+    fileIdentityOptions,
   );
   if (!releaseRecoveryGuard) {
     return;
@@ -983,6 +1170,7 @@ async function recoverStaleProfileFileLock(
       clock,
       staleLockMs,
       isProcessAlive,
+      fileIdentityOptions,
     );
   } finally {
     await releaseRecoveryGuard();
@@ -996,6 +1184,7 @@ async function acquireRecoveryGuard(
   clock: () => number,
   staleLockMs: number,
   isProcessAlive: (pid: number) => boolean | undefined,
+  fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
 ): Promise<ProfileLockRelease | undefined> {
   const recoveryClaimPath = join(
     dirname(recoveryLockPath),
@@ -1005,6 +1194,7 @@ async function acquireRecoveryGuard(
     fileSystem,
     recoveryLockPath,
     createdAt,
+    fileIdentityOptions,
   );
   if (acquired) {
     try {
@@ -1014,20 +1204,21 @@ async function acquireRecoveryGuard(
         clock,
         staleLockMs,
         isProcessAlive,
+        fileIdentityOptions,
       );
       if (claimStatus === "live") {
-        await acquired();
+        await acquired.release();
         return undefined;
       }
     } catch (error: unknown) {
       try {
-        await acquired();
+        await acquired.release();
       } catch (releaseError: unknown) {
         throw releaseError;
       }
       throw error;
     }
-    return acquired;
+    return acquired.release;
   }
 
   const claimedContents = await recoverStaleRecoveryGuard(
@@ -1037,6 +1228,7 @@ async function acquireRecoveryGuard(
     clock,
     staleLockMs,
     isProcessAlive,
+    fileIdentityOptions,
   );
   return claimedContents;
 }
@@ -1049,10 +1241,15 @@ async function recoverOrphanedRecoveryClaim(
   clock: () => number,
   staleLockMs: number,
   isProcessAlive: (pid: number) => boolean | undefined,
+  fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
 ): Promise<RecoveryClaimStatus> {
-  let contents: string;
+  let snapshot: ProfileLockSnapshot;
   try {
-    contents = await fileSystem.readFile(recoveryClaimPath);
+    snapshot = await readTrustedProfileLock(
+      fileSystem,
+      recoveryClaimPath,
+      fileIdentityOptions,
+    );
   } catch (error: unknown) {
     if (isMissingFileError(error)) {
       return "missing";
@@ -1064,7 +1261,7 @@ async function recoverOrphanedRecoveryClaim(
     );
   }
 
-  const record = parseProfileLockRecord(contents);
+  const record = parseProfileLockRecord(snapshot.contents);
   if (
     !record ||
     clock() - record.createdAt < staleLockMs ||
@@ -1072,9 +1269,18 @@ async function recoverOrphanedRecoveryClaim(
   ) {
     return "live";
   }
+  if (snapshot.state !== "stable") {
+    throw profilePersistenceError();
+  }
 
   try {
-    await fileSystem.unlinkStaleLock(recoveryClaimPath, contents);
+    await removeTrustedProfileLock(
+      fileSystem,
+      recoveryClaimPath,
+      snapshot,
+      fileIdentityOptions,
+      true,
+    );
   } catch (error: unknown) {
     if (isMissingFileError(error)) {
       return "missing";
@@ -1096,10 +1302,15 @@ async function recoverStaleRecoveryGuard(
   clock: () => number,
   staleLockMs: number,
   isProcessAlive: (pid: number) => boolean | undefined,
+  fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
 ): Promise<ProfileLockRelease | undefined> {
-  let contents: string;
+  let snapshot: ProfileLockSnapshot;
   try {
-    contents = await fileSystem.readFile(recoveryLockPath);
+    snapshot = await readTrustedProfileLock(
+      fileSystem,
+      recoveryLockPath,
+      fileIdentityOptions,
+    );
   } catch (error: unknown) {
     if (isMissingFileError(error)) {
       return undefined;
@@ -1111,13 +1322,16 @@ async function recoverStaleRecoveryGuard(
     );
   }
 
-  const record = parseProfileLockRecord(contents);
+  const record = parseProfileLockRecord(snapshot.contents);
   if (
     !record ||
     clock() - record.createdAt < staleLockMs ||
     isProcessAlive(record.pid) !== false
   ) {
     return undefined;
+  }
+  if (snapshot.state !== "stable") {
+    throw profilePersistenceError();
   }
 
   const releaseClaim = await acquireRecoveryClaim(
@@ -1126,14 +1340,19 @@ async function recoverStaleRecoveryGuard(
     clock,
     staleLockMs,
     isProcessAlive,
+    fileIdentityOptions,
   );
   if (!releaseClaim) {
     return undefined;
   }
 
-  let currentContents: string;
+  let current: ProfileLockSnapshot;
   try {
-    currentContents = await fileSystem.readFile(recoveryLockPath);
+    current = await readTrustedProfileLock(
+      fileSystem,
+      recoveryLockPath,
+      fileIdentityOptions,
+    );
   } catch (error: unknown) {
     if (isMissingFileError(error)) {
       await releaseClaim();
@@ -1155,13 +1374,26 @@ async function recoverStaleRecoveryGuard(
     );
   }
 
-  if (currentContents !== contents) {
+  if (current.contents !== snapshot.contents) {
     await releaseClaim();
     return undefined;
   }
+  if (
+    current.state !== "stable" ||
+    !sameProfileFileIdentity(current.identity, snapshot.identity)
+  ) {
+    await releaseClaim();
+    throw profilePersistenceError();
+  }
 
   try {
-    await fileSystem.unlinkStaleLock(recoveryLockPath, contents);
+    await removeTrustedProfileLock(
+      fileSystem,
+      recoveryLockPath,
+      snapshot,
+      fileIdentityOptions,
+      true,
+    );
   } catch (error: unknown) {
     if (isMissingFileError(error)) {
       return releaseClaim;
@@ -1191,13 +1423,23 @@ async function acquireRecoveryClaim(
   clock: () => number,
   staleLockMs: number,
   isProcessAlive: (pid: number) => boolean | undefined,
+  fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
 ): Promise<ProfileLockRelease | undefined> {
-  let contents: string;
+  let snapshot: ProfileLockSnapshot;
   try {
-    contents = await fileSystem.readFile(recoveryClaimPath);
+    snapshot = await readTrustedProfileLock(
+      fileSystem,
+      recoveryClaimPath,
+      fileIdentityOptions,
+    );
   } catch (error: unknown) {
     if (isMissingFileError(error)) {
-      return tryAcquireRecoveryClaim(fileSystem, recoveryClaimPath, clock);
+      return tryAcquireRecoveryClaim(
+        fileSystem,
+        recoveryClaimPath,
+        clock,
+        fileIdentityOptions,
+      );
     }
     throw new ProfileStoreError(
       "persistence-failed",
@@ -1206,7 +1448,7 @@ async function acquireRecoveryClaim(
     );
   }
 
-  const record = parseProfileLockRecord(contents);
+  const record = parseProfileLockRecord(snapshot.contents);
   if (
     !record ||
     clock() - record.createdAt < staleLockMs ||
@@ -1214,9 +1456,18 @@ async function acquireRecoveryClaim(
   ) {
     return undefined;
   }
+  if (snapshot.state !== "stable") {
+    throw profilePersistenceError();
+  }
 
   try {
-    await fileSystem.unlinkStaleLock(recoveryClaimPath, contents);
+    await removeTrustedProfileLock(
+      fileSystem,
+      recoveryClaimPath,
+      snapshot,
+      fileIdentityOptions,
+      true,
+    );
   } catch (error: unknown) {
     if (isMissingFileError(error)) {
       return undefined;
@@ -1228,26 +1479,37 @@ async function acquireRecoveryClaim(
     );
   }
 
-  return tryAcquireRecoveryClaim(fileSystem, recoveryClaimPath, clock);
+  return tryAcquireRecoveryClaim(
+    fileSystem,
+    recoveryClaimPath,
+    clock,
+    fileIdentityOptions,
+  );
 }
 
 async function tryAcquireRecoveryClaim(
   fileSystem: ProfileLockFileSystem,
   recoveryClaimPath: string,
   clock: () => number,
+  fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
 ): Promise<ProfileLockRelease | undefined> {
   const lease = await tryAcquireProfileLockLease(
     fileSystem,
     recoveryClaimPath,
     clock(),
+    fileIdentityOptions,
   );
   if (!lease) {
     return undefined;
   }
 
-  let claimContents: string;
+  let claim: ProfileLockSnapshot;
   try {
-    claimContents = await fileSystem.readFile(recoveryClaimPath);
+    claim = await readTrustedProfileLock(
+      fileSystem,
+      recoveryClaimPath,
+      fileIdentityOptions,
+    );
   } catch (error: unknown) {
     const verificationError = new ProfileStoreError(
       "persistence-failed",
@@ -1270,7 +1532,11 @@ async function tryAcquireRecoveryClaim(
     }
     throw verificationError;
   }
-  if (claimContents !== lease.contents) {
+  if (
+    claim.state !== "stable" ||
+    claim.contents !== lease.contents ||
+    !sameProfileFileIdentity(claim.identity, lease.identity)
+  ) {
     await lease.release();
     return undefined;
   }
@@ -1284,10 +1550,11 @@ async function recoverStaleProfileFileLockWhileGuarded(
   clock: () => number,
   staleLockMs: number,
   isProcessAlive: (pid: number) => boolean | undefined,
+  fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
 ): Promise<void> {
-  let contents: string;
+  let snapshot: ProfileLockSnapshot;
   try {
-    contents = await fileSystem.readFile(lockPath);
+    snapshot = await readTrustedProfileLock(fileSystem, lockPath, fileIdentityOptions);
   } catch (error: unknown) {
     if (isMissingFileError(error)) {
       return;
@@ -1299,7 +1566,7 @@ async function recoverStaleProfileFileLockWhileGuarded(
     );
   }
 
-  const record = parseProfileLockRecord(contents);
+  const record = parseProfileLockRecord(snapshot.contents);
   if (
     !record ||
     clock() - record.createdAt < staleLockMs ||
@@ -1307,9 +1574,18 @@ async function recoverStaleProfileFileLockWhileGuarded(
   ) {
     return;
   }
+  if (snapshot.state !== "stable") {
+    throw profilePersistenceError();
+  }
 
   try {
-    await fileSystem.unlinkStaleLock(lockPath, contents);
+    await removeTrustedProfileLock(
+      fileSystem,
+      lockPath,
+      snapshot,
+      fileIdentityOptions,
+      true,
+    );
   } catch (error: unknown) {
     if (isMissingFileError(error)) {
       return;

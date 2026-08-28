@@ -244,6 +244,260 @@ test("preserves a replaced zero-inode index temporary file during failed publica
   });
 });
 
+test("does not release a zero-inode Profile lock replaced with identical owner bytes", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  await withZeroInodeProfileStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const lockPath = join(layout.switcherDir, "profiles", ".create.lock");
+      const lockFileSystem = new ReplaceProfileLockAfterReadFileSystem(lockPath);
+      const store = new ProfileStore(layout, {
+        fileIdentityOptions: zeroInodeProfileIdentityOptions(),
+        lockOptions: { fileSystem: lockFileSystem },
+      });
+
+      await assert.rejects(
+        () => store.create({
+          name: "Replaced Lock",
+          kind: "official",
+          configText: 'model_provider = "openai"\n',
+        }),
+        (error: unknown) => error instanceof ProfileStoreError && error.code === "persistence-failed",
+      );
+      assert.equal(await readFile(lockPath, "utf8"), lockFileSystem.replacementContents);
+    });
+  });
+});
+
+test("does not reclaim a zero-inode stale Profile lock replaced with identical bytes", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  await withZeroInodeProfileStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const profilesDir = join(layout.switcherDir, "profiles");
+      const lockPath = join(profilesDir, ".create.lock");
+      const staleContents = JSON.stringify({ pid: 999999, createdAt: 0 });
+      await mkdir(profilesDir, { recursive: true });
+      await writeFile(lockPath, staleContents, "utf8");
+      const lockFileSystem = new ReplaceProfileLockAfterReadFileSystem(lockPath);
+      const store = new ProfileStore(layout, {
+        fileIdentityOptions: zeroInodeProfileIdentityOptions(),
+        lockOptions: {
+          clock: () => 10_000,
+          fileSystem: lockFileSystem,
+          isProcessAlive: () => false,
+          lockRetryMs: 1,
+          lockTimeoutMs: 10,
+          staleLockMs: 1,
+        },
+      });
+
+      await assert.rejects(
+        () => store.create({
+          name: "Replaced Stale Lock",
+          kind: "official",
+          configText: 'model_provider = "openai"\n',
+        }),
+        (error: unknown) => error instanceof ProfileStoreError && error.code === "persistence-failed",
+      );
+      assert.equal(await readFile(lockPath, "utf8"), staleContents);
+    });
+  });
+});
+
+test("does not reclaim a zero-inode stale recovery guard replaced with identical bytes", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  await withZeroInodeProfileStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const profilesDir = join(layout.switcherDir, "profiles");
+      const lockPath = join(profilesDir, ".create.lock");
+      const guardPath = join(profilesDir, ".create.lock.recovery");
+      const staleContents = JSON.stringify({ pid: 999999, createdAt: 0 });
+      await mkdir(profilesDir, { recursive: true });
+      await writeFile(lockPath, staleContents, "utf8");
+      await writeFile(guardPath, staleContents, "utf8");
+      const lockFileSystem = new ReplaceProfileLockAfterReadFileSystem(guardPath);
+      const store = new ProfileStore(layout, {
+        fileIdentityOptions: zeroInodeProfileIdentityOptions(),
+        lockOptions: {
+          clock: () => 10_000,
+          fileSystem: lockFileSystem,
+          isProcessAlive: () => false,
+          lockRetryMs: 1,
+          lockTimeoutMs: 10,
+          staleLockMs: 1,
+        },
+      });
+
+      await assert.rejects(
+        () => store.create({
+          name: "Replaced Recovery Guard",
+          kind: "official",
+          configText: 'model_provider = "openai"\n',
+        }),
+        (error: unknown) => error instanceof ProfileStoreError && error.code === "persistence-failed",
+      );
+      assert.equal(await readFile(guardPath, "utf8"), staleContents);
+    });
+  });
+});
+
+test("does not reclaim a zero-inode stale recovery claim replaced with identical bytes", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  await withZeroInodeProfileStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const profilesDir = join(layout.switcherDir, "profiles");
+      const lockPath = join(profilesDir, ".create.lock");
+      const claimPath = join(profilesDir, ".create.lock.recovery.claim");
+      const staleContents = JSON.stringify({ pid: 999999, createdAt: 0 });
+      await mkdir(profilesDir, { recursive: true });
+      await writeFile(lockPath, staleContents, "utf8");
+      await writeFile(claimPath, staleContents, "utf8");
+      const lockFileSystem = new ReplaceProfileLockAfterReadFileSystem(claimPath);
+      const store = new ProfileStore(layout, {
+        fileIdentityOptions: zeroInodeProfileIdentityOptions(),
+        lockOptions: {
+          clock: () => 10_000,
+          fileSystem: lockFileSystem,
+          isProcessAlive: () => false,
+          lockRetryMs: 1,
+          lockTimeoutMs: 10,
+          staleLockMs: 1,
+        },
+      });
+
+      await assert.rejects(
+        () => store.create({
+          name: "Replaced Recovery Claim",
+          kind: "official",
+          configText: 'model_provider = "openai"\n',
+        }),
+        (error: unknown) => error instanceof ProfileStoreError && error.code === "persistence-failed",
+      );
+      assert.equal(await readFile(claimPath, "utf8"), staleContents);
+    });
+  });
+});
+
+test("does not publish an index after a newly created zero-inode config is replaced", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  await withZeroInodeProfileStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const configPath = join(
+        layout.switcherDir,
+        "profiles",
+        "created-then-replaced",
+        "config.toml",
+      );
+      const externalPath = join(layout.codexHome, "external-config.toml");
+      const externalContents = 'model_provider = "external"\n';
+      await writeFile(externalPath, externalContents, "utf8");
+      const store = new ProfileStore(layout, {
+        fileIdentityOptions: zeroInodeProfileIdentityOptions(),
+        fileSystem: new ReplaceConfigBeforeIndexPublishProfileFileSystem(
+          configPath,
+          externalPath,
+        ),
+      });
+
+      await assert.rejects(
+        () => store.create({
+          name: "Created Then Replaced",
+          kind: "official",
+          configText: 'model_provider = "openai"\n',
+        }),
+        (error: unknown) => error instanceof ProfileStoreError && error.code === "rollback-failed",
+      );
+      assert.equal(await readFile(configPath, "utf8"), externalContents);
+      await assert.rejects(
+        () => readFile(join(layout.switcherDir, "profiles", "index.json"), "utf8"),
+        { code: "ENOENT" },
+      );
+    });
+  });
+});
+
+test("does not read a zero-inode index replaced after its handle opens", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  await withZeroInodeProfileStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const identityOptions = zeroInodeProfileIdentityOptions();
+      const initialStore = new ProfileStore(layout, { fileIdentityOptions: identityOptions });
+      await initialStore.create({
+        name: "Index Read Race",
+        kind: "official",
+        configText: 'model_provider = "openai"\n',
+      });
+      const indexPath = join(layout.switcherDir, "profiles", "index.json");
+      const externalIndexPath = join(layout.codexHome, "external-index.json");
+      const externalIndex = '{"profiles":[]}\n';
+      await writeFile(externalIndexPath, externalIndex, "utf8");
+      const store = new ProfileStore(layout, {
+        fileIdentityOptions: identityOptions,
+        fileSystem: new ReplaceIndexAfterReadHandleProfileFileSystem(
+          indexPath,
+          externalIndexPath,
+        ),
+      });
+
+      await assert.rejects(
+        () => store.list(),
+        (error: unknown) => error instanceof ProfileStoreError && error.code === "index-read-failed",
+      );
+      assert.equal(await readFile(indexPath, "utf8"), externalIndex);
+    });
+  });
+});
+
+test("rejects a zero-inode config replaced after its read handle reads", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  await withZeroInodeProfileStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const identityOptions = zeroInodeProfileIdentityOptions();
+      const initialStore = new ProfileStore(layout, { fileIdentityOptions: identityOptions });
+      const created = await initialStore.create({
+        name: "Config After Read Race",
+        kind: "official",
+        configText: 'model_provider = "openai"\n',
+      });
+      const externalPath = join(layout.codexHome, "external-config.toml");
+      await writeFile(externalPath, 'model_provider = "external"\n', "utf8");
+      const store = new ProfileStore(layout, {
+        fileIdentityOptions: identityOptions,
+        fileSystem: new ReplaceConfigAfterReadProfileFileSystem(
+          created.configFile,
+          externalPath,
+        ),
+      });
+
+      await assert.rejects(
+        () => store.readConfig(created.id),
+        (error: unknown) => error instanceof ProfileStoreError && error.code === "persistence-failed",
+      );
+      assert.equal(await readFile(created.configFile, "utf8"), 'model_provider = "external"\n');
+    });
+  });
+});
+
 test("updates a profile without changing its identity, creation time, or custom secret identifier", async () => {
   await withTemporaryLayout(async (layout) => {
     const timestamps = [
@@ -945,6 +1199,7 @@ test("does not let stale recovery reclaiming delete a live recovery guard", asyn
         pid: process.pid,
         createdAt: 10_000,
       });
+      assert.notEqual(liveGuardContents, staleContents);
       assert.equal(await readFile(recoveryLockPath, "utf8"), liveGuardContents);
       await assert.rejects(() => open(recoveryLockPath, "wx", 0o600), {
         code: "EEXIST",
@@ -1995,6 +2250,14 @@ async function nativeProfileIdentityRunner(
   return { stdout: `0x${stats.ino.toString(16).padStart(16, "0")}` };
 }
 
+function zeroInodeProfileIdentityOptions() {
+  return {
+    platform: "win32" as const,
+    systemRoot: "C:\\Windows",
+    runner: nativeProfileIdentityRunner,
+  };
+}
+
 class RecordingProfileFileSystem implements ProfileFileSystem {
   readonly exclusiveWrites: Array<{ path: string; mode: number }> = [];
   readonly renames: Array<{ from: string; to: string }> = [];
@@ -2048,6 +2311,118 @@ class RecordingProfileFileSystem implements ProfileFileSystem {
   }
 }
 
+class ReplaceProfileLockAfterReadFileSystem
+  extends RecordingProfileFileSystem
+  implements ProfileLockFileSystem
+{
+  replacementContents = "";
+  private replaced = false;
+
+  constructor(private readonly targetPath: string) {
+    super();
+  }
+
+  async open(path: string, flags: "wx", mode: number) {
+    return open(path, flags, mode);
+  }
+
+  override async readFile(path: string): Promise<string> {
+    const contents = await super.readFile(path);
+    if (!this.replaced && path === this.targetPath) {
+      this.replaced = true;
+      this.replacementContents = contents;
+      const replacementPath = `${path}.replacement`;
+      await writeFile(replacementPath, contents, "utf8");
+      await rename(replacementPath, path);
+    }
+    return contents;
+  }
+
+  async unlinkStaleLock(path: string): Promise<void> {
+    await this.unlink(path);
+  }
+}
+
+class ReplaceConfigBeforeIndexPublishProfileFileSystem
+  extends RecordingProfileFileSystem
+{
+  private replaced = false;
+
+  constructor(
+    private readonly configPath: string,
+    private readonly externalPath: string,
+  ) {
+    super();
+  }
+
+  override async writeFile(path: string, contents: string): Promise<void> {
+    await super.writeFile(path, contents);
+    if (!this.replaced && path.includes(".index.json.tmp-")) {
+      this.replaced = true;
+      await rename(this.externalPath, this.configPath);
+    }
+  }
+}
+
+class ReplaceIndexAfterReadHandleProfileFileSystem
+  extends RecordingProfileFileSystem
+{
+  private replaced = false;
+
+  constructor(
+    private readonly indexPath: string,
+    private readonly externalIndexPath: string,
+  ) {
+    super();
+  }
+
+  override async openRead(path: string) {
+    const handle = await super.openRead(path);
+    if (!this.replaced && path === this.indexPath) {
+      try {
+        this.replaced = true;
+        await rm(this.indexPath);
+        await rename(this.externalIndexPath, this.indexPath);
+      } catch (error: unknown) {
+        await handle.close();
+        throw error;
+      }
+    }
+    return handle;
+  }
+}
+
+class ReplaceConfigAfterReadProfileFileSystem
+  extends RecordingProfileFileSystem
+{
+  private replaced = false;
+
+  constructor(
+    private readonly configPath: string,
+    private readonly externalPath: string,
+  ) {
+    super();
+  }
+
+  override async openRead(path: string) {
+    const handle = await super.openRead(path);
+    if (path !== this.configPath || this.replaced) {
+      return handle;
+    }
+    return {
+      close: () => handle.close(),
+      readFile: async () => {
+        const contents = await handle.readFile();
+        this.replaced = true;
+        await rm(this.configPath);
+        await rename(this.externalPath, this.configPath);
+        return contents;
+      },
+      stat: () => handle.stat(),
+    };
+  }
+}
+
 class FirstIndexReadBarrierProfileFileSystem extends RecordingProfileFileSystem {
   private firstIndexReadStarted = false;
   private indexReadReleased = false;
@@ -2069,7 +2444,7 @@ class FirstIndexReadBarrierProfileFileSystem extends RecordingProfileFileSystem 
     this.releaseIndexReadBarrier();
   }
 
-  override async readFile(path: string): Promise<string> {
+  override async openRead(path: string) {
     if (path.endsWith("index.json") && !this.indexReadReleased) {
       if (!this.firstIndexReadStarted) {
         this.firstIndexReadStarted = true;
@@ -2080,7 +2455,7 @@ class FirstIndexReadBarrierProfileFileSystem extends RecordingProfileFileSystem 
       error.code = "ENOENT";
       throw error;
     }
-    return super.readFile(path);
+    return super.openRead(path);
   }
 }
 
