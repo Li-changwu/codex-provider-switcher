@@ -244,6 +244,44 @@ test("preserves a replaced zero-inode index temporary file during failed publica
   });
 });
 
+test("treats a missing zero-inode index temporary file after native delete failure as cleaned up", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  await withZeroInodeProfileStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const fileSystem = new FailingIndexProfileFileSystem();
+      const windowsFileOperations = new RecordingWindowsFileOperations([
+        {
+          matches: (path) => basename(path).startsWith(".index.json.tmp-"),
+          action: "remove-and-throw",
+        },
+      ]);
+      const store = new ProfileStore(layout, {
+        fileSystem,
+        fileIdentityOptions: zeroInodeProfileIdentityOptions(windowsFileOperations),
+      });
+      const writeAtomically = Reflect.get(store, "writeAtomically") as (
+        path: string,
+        contents: string,
+      ) => Promise<unknown>;
+
+      await assert.rejects(
+        () => writeAtomically.call(store, join(layout.switcherDir, "profiles", "index.json"), "{}\n"),
+        (error: unknown) => error instanceof ProfileStoreError && error.code === "persistence-failed",
+      );
+
+      const temporaryDelete = windowsFileOperations.deleteRequests.find(({ path }) =>
+        basename(path).startsWith(".index.json.tmp-"),
+      );
+      assert.notEqual(temporaryDelete, undefined);
+      await assert.rejects(() => lstat(temporaryDelete!.path), { code: "ENOENT" });
+      assert.deepEqual(fileSystem.unlinked, []);
+    });
+  });
+});
+
 test("does not release a zero-inode Profile lock replaced during native delete", async (t) => {
   if (process.platform !== "win32") {
     t.skip("Windows File IDs are not available on this platform.");
@@ -380,6 +418,47 @@ test("does not reclaim a zero-inode stale Profile lock replaced during native de
       assert.equal(await readFile(lockPath, "utf8"), staleContents);
       assert.deepEqual(lockFileSystem.unlinked, []);
       assert.equal(windowsFileOperations.deleteRequests.some(({ path }) => path === lockPath), true);
+    });
+  });
+});
+
+test("continues stale zero-inode Profile lock recovery after native delete observes disappearance", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  await withZeroInodeProfileStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const profilesDir = join(layout.switcherDir, "profiles");
+      const lockPath = join(profilesDir, ".create.lock");
+      await mkdir(profilesDir, { recursive: true });
+      await writeFile(lockPath, JSON.stringify({ pid: 999999, createdAt: 0 }), "utf8");
+      const lockFileSystem = new RecordingProfileLockFileSystem();
+      const windowsFileOperations = new RecordingWindowsFileOperations([
+        { matches: (path) => path === lockPath, action: "remove-and-throw" },
+      ]);
+      const store = new ProfileStore(layout, {
+        fileIdentityOptions: zeroInodeProfileIdentityOptions(windowsFileOperations),
+        lockOptions: {
+          clock: () => 10_000,
+          fileSystem: lockFileSystem,
+          isProcessAlive: () => false,
+          lockRetryMs: 1,
+          lockTimeoutMs: 10,
+          staleLockMs: 1,
+        },
+      });
+
+      const created = await store.create({
+        name: "Missing Native Stale Lock",
+        kind: "official",
+        configText: 'model_provider = "openai"\n',
+      });
+
+      assert.equal(created.id, "missing-native-stale-lock");
+      assert.equal(windowsFileOperations.deleteRequests[0]?.path, lockPath);
+      assert.equal(windowsFileOperations.deleteRequests.length >= 2, true);
+      assert.deepEqual(lockFileSystem.unlinked, []);
     });
   });
 });
@@ -2378,6 +2457,13 @@ interface WindowsReplacementRule {
   readonly replacementContents: string;
 }
 
+interface WindowsRemoveAndThrowRule {
+  readonly matches: (path: string) => boolean;
+  readonly action: "remove-and-throw";
+}
+
+type WindowsDeleteRule = WindowsReplacementRule | WindowsRemoveAndThrowRule;
+
 class RecordingWindowsFileOperations implements WindowsFileOperations {
   readonly capturedPaths: string[] = [];
   readonly deleteRequests: Array<{
@@ -2385,9 +2471,9 @@ class RecordingWindowsFileOperations implements WindowsFileOperations {
     expected: WindowsFileIdentity;
   }> = [];
   readonly replacements: Array<{ path: string; contents: string }> = [];
-  private readonly replacedRules = new Set<WindowsReplacementRule>();
+  private readonly processedRules = new Set<WindowsDeleteRule>();
 
-  constructor(private readonly replacementRules: readonly WindowsReplacementRule[] = []) {}
+  constructor(private readonly deletionRules: readonly WindowsDeleteRule[] = []) {}
 
   captureFileIdentity(path: string): WindowsFileIdentity {
     this.capturedPaths.push(path);
@@ -2411,15 +2497,20 @@ class RecordingWindowsFileOperations implements WindowsFileOperations {
       return "identity-mismatch";
     }
 
-    const replacement = this.replacementRules.find(
-      (rule) => !this.replacedRules.has(rule) && rule.matches(path),
+    const rule = this.deletionRules.find(
+      (candidate) => !this.processedRules.has(candidate) && candidate.matches(path),
     );
-    if (replacement !== undefined) {
+    if (rule !== undefined && "action" in rule) {
+      unlinkSync(path);
+      this.processedRules.add(rule);
+      throw new Error("controlled native delete failure");
+    }
+    if (rule !== undefined) {
       const replacementPath = `${path}.replacement`;
-      writeFileSync(replacementPath, replacement.replacementContents, "utf8");
+      writeFileSync(replacementPath, rule.replacementContents, "utf8");
       renameSync(replacementPath, path);
-      this.replacedRules.add(replacement);
-      this.replacements.push({ path, contents: replacement.replacementContents });
+      this.processedRules.add(rule);
+      this.replacements.push({ path, contents: rule.replacementContents });
       return "identity-mismatch";
     }
 

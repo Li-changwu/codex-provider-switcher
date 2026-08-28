@@ -865,19 +865,27 @@ async function deleteTrustedProfileFile(
     profileIdentityPlatform(fileIdentityOptions) === "win32" &&
     isZeroProfileInode(expected.ino)
   ) {
+    const windowsFileOperations = resolveProfileWindowsFileOperations(fileIdentityOptions);
+    const expectedWindowsIdentity = requireProfileWindowsFileIdentity(expected);
+    let result: "deleted" | "identity-mismatch";
     try {
-      const result = resolveProfileWindowsFileOperations(fileIdentityOptions)
-        .deleteFileIfMatches(path, requireProfileWindowsFileIdentity(expected));
-      if (result !== "deleted") {
+      result = windowsFileOperations.deleteFileIfMatches(path, expectedWindowsIdentity);
+    } catch {
+      let afterNativeFailure: ProfileFileIdentityStats | undefined;
+      try {
+        afterNativeFailure = await lstatBigIntIfPresent(path, fileIdentityOptions);
+      } catch {
         throw profilePersistenceError();
       }
-      return;
-    } catch (error: unknown) {
-      if (error instanceof ProfileStoreError) {
-        throw error;
+      if (afterNativeFailure === undefined) {
+        throw missingProfileFileError();
       }
       throw profilePersistenceError();
     }
+    if (result !== "deleted") {
+      throw profilePersistenceError();
+    }
+    return;
   }
 
   const current = await lstatBigIntWithFileIdentity(path, fileIdentityOptions);
@@ -1829,6 +1837,12 @@ function hasOnlyProfileIndexKeys(value: Record<string, unknown>): boolean {
 
 function isMissingFileError(error: unknown): error is NodeJS.ErrnoException {
   return typeof error === "object" && error !== null && (error as NodeJS.ErrnoException).code === "ENOENT";
+}
+
+function missingProfileFileError(): NodeJS.ErrnoException {
+  const error = new Error("Managed Profile file is missing.") as NodeJS.ErrnoException;
+  error.code = "ENOENT";
+  return error;
 }
 
 function isExistingFileError(error: unknown): error is NodeJS.ErrnoException {
