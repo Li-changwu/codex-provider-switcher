@@ -276,6 +276,36 @@ test("does not release a zero-inode Profile lock replaced during native delete",
   });
 });
 
+test("releases an ordinary zero-inode Windows Profile lock through native delete without rereading", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  await withZeroInodeProfileStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const lockPath = join(layout.switcherDir, "profiles", ".create.lock");
+      const lockFileSystem = new NoPostCreationLockReadFileSystem(lockPath);
+      const windowsFileOperations = new RecordingWindowsFileOperations();
+      const store = new ProfileStore(layout, {
+        fileIdentityOptions: zeroInodeProfileIdentityOptions(windowsFileOperations),
+        lockOptions: { fileSystem: lockFileSystem },
+      });
+
+      const created = await store.create({
+        name: "Native Lock Release",
+        kind: "official",
+        configText: 'model_provider = "openai"\n',
+      });
+
+      assert.equal(created.id, "native-lock-release");
+      assert.equal(windowsFileOperations.deleteRequests.length, 1);
+      assert.equal(windowsFileOperations.deleteRequests[0]?.path, lockPath);
+      assert.deepEqual(lockFileSystem.unlinked, []);
+      await assert.rejects(() => lstat(lockPath), { code: "ENOENT" });
+    });
+  });
+});
+
 test("does not reclaim a zero-inode stale Profile lock replaced during native delete", async (t) => {
   if (process.platform !== "win32") {
     t.skip("Windows File IDs are not available on this platform.");
@@ -2481,6 +2511,29 @@ class RecordingProfileLockFileSystem
 {
   async open(path: string, flags: "wx", mode: number) {
     return open(path, flags, mode);
+  }
+}
+
+class NoPostCreationLockReadFileSystem extends RecordingProfileLockFileSystem {
+  private lockCreated = false;
+
+  constructor(private readonly lockPath: string) {
+    super();
+  }
+
+  override async open(path: string, flags: "wx", mode: number) {
+    const handle = await super.open(path, flags, mode);
+    if (path === this.lockPath) {
+      this.lockCreated = true;
+    }
+    return handle;
+  }
+
+  override async readFile(path: string): Promise<string> {
+    if (this.lockCreated && path === this.lockPath) {
+      throw new Error("lock was read after creation");
+    }
+    return super.readFile(path);
   }
 }
 

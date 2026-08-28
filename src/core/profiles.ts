@@ -1215,6 +1215,21 @@ async function removeTrustedProfileLock(
   fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
   stale = false,
 ): Promise<void> {
+  if (
+    profileIdentityPlatform(fileIdentityOptions) === "win32" &&
+    isZeroProfileInode(expected.identity.ino)
+  ) {
+    await deleteTrustedProfileFile(
+      path,
+      expected.identity,
+      fileIdentityOptions,
+      async () => {
+        throw new Error("Windows native profile lock deletion used the portable callback.");
+      },
+    );
+    return;
+  }
+
   const current = await readTrustedProfileLock(fileSystem, path, fileIdentityOptions);
   if (
     current.state !== "stable" ||
