@@ -20,6 +20,10 @@ import {
   type HydrateWindowsFileIdentityOptions,
 } from "./file-identity";
 import {
+  createWindowsFileOperations,
+  type WindowsFileIdentity,
+} from "./windows-file-operations";
+import {
   parseAndValidateProfileConfig,
   ProfileConfigPolicyError,
 } from "./config-policy";
@@ -108,7 +112,6 @@ export interface ProfileLockFileSystem {
     mode: number,
   ): Promise<ProfileLockFileHandle>;
   readFile(path: string): Promise<string>;
-  unlinkStaleLock(path: string, expectedContents: string): Promise<void>;
   unlink(path: string): Promise<void>;
 }
 
@@ -469,11 +472,12 @@ export class ProfileStore {
       return;
     }
     try {
-      const stats = await lstatBigIntWithFileIdentity(path, this.fileIdentityOptions);
-      if (!isSafeProfileFile(stats) || !sameProfileFileIdentity(stats, expectedStats)) {
-        throw profilePersistenceError();
-      }
-      await this.fileSystem.unlink(path);
+      await deleteTrustedProfileFile(
+        path,
+        expectedStats,
+        this.fileIdentityOptions,
+        () => this.fileSystem.unlink(path),
+      );
     } catch (error: unknown) {
       if (!isMissingFileError(error)) {
         throw error;
@@ -847,6 +851,91 @@ function sameProfileFileIdentity(
   return sameStableFileIdentity(left, right);
 }
 
+async function deleteTrustedProfileFile(
+  path: string,
+  expected: ProfileFileIdentityStats,
+  fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
+  unlinkForCaller: () => Promise<void>,
+): Promise<void> {
+  if (!isSafeProfileFile(expected)) {
+    throw profilePersistenceError();
+  }
+
+  if (
+    profileIdentityPlatform(fileIdentityOptions) === "win32" &&
+    isZeroProfileInode(expected.ino)
+  ) {
+    try {
+      const result = resolveProfileWindowsFileOperations(fileIdentityOptions)
+        .deleteFileIfMatches(path, requireProfileWindowsFileIdentity(expected));
+      if (result !== "deleted") {
+        throw profilePersistenceError();
+      }
+      return;
+    } catch (error: unknown) {
+      if (error instanceof ProfileStoreError) {
+        throw error;
+      }
+      throw profilePersistenceError();
+    }
+  }
+
+  const current = await lstatBigIntWithFileIdentity(path, fileIdentityOptions);
+  if (!isSafeProfileFile(current) || !sameProfileFileIdentity(current, expected)) {
+    throw profilePersistenceError();
+  }
+  await unlinkForCaller();
+}
+
+function profileIdentityPlatform(
+  fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
+): NodeJS.Platform {
+  return fileIdentityOptions?.platform ?? process.platform;
+}
+
+function isZeroProfileInode(value: number | bigint): boolean {
+  return value === 0 || value === 0n;
+}
+
+function resolveProfileWindowsFileOperations(
+  fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
+) {
+  return fileIdentityOptions?.windowsFileOperations ?? createWindowsFileOperations();
+}
+
+function requireProfileWindowsFileIdentity(
+  expected: ProfileFileIdentityStats,
+): WindowsFileIdentity {
+  try {
+    const identityDescriptor = Object.getOwnPropertyDescriptor(
+      expected,
+      "windowsFileIdentity",
+    );
+    const identity = identityDescriptor && "value" in identityDescriptor
+      ? identityDescriptor.value
+      : undefined;
+    if (
+      !identity ||
+      typeof identity !== "object" ||
+      typeof (identity as WindowsFileIdentity).volumeSerial !== "string" ||
+      typeof (identity as WindowsFileIdentity).fileId !== "string" ||
+      (identity as WindowsFileIdentity).linkCount !== 1n ||
+      expected.nlink !== 1n ||
+      !/^[0-9a-f]{16}$/u.test((identity as WindowsFileIdentity).volumeSerial) ||
+      !/^[0-9a-f]{32}$/u.test((identity as WindowsFileIdentity).fileId)
+    ) {
+      throw new Error("invalid Windows file identity");
+    }
+    return Object.freeze({
+      volumeSerial: (identity as WindowsFileIdentity).volumeSerial,
+      fileId: (identity as WindowsFileIdentity).fileId,
+      linkCount: (identity as WindowsFileIdentity).linkCount,
+    });
+  } catch {
+    throw profilePersistenceError();
+  }
+}
+
 function sameResolvedPath(left: string, right: string): boolean {
   const normalizedLeft = resolve(left);
   const normalizedRight = resolve(right);
@@ -1134,11 +1223,17 @@ async function removeTrustedProfileLock(
   ) {
     throw profilePersistenceError();
   }
-  if (stale) {
-    await fileSystem.unlinkStaleLock(path, expected.contents);
-    return;
-  }
-  await fileSystem.unlink(path);
+  await deleteTrustedProfileFile(
+    path,
+    expected.identity,
+    fileIdentityOptions,
+    async () => {
+      if (stale && (await fileSystem.readFile(path)) !== expected.contents) {
+        throw profilePersistenceError();
+      }
+      await fileSystem.unlink(path);
+    },
+  );
 }
 
 async function recoverStaleProfileFileLock(
@@ -1759,11 +1854,5 @@ const nativeProfileLockFileSystem: ProfileLockFileSystem = {
   },
   open: nativeOpen,
   readFile: (path) => nativeReadFile(path, "utf8"),
-  async unlinkStaleLock(path, expectedContents) {
-    if ((await nativeReadFile(path, "utf8")) !== expectedContents) {
-      return;
-    }
-    await nativeUnlink(path);
-  },
   unlink: nativeUnlink,
 };

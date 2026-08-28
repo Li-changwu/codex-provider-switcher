@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { lstatSync } from "node:fs";
+import { lstatSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import {
   chmod,
   link,
@@ -32,7 +32,10 @@ import {
   UnsupportedSecretStorageError,
   type SecretStorageLike,
 } from "../../src/core/secrets";
-import type { WindowsFileOperations } from "../../src/core/windows-file-operations";
+import type {
+  WindowsFileIdentity,
+  WindowsFileOperations,
+} from "../../src/core/windows-file-operations";
 
 const nodeRequire = createRequire(import.meta.url);
 
@@ -209,12 +212,16 @@ test("preserves a replaced zero-inode index temporary file during failed publica
   await withZeroInodeProfileStats(async () => {
     await withTemporaryLayout(async (layout) => {
       const externalContents = '{"profiles":"external"}\n';
-      const fileSystem = new ReplaceTemporaryIndexBeforeCleanupProfileFileSystem(
-        externalContents,
+      const fileSystem = new FailingIndexProfileFileSystem();
+      const windowsFileOperations = new RecordingWindowsFileOperations(
+        [{
+          matches: (path) => basename(path).startsWith(".index.json.tmp-"),
+          replacementContents: externalContents,
+        }],
       );
       const store = new ProfileStore(layout, {
         fileSystem,
-        fileIdentityOptions: zeroInodeProfileIdentityOptions(),
+        fileIdentityOptions: zeroInodeProfileIdentityOptions(windowsFileOperations),
       });
 
       await assert.rejects(
@@ -226,13 +233,18 @@ test("preserves a replaced zero-inode index temporary file during failed publica
         (error: unknown) => error instanceof ProfileStoreError && error.code === "rollback-failed",
       );
 
-      assert.notEqual(fileSystem.replacementPath, undefined);
-      assert.equal(await readFile(fileSystem.replacementPath!, "utf8"), externalContents);
+      const replacement = windowsFileOperations.replacements.find(({ path }) =>
+        basename(path).startsWith(".index.json.tmp-"),
+      );
+      assert.notEqual(replacement, undefined);
+      assert.equal(await readFile(replacement!.path, "utf8"), externalContents);
+      assert.deepEqual(fileSystem.unlinked, []);
+      assert.equal(windowsFileOperations.deleteRequests.length > 0, true);
     });
   });
 });
 
-test("does not release a zero-inode Profile lock replaced with identical owner bytes", async (t) => {
+test("does not release a zero-inode Profile lock replaced during native delete", async (t) => {
   if (process.platform !== "win32") {
     t.skip("Windows File IDs are not available on this platform.");
     return;
@@ -240,9 +252,12 @@ test("does not release a zero-inode Profile lock replaced with identical owner b
   await withZeroInodeProfileStats(async () => {
     await withTemporaryLayout(async (layout) => {
       const lockPath = join(layout.switcherDir, "profiles", ".create.lock");
-      const lockFileSystem = new ReplaceProfileLockAfterReadFileSystem(lockPath);
+      const lockFileSystem = new RecordingProfileLockFileSystem();
+      const windowsFileOperations = new RecordingWindowsFileOperations(
+        [{ matches: (path) => path === lockPath, replacementContents: "replacement lock" }],
+      );
       const store = new ProfileStore(layout, {
-        fileIdentityOptions: zeroInodeProfileIdentityOptions(),
+        fileIdentityOptions: zeroInodeProfileIdentityOptions(windowsFileOperations),
         lockOptions: { fileSystem: lockFileSystem },
       });
 
@@ -254,12 +269,14 @@ test("does not release a zero-inode Profile lock replaced with identical owner b
         }),
         (error: unknown) => error instanceof ProfileStoreError && error.code === "persistence-failed",
       );
-      assert.equal(await readFile(lockPath, "utf8"), lockFileSystem.replacementContents);
+      assert.equal(await readFile(lockPath, "utf8"), "replacement lock");
+      assert.deepEqual(lockFileSystem.unlinked, []);
+      assert.equal(windowsFileOperations.deleteRequests.length, 1);
     });
   });
 });
 
-test("does not reclaim a zero-inode stale Profile lock replaced with identical bytes", async (t) => {
+test("does not reclaim a zero-inode stale Profile lock replaced during native delete", async (t) => {
   if (process.platform !== "win32") {
     t.skip("Windows File IDs are not available on this platform.");
     return;
@@ -271,9 +288,12 @@ test("does not reclaim a zero-inode stale Profile lock replaced with identical b
       const staleContents = JSON.stringify({ pid: 999999, createdAt: 0 });
       await mkdir(profilesDir, { recursive: true });
       await writeFile(lockPath, staleContents, "utf8");
-      const lockFileSystem = new ReplaceProfileLockAfterReadFileSystem(lockPath);
+      const lockFileSystem = new RecordingProfileLockFileSystem();
+      const windowsFileOperations = new RecordingWindowsFileOperations(
+        [{ matches: (path) => path === lockPath, replacementContents: staleContents }],
+      );
       const store = new ProfileStore(layout, {
-        fileIdentityOptions: zeroInodeProfileIdentityOptions(),
+        fileIdentityOptions: zeroInodeProfileIdentityOptions(windowsFileOperations),
         lockOptions: {
           clock: () => 10_000,
           fileSystem: lockFileSystem,
@@ -293,11 +313,13 @@ test("does not reclaim a zero-inode stale Profile lock replaced with identical b
         (error: unknown) => error instanceof ProfileStoreError && error.code === "persistence-failed",
       );
       assert.equal(await readFile(lockPath, "utf8"), staleContents);
+      assert.deepEqual(lockFileSystem.unlinked, []);
+      assert.equal(windowsFileOperations.deleteRequests.some(({ path }) => path === lockPath), true);
     });
   });
 });
 
-test("does not reclaim a zero-inode stale recovery guard replaced with identical bytes", async (t) => {
+test("does not reclaim a zero-inode stale recovery guard replaced during native delete", async (t) => {
   if (process.platform !== "win32") {
     t.skip("Windows File IDs are not available on this platform.");
     return;
@@ -311,9 +333,12 @@ test("does not reclaim a zero-inode stale recovery guard replaced with identical
       await mkdir(profilesDir, { recursive: true });
       await writeFile(lockPath, staleContents, "utf8");
       await writeFile(guardPath, staleContents, "utf8");
-      const lockFileSystem = new ReplaceProfileLockAfterReadFileSystem(guardPath);
+      const lockFileSystem = new RecordingProfileLockFileSystem();
+      const windowsFileOperations = new RecordingWindowsFileOperations(
+        [{ matches: (path) => path === guardPath, replacementContents: staleContents }],
+      );
       const store = new ProfileStore(layout, {
-        fileIdentityOptions: zeroInodeProfileIdentityOptions(),
+        fileIdentityOptions: zeroInodeProfileIdentityOptions(windowsFileOperations),
         lockOptions: {
           clock: () => 10_000,
           fileSystem: lockFileSystem,
@@ -333,11 +358,13 @@ test("does not reclaim a zero-inode stale recovery guard replaced with identical
         (error: unknown) => error instanceof ProfileStoreError && error.code === "persistence-failed",
       );
       assert.equal(await readFile(guardPath, "utf8"), staleContents);
+      assert.deepEqual(lockFileSystem.unlinked, []);
+      assert.equal(windowsFileOperations.deleteRequests.some(({ path }) => path === guardPath), true);
     });
   });
 });
 
-test("does not reclaim a zero-inode stale recovery claim replaced with identical bytes", async (t) => {
+test("does not reclaim a zero-inode stale recovery claim replaced during native delete", async (t) => {
   if (process.platform !== "win32") {
     t.skip("Windows File IDs are not available on this platform.");
     return;
@@ -351,9 +378,12 @@ test("does not reclaim a zero-inode stale recovery claim replaced with identical
       await mkdir(profilesDir, { recursive: true });
       await writeFile(lockPath, staleContents, "utf8");
       await writeFile(claimPath, staleContents, "utf8");
-      const lockFileSystem = new ReplaceProfileLockAfterReadFileSystem(claimPath);
+      const lockFileSystem = new RecordingProfileLockFileSystem();
+      const windowsFileOperations = new RecordingWindowsFileOperations(
+        [{ matches: (path) => path === claimPath, replacementContents: staleContents }],
+      );
       const store = new ProfileStore(layout, {
-        fileIdentityOptions: zeroInodeProfileIdentityOptions(),
+        fileIdentityOptions: zeroInodeProfileIdentityOptions(windowsFileOperations),
         lockOptions: {
           clock: () => 10_000,
           fileSystem: lockFileSystem,
@@ -373,7 +403,33 @@ test("does not reclaim a zero-inode stale recovery claim replaced with identical
         (error: unknown) => error instanceof ProfileStoreError && error.code === "persistence-failed",
       );
       assert.equal(await readFile(claimPath, "utf8"), staleContents);
+      assert.deepEqual(lockFileSystem.unlinked, []);
+      assert.equal(windowsFileOperations.deleteRequests.some(({ path }) => path === claimPath), true);
     });
+  });
+});
+
+test("keeps non-Windows Profile lock deletion on the portable filesystem path", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const lockPath = join(layout.switcherDir, "profiles", ".create.lock");
+    const lockFileSystem = new RecordingProfileLockFileSystem();
+    const windowsFileOperations = new RecordingWindowsFileOperations();
+    const store = new ProfileStore(layout, {
+      fileIdentityOptions: {
+        platform: "linux",
+        windowsFileOperations,
+      },
+      lockOptions: { fileSystem: lockFileSystem },
+    });
+
+    await store.create({
+      name: "Portable Lock",
+      kind: "official",
+      configText: 'model_provider = "openai"\n',
+    });
+
+    assert.deepEqual(windowsFileOperations.deleteRequests, []);
+    assert.deepEqual(lockFileSystem.unlinked, [lockPath]);
   });
 });
 
@@ -1264,7 +1320,7 @@ test("serializes interleaved stale lock recovery without unlinking a live lock",
         [first.id, second.id].sort(),
         ["first-reclaimer", "second-reclaimer"],
       );
-      assert.equal(lockFileSystem.liveLockUnlinkAttempts, 0);
+      assert.equal(lockFileSystem.finalStaleCleanupReadObserved, true);
       assert.deepEqual(
         (await firstStore.list()).map((profile) => profile.id).sort(),
         ["first-reclaimer", "second-reclaimer"],
@@ -2226,35 +2282,130 @@ function withZeroInodeProfileStatsValue<T extends Awaited<ReturnType<typeof lsta
   return copy;
 }
 
-function zeroInodeProfileIdentityOptions() {
+function zeroInodeProfileIdentityOptions(
+  windowsFileOperations: WindowsFileOperations = nativeProfileWindowsFileOperations(),
+) {
   return {
     platform: "win32" as const,
-    windowsFileOperations: nativeProfileWindowsFileOperations(),
+    windowsFileOperations,
   };
 }
 
 function nativeProfileWindowsFileOperations(): WindowsFileOperations {
   return {
-    captureFileIdentity(path) {
-      const stats = lstatSync(path, { bigint: true });
-      if (stats.nlink !== 1n) {
-        throw new Error("native identity is unavailable");
+    captureFileIdentity: captureProfileWindowsFileIdentity,
+    deleteFileIfMatches(path, expected) {
+      const current = captureProfileWindowsFileIdentity(path);
+      if (!sameProfileWindowsFileIdentity(current, expected)) {
+        return "identity-mismatch";
       }
-      return {
-        volumeSerial: "0000000000000001",
-        fileId: `${stats.dev.toString(16)}${stats.ino.toString(16)}`
-          .padStart(32, "0")
-          .slice(-32),
-        linkCount: stats.nlink,
-      };
-    },
-    deleteFileIfMatches() {
-      throw new Error("unused");
+      unlinkSync(path);
+      return "deleted";
     },
     holdFileIfMatches() {
       throw new Error("unused");
     },
   };
+}
+
+interface WindowsReplacementRule {
+  readonly matches: (path: string) => boolean;
+  readonly replacementContents: string;
+}
+
+class RecordingWindowsFileOperations implements WindowsFileOperations {
+  readonly capturedPaths: string[] = [];
+  readonly deleteRequests: Array<{
+    path: string;
+    expected: WindowsFileIdentity;
+  }> = [];
+  readonly replacements: Array<{ path: string; contents: string }> = [];
+  private readonly replacedRules = new Set<WindowsReplacementRule>();
+
+  constructor(private readonly replacementRules: readonly WindowsReplacementRule[] = []) {}
+
+  captureFileIdentity(path: string): WindowsFileIdentity {
+    this.capturedPaths.push(path);
+    return captureProfileWindowsFileIdentity(path);
+  }
+
+  deleteFileIfMatches(
+    path: string,
+    expected: WindowsFileIdentity,
+  ): "deleted" | "identity-mismatch" {
+    const expectedSnapshot = snapshotProfileWindowsFileIdentity(expected);
+    this.deleteRequests.push({ path, expected: expectedSnapshot });
+
+    let current: WindowsFileIdentity;
+    try {
+      current = captureProfileWindowsFileIdentity(path);
+    } catch {
+      return "identity-mismatch";
+    }
+    if (!sameProfileWindowsFileIdentity(current, expectedSnapshot)) {
+      return "identity-mismatch";
+    }
+
+    const replacement = this.replacementRules.find(
+      (rule) => !this.replacedRules.has(rule) && rule.matches(path),
+    );
+    if (replacement !== undefined) {
+      const replacementPath = `${path}.replacement`;
+      writeFileSync(replacementPath, replacement.replacementContents, "utf8");
+      renameSync(replacementPath, path);
+      this.replacedRules.add(replacement);
+      this.replacements.push({ path, contents: replacement.replacementContents });
+      return "identity-mismatch";
+    }
+
+    unlinkSync(path);
+    return "deleted";
+  }
+
+  holdFileIfMatches(): never {
+    throw new Error("unused");
+  }
+}
+
+function captureProfileWindowsFileIdentity(path: string): WindowsFileIdentity {
+  const stats = lstatSync(path, { bigint: true });
+  if (stats.nlink !== 1n) {
+    throw new Error("native identity is unavailable");
+  }
+  return {
+    volumeSerial: "0000000000000001",
+    fileId: `${stats.dev.toString(16).padStart(16, "0").slice(-16)}${stats.ino
+      .toString(16)
+      .padStart(16, "0")
+      .slice(-16)}`,
+    linkCount: 1n,
+  };
+}
+
+function snapshotProfileWindowsFileIdentity(
+  identity: WindowsFileIdentity,
+): WindowsFileIdentity {
+  if (
+    !/^[0-9a-f]{16}$/u.test(identity.volumeSerial) ||
+    !/^[0-9a-f]{32}$/u.test(identity.fileId) ||
+    identity.linkCount !== 1n
+  ) {
+    throw new Error("invalid expected Windows file identity");
+  }
+  return {
+    volumeSerial: identity.volumeSerial,
+    fileId: identity.fileId,
+    linkCount: identity.linkCount,
+  };
+}
+
+function sameProfileWindowsFileIdentity(
+  left: WindowsFileIdentity,
+  right: WindowsFileIdentity,
+): boolean {
+  return left.volumeSerial === right.volumeSerial &&
+    left.fileId === right.fileId &&
+    left.linkCount === right.linkCount;
 }
 
 function unavailableProfileWindowsFileOperations(): WindowsFileOperations {
@@ -2324,35 +2475,12 @@ class RecordingProfileFileSystem implements ProfileFileSystem {
   }
 }
 
-class ReplaceProfileLockAfterReadFileSystem
+class RecordingProfileLockFileSystem
   extends RecordingProfileFileSystem
   implements ProfileLockFileSystem
 {
-  replacementContents = "";
-  private replaced = false;
-
-  constructor(private readonly targetPath: string) {
-    super();
-  }
-
   async open(path: string, flags: "wx", mode: number) {
     return open(path, flags, mode);
-  }
-
-  override async readFile(path: string): Promise<string> {
-    const contents = await super.readFile(path);
-    if (!this.replaced && path === this.targetPath) {
-      this.replaced = true;
-      this.replacementContents = contents;
-      const replacementPath = `${path}.replacement`;
-      await writeFile(replacementPath, contents, "utf8");
-      await rename(replacementPath, path);
-    }
-    return contents;
-  }
-
-  async unlinkStaleLock(path: string): Promise<void> {
-    await this.unlink(path);
   }
 }
 
@@ -2476,9 +2604,9 @@ class InterleavingProfileLockFileSystem
   extends RecordingProfileFileSystem
   implements ProfileLockFileSystem
 {
-  liveLockUnlinkAttempts = 0;
+  finalStaleCleanupReadObserved = false;
   private firstValidationReleased = false;
-  private firstStaleReadCount = 0;
+  private profileLockReadCount = 0;
   private recoveryGuardContentionResolved = false;
   private releaseFirstValidationBarrier!: () => void;
   private resolveFirstValidation!: () => void;
@@ -2534,29 +2662,17 @@ class InterleavingProfileLockFileSystem
 
   override async readFile(path: string): Promise<string> {
     const contents = await super.readFile(path);
-    if (path === this.profileLockPath && contents === this.staleContents) {
-      this.firstStaleReadCount += 1;
-      if (this.firstStaleReadCount === 1 && !this.firstValidationReleased) {
+    if (path === this.profileLockPath) {
+      this.profileLockReadCount += 1;
+      if (this.profileLockReadCount === 1 && !this.firstValidationReleased) {
         this.resolveFirstValidation();
         await this.firstValidationBarrier;
       }
-    }
-    return contents;
-  }
-
-  override async unlink(path: string): Promise<void> {
-    await super.unlink(path);
-  }
-
-  async unlinkStaleLock(path: string, expectedContents: string): Promise<void> {
-    if (path === this.profileLockPath) {
-      const contents = await readFile(path, "utf8");
-      if (contents !== expectedContents || contents !== this.staleContents) {
-        this.liveLockUnlinkAttempts += 1;
-        throw createFileSystemError("EPERM", "attempted to remove a live profile lock");
+      if (this.profileLockReadCount === 3) {
+        this.finalStaleCleanupReadObserved = contents === this.staleContents;
       }
     }
-    await super.unlink(path);
+    return contents;
   }
 }
 
@@ -2686,12 +2802,6 @@ class InterleavingRecoveryGuardFileSystem
     return contents;
   }
 
-  async unlinkStaleLock(path: string, expectedContents: string): Promise<void> {
-    if ((await readFile(path, "utf8")) !== expectedContents) {
-      return;
-    }
-    await this.unlink(path);
-  }
 }
 
 class FailingRecoveryClaimReadFileSystem
@@ -2746,12 +2856,6 @@ class FailingRecoveryClaimReadFileSystem
     await super.unlink(path);
   }
 
-  async unlinkStaleLock(path: string, expectedContents: string): Promise<void> {
-    if ((await readFile(path, "utf8")) !== expectedContents) {
-      return;
-    }
-    await this.unlink(path);
-  }
 }
 
 class FailingRecoveryGuardCleanupLockFileSystem
@@ -2773,9 +2877,6 @@ class FailingRecoveryGuardCleanupLockFileSystem
     await super.unlink(path);
   }
 
-  async unlinkStaleLock(path: string): Promise<void> {
-    await this.unlink(path);
-  }
 }
 
 class FailingMkdirProfileFileSystem extends RecordingProfileFileSystem {
@@ -2844,27 +2945,6 @@ class ExternalConfigEditOnIndexFailureProfileFileSystem
   override async rename(from: string, to: string): Promise<void> {
     if (to.endsWith("index.json")) {
       await writeFile(this.configPath, this.externalConfig, "utf8");
-      throw new Error("index persistence failed");
-    }
-    await super.rename(from, to);
-  }
-}
-
-class ReplaceTemporaryIndexBeforeCleanupProfileFileSystem
-  extends RecordingProfileFileSystem
-{
-  replacementPath: string | undefined;
-
-  constructor(private readonly externalContents: string) {
-    super();
-  }
-
-  override async rename(from: string, to: string): Promise<void> {
-    if (to.endsWith("index.json")) {
-      const retainedPath = `${from}.retained`;
-      await rename(from, retainedPath);
-      await writeFile(from, this.externalContents, "utf8");
-      this.replacementPath = from;
       throw new Error("index persistence failed");
     }
     await super.rename(from, to);
