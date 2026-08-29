@@ -21,6 +21,7 @@ import {
   createRolloutInversePatches,
 } from "../../src/core/rollouts";
 import type { CodexLayout } from "../../src/core/types";
+import type { WindowsFileIdentity } from "../../src/core/windows-file-operations";
 
 test("requires comparable exact filesystem identity for trusted directories", () => {
   const matching: FileIdentity = { dev: 1n, ino: 2n, nlink: 1n };
@@ -53,6 +54,46 @@ test("requires comparable exact filesystem identity for trusted directories", ()
       { dev: Number.MAX_SAFE_INTEGER + 1, ino: 2, nlink: 1 },
       { dev: Number.MAX_SAFE_INTEGER + 1, ino: 2, nlink: 1 },
     ),
+    false,
+  );
+});
+
+test("compares canonical native identities for zero-inode transaction files", () => {
+  const nativeIdentity: WindowsFileIdentity = {
+    volumeSerial: "0000000000000001",
+    fileId: "0123456789abcdef0123456789abcdef",
+    linkCount: 1n,
+  };
+  const matching: FileIdentity = {
+    dev: 0n,
+    ino: 0n,
+    nlink: 1n,
+    windowsFileIdentity: nativeIdentity,
+  };
+
+  assert.equal(
+    hasSameStableFileIdentity(matching, {
+      dev: 0n,
+      ino: 0n,
+      nlink: 1n,
+      windowsFileIdentity: nativeIdentity,
+    }),
+    true,
+  );
+  assert.equal(
+    hasSameStableFileIdentity(matching, {
+      dev: 0n,
+      ino: 0n,
+      nlink: 1n,
+      windowsFileIdentity: {
+        ...nativeIdentity,
+        fileId: "fedcba9876543210fedcba9876543210",
+      },
+    }),
+    false,
+  );
+  assert.equal(
+    hasSameStableFileIdentity(matching, { dev: 0n, ino: 0n, nlink: 1n }),
     false,
   );
 });

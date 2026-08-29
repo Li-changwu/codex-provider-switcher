@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { lstatSync } from "node:fs";
+import { lstatSync, unlinkSync } from "node:fs";
 import { link, lstat, mkdir, mkdtemp, open, readFile, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
@@ -67,6 +67,41 @@ test("accepts zero-inode Windows active Profile storage with canonical file iden
       });
       assert.equal(await store.get(), undefined);
       await assert.rejects(() => readFile(store.path, "utf8"), { code: "ENOENT" });
+    });
+  });
+});
+
+test("fails closed when zero-inode active Profile deletion observes a replacement", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  let deleteCalls = 0;
+  await withZeroInodeStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const store = new ActiveProfileStore(layout, {
+        fileIdentityOptions: {
+          platform: "win32",
+          windowsFileOperations: {
+            captureFileIdentity: nativeWindowsFileOperations().captureFileIdentity,
+            deleteFileIfMatches() {
+              deleteCalls += 1;
+              return "identity-mismatch";
+            },
+            holdFileIfMatches() {
+              throw new Error("unused");
+            },
+          },
+        },
+      });
+      await store.set("official");
+
+      await assert.rejects(
+        () => store.clear(),
+        (error: unknown) => error instanceof ActiveProfileStoreError && error.code === "unsafe-state",
+      );
+      assert.equal(deleteCalls, 1);
+      assert.equal((await store.get())?.profileId, "official");
     });
   });
 });
@@ -464,22 +499,34 @@ function withZeroInode<T extends Awaited<ReturnType<typeof lstat>>>(stats: T): T
 }
 
 function nativeWindowsFileOperations(): WindowsFileOperations {
+  const captureNativeIdentity = (path: string): WindowsFileIdentity => {
+    const stats = lstatSync(path, { bigint: true });
+    if (stats.nlink !== 1n) {
+      throw new Error("native identity is unavailable");
+    }
+    return {
+      volumeSerial: "0000000000000001",
+      fileId: `${stats.dev.toString(16)}${stats.ino.toString(16)}`
+        .padStart(32, "0")
+        .slice(-32),
+      linkCount: stats.nlink,
+    };
+  };
   return {
     captureFileIdentity(path) {
-      const stats = lstatSync(path, { bigint: true });
-      if (stats.nlink !== 1n) {
-        throw new Error("native identity is unavailable");
-      }
-      return {
-        volumeSerial: "0000000000000001",
-        fileId: `${stats.dev.toString(16)}${stats.ino.toString(16)}`
-          .padStart(32, "0")
-          .slice(-32),
-        linkCount: stats.nlink,
-      };
+      return captureNativeIdentity(path);
     },
-    deleteFileIfMatches() {
-      throw new Error("unused");
+    deleteFileIfMatches(path, expected) {
+      const current = captureNativeIdentity(path);
+      if (
+        current.volumeSerial !== expected.volumeSerial ||
+        current.fileId !== expected.fileId ||
+        current.linkCount !== expected.linkCount
+      ) {
+        return "identity-mismatch";
+      }
+      unlinkSync(path);
+      return "deleted";
     },
     holdFileIfMatches() {
       throw new Error("unused");

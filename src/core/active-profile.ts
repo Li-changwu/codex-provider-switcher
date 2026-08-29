@@ -17,6 +17,10 @@ import {
   type FileIdentity,
   type HydrateWindowsFileIdentityOptions,
 } from "./file-identity";
+import {
+  createWindowsFileOperations,
+  type WindowsFileIdentity,
+} from "./windows-file-operations";
 import type { CodexLayout } from "./types";
 
 const activeProfileFileName = "active-profile.json";
@@ -128,7 +132,12 @@ export class ActiveProfileStore {
       ) {
         throw unsafeStateError();
       }
-      await unlink(this.path);
+      await deleteTrustedActiveProfileFile(
+        this.path,
+        current,
+        this.fileIdentityOptions,
+        () => unlink(this.path),
+      );
       await this.verifyTrustedSwitcherDirectory(previous.directory!);
       await syncTrustedParentDirectory(previous.directory!, this.fileIdentityOptions);
       await this.verifyTrustedSwitcherDirectory(previous.directory!);
@@ -389,7 +398,12 @@ export class ActiveProfileStore {
     if (!isSafeActiveProfileFile(stats) || !sameFileIdentity(stats, expectedStats)) {
       throw unsafeStateError();
     }
-    await unlink(path);
+    await deleteTrustedActiveProfileFile(
+      path,
+      stats,
+      this.fileIdentityOptions,
+      () => unlink(path),
+    );
   }
 
   private async lstat(path: string): Promise<FileIdentityStats> {
@@ -495,6 +509,64 @@ function isSafeActiveProfileFile(stats: FileIdentityStats): boolean {
 
 function sameFileIdentity(left: FileIdentityStats, right: FileIdentityStats): boolean {
   return sameStableFileIdentity(left, right);
+}
+
+async function deleteTrustedActiveProfileFile(
+  path: string,
+  expected: FileIdentityStats,
+  options: HydrateWindowsFileIdentityOptions | undefined,
+  unlinkForCaller: () => Promise<void>,
+): Promise<void> {
+  if (
+    (options?.platform ?? process.platform) === "win32" &&
+    expected.ino === 0n
+  ) {
+    const identity = requireActiveWindowsFileIdentity(expected);
+    const operations = options?.windowsFileOperations ?? createWindowsFileOperations();
+    let result: "deleted" | "identity-mismatch";
+    try {
+      result = operations.deleteFileIfMatches(path, identity);
+    } catch (error: unknown) {
+      throw new ActiveProfileStoreError(
+        "persistence-failed",
+        "Could not clear active Profile state.",
+        { cause: error },
+      );
+    }
+    if (result !== "deleted") {
+      throw unsafeStateError();
+    }
+    return;
+  }
+  await unlinkForCaller();
+}
+
+function requireActiveWindowsFileIdentity(
+  stats: FileIdentityStats,
+): WindowsFileIdentity {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(stats, "windowsFileIdentity");
+    const identity = descriptor && "value" in descriptor ? descriptor.value : undefined;
+    if (
+      !identity ||
+      typeof identity !== "object" ||
+      typeof (identity as WindowsFileIdentity).volumeSerial !== "string" ||
+      typeof (identity as WindowsFileIdentity).fileId !== "string" ||
+      (identity as WindowsFileIdentity).linkCount !== 1n ||
+      stats.nlink !== 1n ||
+      !/^[0-9a-f]{16}$/u.test((identity as WindowsFileIdentity).volumeSerial) ||
+      !/^[0-9a-f]{32}$/u.test((identity as WindowsFileIdentity).fileId)
+    ) {
+      throw new Error("invalid Windows file identity");
+    }
+    return Object.freeze({
+      volumeSerial: (identity as WindowsFileIdentity).volumeSerial,
+      fileId: (identity as WindowsFileIdentity).fileId,
+      linkCount: (identity as WindowsFileIdentity).linkCount,
+    });
+  } catch {
+    throw unsafeStateError();
+  }
 }
 
 function sameResolvedPath(left: string, right: string): boolean {
