@@ -1,5 +1,16 @@
+import type { BigIntStats } from "node:fs";
 import { lstat, readdir, readFile, realpath, rm, unlink } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import {
+  hasComparableFileIdentity,
+  hydrateWindowsFileIdentity,
+  sameStableFileIdentity,
+  type FileIdentity,
+  type HydrateWindowsFileIdentityOptions,
+} from "./file-identity";
+import {
+  createWindowsFileOperations,
+} from "./windows-file-operations";
 import type { BranchMapping } from "./continuation";
 import type { CodexLayout } from "./types";
 
@@ -12,14 +23,12 @@ interface TrustedRetentionDirectory {
   readonly childName: "transactions" | "continuation-temp";
   readonly path: string;
   readonly realPath: string;
-  readonly device: bigint;
-  readonly inode: bigint;
+  readonly identity: FileIdentity;
 }
 
 interface ManagedRetentionEntry {
   readonly name: string;
-  readonly device: bigint;
-  readonly inode: bigint;
+  readonly identity: FileIdentity;
 }
 
 export interface BranchRetentionStore {
@@ -37,6 +46,11 @@ export interface BranchRetentionOptions {
 
 export interface BackupRetentionOptions {
   readonly maximumCompletedBackups?: number;
+  readonly fileIdentityOptions?: HydrateWindowsFileIdentityOptions;
+}
+
+export interface CleanupTemporaryContextsOptions {
+  readonly fileIdentityOptions?: HydrateWindowsFileIdentityOptions;
 }
 
 export class RetentionError extends Error {
@@ -89,7 +103,11 @@ export async function retainCompletedTransactionBackups(
   options: BackupRetentionOptions = {},
 ): Promise<{ removedOperationIds: string[] }> {
   const maximum = positiveInteger(options.maximumCompletedBackups, defaultMaximumCompletedBackups);
-  const root = await resolveTrustedRetentionDirectory(layout, "transactions");
+  const root = await resolveTrustedRetentionDirectory(
+    layout,
+    "transactions",
+    options.fileIdentityOptions,
+  );
   if (!root) {
     return { removedOperationIds: [] };
   }
@@ -107,7 +125,7 @@ export async function retainCompletedTransactionBackups(
     if (!entry.isDirectory() || entry.isSymbolicLink() || !transactionIdPattern.test(entry.name)) {
       continue;
     }
-    const candidate = await inspectManagedEntry(root, entry.name, "directory");
+    const candidate = await inspectManagedEntry(root, entry.name, "directory", options.fileIdentityOptions);
     if (!candidate) {
       continue;
     }
@@ -121,11 +139,21 @@ export async function retainCompletedTransactionBackups(
     .slice(maximum);
   const removedOperationIds: string[] = [];
   for (const entry of overflow) {
-    const path = await revalidateManagedEntry(layout, root, entry.entry, "directory");
-    if (!path) {
+    const candidate = await revalidateManagedEntry(
+      layout,
+      root,
+      entry.entry,
+      "directory",
+      options.fileIdentityOptions,
+    );
+    if (!candidate) {
       continue;
     }
-    await rm(path, { recursive: true, force: false });
+    if (isWindowsZeroInode(candidate.entry.identity, options.fileIdentityOptions)) {
+      await removeZeroInodeDirectory(candidate, options.fileIdentityOptions);
+    } else {
+      await rm(candidate.path, { recursive: true, force: false });
+    }
     removedOperationIds.push(entry.operationId);
   }
   return { removedOperationIds };
@@ -133,8 +161,13 @@ export async function retainCompletedTransactionBackups(
 
 export async function cleanupTemporaryContexts(
   layout: CodexLayout,
+  options: CleanupTemporaryContextsOptions = {},
 ): Promise<{ removedCount: number }> {
-  const directory = await resolveTrustedRetentionDirectory(layout, "continuation-temp");
+  const directory = await resolveTrustedRetentionDirectory(
+    layout,
+    "continuation-temp",
+    options.fileIdentityOptions,
+  );
   if (!directory) {
     return { removedCount: 0 };
   }
@@ -152,15 +185,21 @@ export async function cleanupTemporaryContexts(
     if (!continuationTemporaryPattern.test(entry.name)) {
       continue;
     }
-    const candidate = await inspectManagedEntry(directory, entry.name, "file");
+    const candidate = await inspectManagedEntry(directory, entry.name, "file", options.fileIdentityOptions);
     if (!candidate) {
       continue;
     }
-    const path = await revalidateManagedEntry(layout, directory, candidate.entry, "file");
-    if (!path) {
+    const checked = await revalidateManagedEntry(
+      layout,
+      directory,
+      candidate.entry,
+      "file",
+      options.fileIdentityOptions,
+    );
+    if (!checked) {
       continue;
     }
-    await unlink(path);
+    await deleteManagedFile(checked.path, checked.entry.identity, options.fileIdentityOptions);
     removedCount += 1;
   }
   return { removedCount };
@@ -198,15 +237,17 @@ async function readTerminalJournalState(
 async function resolveTrustedRetentionDirectory(
   layout: CodexLayout,
   childName: "transactions" | "continuation-temp",
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<TrustedRetentionDirectory | undefined> {
   const codexHome = resolve(layout.codexHome);
   const switcher = resolve(layout.switcherDir);
-  if (switcher !== join(codexHome, "provider-switcher")) {
+  const platform = fileIdentityOptions?.platform ?? process.platform;
+  if (!pathsEqual(switcher, join(codexHome, "provider-switcher"), platform)) {
     throw new RetentionError("The retention directory is not located under Codex Home.");
   }
   let switcherStats;
   try {
-    switcherStats = await lstat(switcher, { bigint: true });
+    switcherStats = await lstatWithFileIdentity(switcher, fileIdentityOptions);
   } catch (error: unknown) {
     if (isMissingFileError(error)) {
       return undefined;
@@ -218,14 +259,20 @@ async function resolveTrustedRetentionDirectory(
   }
   const codexHomeRealPath = await realpath(codexHome);
   const switcherRealPath = await realpath(switcher);
-  if (!isPathInsideOrEqual(codexHomeRealPath, switcherRealPath)) {
+  const switcherRealStats = await lstatWithFileIdentity(switcherRealPath, fileIdentityOptions);
+  if (
+    !isSafeDirectory(switcherStats, platform) ||
+    !isSafeDirectory(switcherRealStats, platform) ||
+    !sameStableFileIdentity(switcherStats, switcherRealStats, platform) ||
+    !isPathInsideOrEqual(codexHomeRealPath, switcherRealPath)
+  ) {
     throw new RetentionError("The retention directory escapes Codex Home.");
   }
 
   const childPath = join(switcher, childName);
   let childStats;
   try {
-    childStats = await lstat(childPath, { bigint: true });
+    childStats = await lstatWithFileIdentity(childPath, fileIdentityOptions);
   } catch (error: unknown) {
     if (isMissingFileError(error)) {
       return undefined;
@@ -236,22 +283,21 @@ async function resolveTrustedRetentionDirectory(
     throw new RetentionError("The retention child directory must be a real directory.");
   }
   const childRealPath = await realpath(childPath);
-  if (relative(switcherRealPath, dirname(childRealPath)) !== "") {
+  if (!pathsEqual(relative(switcherRealPath, dirname(childRealPath)), "", platform)) {
     throw new RetentionError("The retention child directory is not directly under its trusted root.");
   }
-  const switcherAfter = await lstat(switcher, { bigint: true });
-  const after = await lstat(childPath, { bigint: true });
+  const childRealStats = await lstatWithFileIdentity(childRealPath, fileIdentityOptions);
+  const switcherAfter = await lstatWithFileIdentity(switcher, fileIdentityOptions);
+  const after = await lstatWithFileIdentity(childPath, fileIdentityOptions);
   if (
-    switcherAfter.isSymbolicLink() ||
-    !switcherAfter.isDirectory() ||
-    switcherAfter.dev !== switcherStats.dev ||
-    switcherAfter.ino !== switcherStats.ino ||
-    after.isSymbolicLink() ||
-    !after.isDirectory() ||
-    after.dev !== childStats.dev ||
-    after.ino !== childStats.ino ||
-    (await realpath(switcher)) !== switcherRealPath ||
-    (await realpath(codexHome)) !== codexHomeRealPath
+    !isSafeDirectory(switcherAfter, platform) ||
+    !sameStableFileIdentity(switcherStats, switcherAfter, platform) ||
+    !isSafeDirectory(after, platform) ||
+    !isSafeDirectory(childRealStats, platform) ||
+    !sameStableFileIdentity(childStats, after, platform) ||
+    !sameStableFileIdentity(after, childRealStats, platform) ||
+    !pathsEqual(await realpath(switcher), switcherRealPath, platform) ||
+    !pathsEqual(await realpath(codexHome), codexHomeRealPath, platform)
   ) {
     throw new RetentionError("The retention child directory changed while it was being validated.");
   }
@@ -259,38 +305,47 @@ async function resolveTrustedRetentionDirectory(
     childName,
     path: childPath,
     realPath: childRealPath,
-    device: after.dev,
-    inode: after.ino,
+    identity: snapshotFileIdentity(after),
   };
 }
 
 async function inspectManagedEntry(
-  directory: TrustedRetentionDirectory,
+  directory: Pick<TrustedRetentionDirectory, "path" | "realPath">,
   name: string,
   expectedKind: "directory" | "file",
-): Promise<{ path: string; entry: ManagedRetentionEntry } | undefined> {
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
+): Promise<{ path: string; realPath: string; entry: ManagedRetentionEntry } | undefined> {
   const path = join(directory.path, name);
   let stats;
   try {
-    stats = await lstat(path, { bigint: true });
+    stats = await lstatWithFileIdentity(path, fileIdentityOptions);
   } catch (error: unknown) {
     if (isMissingFileError(error)) {
       return undefined;
     }
     throw error;
   }
+  const platform = fileIdentityOptions?.platform ?? process.platform;
   if (
     stats.isSymbolicLink() ||
     (expectedKind === "directory" ? !stats.isDirectory() : !stats.isFile()) ||
-    (expectedKind === "file" && stats.nlink !== 1n)
+    (expectedKind === "file" && stats.nlink !== 1n) ||
+    !isSafeManagedEntry(stats, expectedKind, platform)
   ) {
     return undefined;
   }
   const realPath = await realpath(path);
-  if (relative(directory.realPath, dirname(realPath)) !== "") {
+  const realStats = await lstatWithFileIdentity(realPath, fileIdentityOptions);
+  if (!pathsEqual(relative(directory.realPath, dirname(realPath)), "", platform)) {
     return undefined;
   }
-  return { path, entry: { name, device: stats.dev, inode: stats.ino } };
+  if (
+    !isSafeManagedEntry(realStats, expectedKind, platform) ||
+    !sameStableFileIdentity(stats, realStats, platform)
+  ) {
+    return undefined;
+  }
+  return { path, realPath, entry: { name, identity: snapshotFileIdentity(stats) } };
 }
 
 async function revalidateManagedEntry(
@@ -298,34 +353,189 @@ async function revalidateManagedEntry(
   expectedDirectory: TrustedRetentionDirectory,
   entry: ManagedRetentionEntry,
   expectedKind: "directory" | "file",
-): Promise<string | undefined> {
-  const directory = await resolveTrustedRetentionDirectory(layout, expectedDirectory.childName);
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
+): Promise<{ path: string; realPath: string; entry: ManagedRetentionEntry } | undefined> {
+  const directory = await resolveTrustedRetentionDirectory(
+    layout,
+    expectedDirectory.childName,
+    fileIdentityOptions,
+  );
   if (!directory) {
     return undefined;
   }
   if (
-    directory.realPath !== expectedDirectory.realPath ||
-    directory.device !== expectedDirectory.device ||
-    directory.inode !== expectedDirectory.inode
+    !pathsEqual(
+      directory.realPath,
+      expectedDirectory.realPath,
+      fileIdentityOptions?.platform ?? process.platform,
+    ) ||
+    !sameStableFileIdentity(directory.identity, expectedDirectory.identity, fileIdentityOptions?.platform ?? process.platform)
   ) {
     throw new RetentionError("The retention directory changed after it was scanned.");
   }
-  const candidate = await inspectManagedEntry(directory, entry.name, expectedKind);
+  const candidate = await inspectManagedEntry(directory, entry.name, expectedKind, fileIdentityOptions);
   if (!candidate) {
     return undefined;
   }
   if (
-    candidate.entry.device !== entry.device ||
-    candidate.entry.inode !== entry.inode
+    !sameStableFileIdentity(
+      candidate.entry.identity,
+      entry.identity,
+      fileIdentityOptions?.platform ?? process.platform,
+    )
   ) {
     throw new RetentionError("The retention entry changed after it was scanned.");
   }
-  return candidate.path;
+  return candidate;
+}
+
+type RetentionFileIdentityStats = BigIntStats & FileIdentity;
+
+async function lstatWithFileIdentity(
+  path: string,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
+): Promise<RetentionFileIdentityStats> {
+  const stats = await lstat(path, { bigint: true });
+  const identity = await hydrateWindowsFileIdentity(path, stats, fileIdentityOptions);
+  if (identity.windowsFileIdentity !== undefined) {
+    Object.defineProperty(stats, "windowsFileIdentity", {
+      configurable: false,
+      enumerable: true,
+      value: identity.windowsFileIdentity,
+      writable: false,
+    });
+  }
+  return stats as RetentionFileIdentityStats;
+}
+
+function isSafeDirectory(
+  stats: RetentionFileIdentityStats,
+  platform: NodeJS.Platform,
+): boolean {
+  return stats.isDirectory() && !stats.isSymbolicLink() && hasComparableFileIdentity(stats, platform);
+}
+
+function isSafeManagedEntry(
+  stats: RetentionFileIdentityStats,
+  expectedKind: "directory" | "file",
+  platform: NodeJS.Platform,
+): boolean {
+  return (
+    expectedKind === "directory"
+      ? isSafeDirectory(stats, platform)
+      : stats.isFile() && !stats.isSymbolicLink() && stats.nlink === 1n && hasComparableFileIdentity(stats, platform)
+  );
+}
+
+function snapshotFileIdentity(stats: RetentionFileIdentityStats): FileIdentity {
+  return Object.freeze({
+    dev: stats.dev,
+    ino: stats.ino,
+    nlink: stats.nlink,
+    ...(stats.windowsFileIdentity === undefined
+      ? {}
+      : { windowsFileIdentity: stats.windowsFileIdentity }),
+  });
+}
+
+function isWindowsZeroInode(
+  identity: FileIdentity,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
+): boolean {
+  const platform = fileIdentityOptions?.platform ?? process.platform;
+  return platform === "win32" && (identity.ino === 0 || identity.ino === 0n);
+}
+
+async function deleteManagedFile(
+  path: string,
+  expected: FileIdentity,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
+): Promise<void> {
+  if (!isWindowsZeroInode(expected, fileIdentityOptions)) {
+    await unlink(path);
+    return;
+  }
+  const windowsIdentity = expected.windowsFileIdentity;
+  if (!windowsIdentity) {
+    throw new RetentionError("The Windows retention file has no comparable native identity.");
+  }
+  let result: "deleted" | "identity-mismatch";
+  try {
+    result = (fileIdentityOptions?.windowsFileOperations ?? createWindowsFileOperations())
+      .deleteFileIfMatches(path, windowsIdentity);
+  } catch (error: unknown) {
+    throw new RetentionError("The Windows retention file could not be deleted safely.", { cause: error });
+  }
+  if (result !== "deleted") {
+    throw new RetentionError("The Windows retention file changed before deletion.");
+  }
+}
+
+async function removeZeroInodeDirectory(
+  candidate: { path: string; realPath: string; entry: ManagedRetentionEntry },
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
+): Promise<void> {
+  const platform = fileIdentityOptions?.platform ?? process.platform;
+  const directory = { path: candidate.path, realPath: candidate.realPath };
+  const entries = await readdir(candidate.path, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.isSymbolicLink() || (!entry.isDirectory() && !entry.isFile())) {
+      throw new RetentionError("The Windows retention directory contains an unsafe entry.");
+    }
+    const child = await inspectManagedEntry(
+      directory,
+      entry.name,
+      entry.isDirectory() ? "directory" : "file",
+      fileIdentityOptions,
+    );
+    if (!child) {
+      throw new RetentionError("The Windows retention entry changed while it was being removed.");
+    }
+    if (entry.isDirectory()) {
+      if (!isWindowsZeroInode(child.entry.identity, fileIdentityOptions)) {
+        throw new RetentionError("The Windows retention directory identity is not safely comparable.");
+      }
+      await removeZeroInodeDirectory(child, fileIdentityOptions);
+    } else {
+      await deleteManagedFile(child.path, child.entry.identity, fileIdentityOptions);
+    }
+  }
+
+  const finalStats = await lstatWithFileIdentity(candidate.path, fileIdentityOptions);
+  const finalRealPath = await realpath(candidate.path);
+  if (
+    !isSafeDirectory(finalStats, platform) ||
+    !sameStableFileIdentity(finalStats, candidate.entry.identity, platform) ||
+    !pathsEqual(finalRealPath, candidate.realPath, platform) ||
+    (await readdir(candidate.path)).length !== 0
+  ) {
+    throw new RetentionError("The Windows retention directory changed before deletion.");
+  }
+  const windowsIdentity = candidate.entry.identity.windowsFileIdentity;
+  if (!windowsIdentity) {
+    throw new RetentionError("The Windows retention directory has no comparable native identity.");
+  }
+  let result: "deleted" | "identity-mismatch";
+  try {
+    result = (fileIdentityOptions?.windowsFileOperations ?? createWindowsFileOperations())
+      .deleteFileIfMatches(candidate.path, windowsIdentity);
+  } catch (error: unknown) {
+    throw new RetentionError("The Windows retention directory could not be deleted safely.", { cause: error });
+  }
+  if (result !== "deleted") {
+    throw new RetentionError("The Windows retention directory changed before deletion.");
+  }
 }
 
 function isPathInsideOrEqual(directory: string, candidate: string): boolean {
   const path = relative(resolve(directory), resolve(candidate));
   return !path.startsWith("..") && !isAbsolute(path);
+}
+
+function pathsEqual(left: string, right: string, platform: NodeJS.Platform = process.platform): boolean {
+  return platform === "win32"
+    ? left.toLocaleLowerCase("en-US") === right.toLocaleLowerCase("en-US")
+    : left === right;
 }
 
 function positiveInteger(value: number | undefined, fallback: number): number {
