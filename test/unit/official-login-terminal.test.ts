@@ -33,6 +33,9 @@ test("runs native login then status with the active Codex Home", async () => {
   });
   assert.equal(harness.showCalls, 1);
   assert.deepEqual(result, { loginExitCode: 0, statusExitCode: 0 });
+  assert.equal(harness.disposeCalls, 0);
+  assert.equal(harness.shellIntegrationListenerCount, 0);
+  assert.equal(harness.endListenerCount, 0);
 });
 
 test("fails closed when Shell Integration does not activate", async () => {
@@ -46,6 +49,29 @@ test("fails closed when Shell Integration does not activate", async () => {
     /shell integration/i,
   );
   assert.deepEqual(harness.commands, []);
+  assert.equal(harness.disposeCalls, 1);
+  assert.equal(harness.shellIntegrationListenerCount, 0);
+});
+
+test("does not lose Shell Integration readiness during listener registration", async () => {
+  const controller = new AbortController();
+  const harness = createHarness({
+    shellIntegration: false,
+    activateShellIntegrationDuringFirstCheck: true,
+  });
+  const executor = createVscodeOfficialLoginExecutor(harness.api, {
+    shellIntegrationTimeoutMs: 20,
+  });
+
+  const result = await executor.run(layout, controller.signal);
+
+  assert.deepEqual(result, { loginExitCode: 0, statusExitCode: 0 });
+  assert.deepEqual(harness.commands, [
+    ["codex", ["login"]],
+    ["codex", ["login", "status"]],
+  ]);
+  assert.equal(harness.disposeCalls, 0);
+  assert.equal(harness.shellIntegrationListenerCount, 0);
 });
 
 test("returns cancellation when abort races with Shell Integration listener registration", async () => {
@@ -103,6 +129,37 @@ test("returns an unknown exit code instead of treating it as success", async () 
     statusExitCode: undefined,
   });
   assert.deepEqual(harness.commands, [["codex", ["login"]]]);
+  assert.equal(harness.disposeCalls, 1);
+});
+
+test("disposes the terminal when login exits non-zero", async () => {
+  const harness = createHarness({ exitCodes: [1, 0] });
+  const executor = createVscodeOfficialLoginExecutor(harness.api);
+
+  const result = await executor.run(layout);
+
+  assert.deepEqual(result, { loginExitCode: 1, statusExitCode: undefined });
+  assert.equal(harness.disposeCalls, 1);
+});
+
+test("disposes the terminal when status exits non-zero", async () => {
+  const harness = createHarness({ exitCodes: [0, 1] });
+  const executor = createVscodeOfficialLoginExecutor(harness.api);
+
+  const result = await executor.run(layout);
+
+  assert.deepEqual(result, { loginExitCode: 0, statusExitCode: 1 });
+  assert.equal(harness.disposeCalls, 1);
+});
+
+test("disposes the terminal when status exit code is unknown", async () => {
+  const harness = createHarness({ exitCodes: [0, undefined] });
+  const executor = createVscodeOfficialLoginExecutor(harness.api);
+
+  const result = await executor.run(layout);
+
+  assert.deepEqual(result, { loginExitCode: 0, statusExitCode: undefined });
+  assert.equal(harness.disposeCalls, 1);
 });
 
 test("ignores an end event for another execution", async () => {
@@ -200,6 +257,7 @@ test("cleans up command resources when executeCommand throws synchronously", asy
 
 interface HarnessOptions {
   shellIntegration?: boolean;
+  activateShellIntegrationDuringFirstCheck?: boolean;
   exitCodes?: Array<number | undefined>;
   emitWrongExecutionFirst?: boolean;
   pendingFirstCommand?: boolean;
@@ -252,10 +310,12 @@ function createHarness(options: HarnessOptions = {}) {
       return execution;
     },
   };
+  let activeShellIntegration = options.shellIntegration === undefined || options.shellIntegration
+    ? shell
+    : undefined;
+  let shellIntegrationReads = 0;
   const terminal: FakeTerminal = {
-    shellIntegration: options.shellIntegration === undefined || options.shellIntegration
-      ? shell
-      : undefined,
+    shellIntegration: activeShellIntegration,
     showCalls: 0,
     show() {
       this.showCalls += 1;
@@ -270,6 +330,18 @@ function createHarness(options: HarnessOptions = {}) {
       disposeCalls += 1;
     },
   };
+  Object.defineProperty(terminal, "shellIntegration", {
+    get() {
+      shellIntegrationReads += 1;
+      if (options.activateShellIntegrationDuringFirstCheck && shellIntegrationReads === 1) {
+        const integrationBeforeRead = activeShellIntegration;
+        activeShellIntegration = shell;
+        shellEvent.fire({ terminal, shellIntegration: shell });
+        return integrationBeforeRead;
+      }
+      return activeShellIntegration;
+    },
+  });
   let disposeCalls = 0;
   let terminalOptions: unknown;
   const api: OfficialLoginTerminalApi = {

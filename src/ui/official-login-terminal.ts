@@ -107,6 +107,7 @@ export function createVscodeOfficialLoginExecutor(
         return cancelledResult();
       }
       if (login.exitCode !== 0) {
+        terminal.dispose();
         return {
           loginExitCode: login.exitCode,
           statusExitCode: undefined,
@@ -123,6 +124,9 @@ export function createVscodeOfficialLoginExecutor(
       );
       if (status.cancelled) {
         return cancelledResult();
+      }
+      if (status.exitCode !== 0) {
+        terminal.dispose();
       }
       return {
         loginExitCode: login.exitCode,
@@ -169,6 +173,11 @@ async function waitForShellIntegration(
       terminal.dispose();
       settle(() => resolve({ cancelled: true }));
     };
+    const currentShellIntegration = terminal.shellIntegration;
+    if (currentShellIntegration) {
+      settle(() => resolve({ value: currentShellIntegration, cancelled: false }));
+      return;
+    }
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) {
       abort();
