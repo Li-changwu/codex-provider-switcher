@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { renameSync, writeFileSync } from "node:fs";
+import { realpathSync, renameSync, writeFileSync } from "node:fs";
 import { access, copyFile, link, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
@@ -1519,31 +1519,10 @@ async function withZeroInodeStats(callback: () => Promise<void>): Promise<void> 
   syncBuiltinESMExports();
   try {
     await callback();
-  } catch (error: unknown) {
-    console.error("zero-inode continuation diagnostic", describeErrorChain(error));
-    throw error;
   } finally {
     mutableFs.lstat = originalLstat;
     syncBuiltinESMExports();
   }
-}
-
-function describeErrorChain(error: unknown): unknown {
-  if (!(error instanceof Error)) {
-    return error;
-  }
-  const description: Record<string, unknown> = {
-    name: error.name,
-    message: error.message,
-    code: (error as NodeJS.ErrnoException).code,
-  };
-  if (error.cause !== undefined) {
-    description.cause = describeErrorChain(error.cause);
-  }
-  if (error instanceof AggregateError) {
-    description.errors = error.errors.map((entry) => describeErrorChain(entry));
-  }
-  return description;
 }
 
 function withZeroInodeStatsValue<T extends Awaited<ReturnType<typeof lstat>>>(stats: T): T {
@@ -1572,20 +1551,18 @@ function zeroInodeIdentityOptions(
 class DeterministicWindowsFileOperations implements WindowsFileOperations {
   private readonly identities = new Map<string, WindowsFileIdentity>();
   private readonly captureCounts = new Map<string, number>();
-  private replacement?: { path: string; afterCaptureCount: number };
+  private replacement?: { key: string; path: string; afterCaptureCount: number };
 
   captureFileIdentity(path: string): WindowsFileIdentity {
-    const key = path.toLowerCase();
+    const key = this.canonicalKey(path);
     const count = (this.captureCounts.get(key) ?? 0) + 1;
     this.captureCounts.set(key, count);
-    console.error("zero-inode capture", { count, path });
     const identity = this.identities.get(key) ?? this.createIdentity(this.identities.size + 1);
     this.identities.set(key, identity);
-    if (this.replacement?.path.toLowerCase() === key && this.replacement.afterCaptureCount === count) {
+    if (this.replacement?.key === key && this.replacement.afterCaptureCount === count) {
       const replacementPath = `${path}.replacement`;
       writeFileSync(replacementPath, "replacement state", "utf8");
       renameSync(replacementPath, path);
-      console.error("zero-inode replacement", { path });
       this.identities.set(key, this.createIdentity(this.identities.size + 1));
       this.replacement = undefined;
     }
@@ -1603,9 +1580,14 @@ class DeterministicWindowsFileOperations implements WindowsFileOperations {
   replaceStateAfterNextTrustCheck(layout: CodexLayout): void {
     const path = join(layout.switcherDir, "state.sqlite");
     this.replacement = {
+      key: this.canonicalKey(path),
       path,
-      afterCaptureCount: (this.captureCounts.get(path.toLowerCase()) ?? 0) + 2,
+      afterCaptureCount: (this.captureCounts.get(this.canonicalKey(path)) ?? 0) + 2,
     };
+  }
+
+  private canonicalKey(path: string): string {
+    return realpathSync.native(path).toLowerCase();
   }
 
   private createIdentity(index: number): WindowsFileIdentity {
