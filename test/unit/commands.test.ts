@@ -4,6 +4,7 @@ import {
   createProfileCommandHandlers,
   createVscodeProfileCommandUi,
 } from "../../src/ui/commands";
+import type { OfficialLoginExecutor } from "../../src/core/official-login";
 import type { CodexLayout, ProfileRecord } from "../../src/core/types";
 
 const customToml = [
@@ -75,6 +76,42 @@ test("prompts for and stores API keys only for custom Profiles after persistence
     fixture.ui.inputOptions.filter((options) => options.password === true).length,
     1,
   );
+});
+
+test("passes the official login executor to a stored Profile switch", async () => {
+  const active = profile("research", "Research", "custom");
+  const target = profile("official", "Official", "official");
+  const officialLogin: OfficialLoginExecutor = {
+    run: async () => ({ loginExitCode: 0, statusExitCode: 0 }),
+  };
+  const fixture = commandFixture({
+    records: [active, target],
+    activeProfileId: active.id,
+    picks: [target.id],
+    confirmations: [true],
+    officialLogin,
+  });
+  let receivedOfficialLogin: OfficialLoginExecutor | undefined;
+  fixture.switchStoredProfile = async (_request, dependencies) => {
+    receivedOfficialLogin = dependencies.officialLogin;
+    return switchResult("committed");
+  };
+  fixture.rebuildHandlers();
+
+  await fixture.handlers.switchProfile();
+
+  assert.equal(receivedOfficialLogin, officialLogin);
+});
+
+test("does not show the manual codex login prompt after creating an official Profile", async () => {
+  const fixture = commandFixture({
+    inputs: ["Official", officialToml],
+    picks: ["official"],
+  });
+
+  await fixture.handlers.createProfile();
+
+  assert.deepEqual(fixture.ui.infos, ["Profile created."]);
 });
 
 test("confirms a selected target Profile and invokes one stored switch", async () => {
@@ -277,12 +314,14 @@ function commandFixture(options: {
   activeProfileId?: string;
   cancelProgress?: boolean;
   failSecretWrite?: boolean;
+  officialLogin?: OfficialLoginExecutor;
 } = {}) {
   const events: string[] = [];
   const profiles = new FakeProfiles(options.records ?? [], events);
   const secrets = new FakeSecrets(events, options.failSecretWrite ?? false);
   const activeProfiles = new FakeActiveProfiles(options.activeProfileId);
   const ui = new FakeUi(options);
+  const officialLogin = options.officialLogin;
   let statusRefreshes = 0;
   let switchStoredProfile = async () => switchResult("committed");
   let continueSession = async () => ({
@@ -302,6 +341,7 @@ function commandFixture(options: {
     secrets,
     activeProfiles,
     ui,
+    officialLogin,
     switchStoredProfile,
     continueSession,
     recoverPendingSwitches,
