@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { execFile as nativeExecFile } from "node:child_process";
 import { lstatSync, unlinkSync } from "node:fs";
-import { link, lstat, mkdir, mkdtemp, open, readFile, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, mkdtemp, open, readFile, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import type { CodexLayout } from "../../src/core/types";
 import {
   ActiveProfileStore,
@@ -13,6 +15,7 @@ import {
 import type { WindowsFileOperations } from "../../src/core/windows-file-operations";
 
 const nodeRequire = createRequire(import.meta.url);
+const execFile = promisify(nativeExecFile);
 
 test("persists a strict non-secret active Profile record inside Codex Home", async () => {
   await withTemporaryLayout(async (layout) => {
@@ -33,6 +36,44 @@ test("persists a strict non-secret active Profile record inside Codex Home", asy
     assert.doesNotMatch(contents, /OPENAI_API_KEY|api.?key/i);
     assert.ok(store.path.startsWith(layout.codexHome));
   });
+});
+
+test("accepts a Windows 8.3 alias for trusted directories", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows path aliases are not available on this platform.");
+    return;
+  }
+
+  const canonicalHome = await mkdtemp(join(tmpdir(), "codex-provider-switcher-short-path-"));
+  try {
+    const shortHome = await windowsShortPath(canonicalHome);
+    if (shortHome === undefined || shortHome === canonicalHome) {
+      t.skip("Windows short-path aliases are unavailable on this runner.");
+      return;
+    }
+
+    const layout: CodexLayout = {
+      codexHome: shortHome,
+      configPath: join(shortHome, "config.toml"),
+      authPath: join(shortHome, "auth.json"),
+      sessionsDir: join(shortHome, "sessions"),
+      archivedSessionsDir: join(shortHome, "archived_sessions"),
+      sqlitePath: join(shortHome, "state_5.sqlite"),
+      switcherDir: join(shortHome, "provider-switcher"),
+    };
+    const store = new ActiveProfileStore(layout, {
+      now: () => "2026-08-25T00:00:00.000Z",
+    });
+
+    assert.deepEqual(await store.set("research-proxy"), { state: "missing" });
+    assert.deepEqual(await store.get(), {
+      version: 1,
+      profileId: "research-proxy",
+      updatedAt: "2026-08-25T00:00:00.000Z",
+    });
+  } finally {
+    await rm(canonicalHome, { recursive: true, force: true });
+  }
 });
 
 test("accepts zero-inode Windows active Profile storage with canonical file identities", async (t) => {
@@ -420,6 +461,20 @@ async function withTemporaryLayout(
     await callback(layout);
   } finally {
     await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
+async function windowsShortPath(path: string): Promise<string | undefined> {
+  try {
+    const result = await execFile(
+      "cmd.exe",
+      ["/d", "/c", `for %I in (${path}) do @echo %~sI`],
+      { encoding: "utf8" },
+    );
+    const shortPath = result.stdout.trim();
+    return shortPath.length === 0 ? undefined : shortPath;
+  } catch {
+    return undefined;
   }
 }
 

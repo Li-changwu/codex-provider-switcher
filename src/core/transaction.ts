@@ -356,18 +356,20 @@ async function inspectTrustedTransactionDirectory(
   if (!isTrustedTransactionDirectoryStats(before)) {
     throw new TransactionError("journal-invalid", "The transaction directory is not a real directory.");
   }
-  const pathReal = await realpath(path);
-  if (expectedParentRealPath && !isPathInsideOrEqual(expectedParentRealPath, pathReal)) {
+  const realPath = await lstatRealPathWithTransactionIdentity(path, fileIdentityOptions);
+  if (expectedParentRealPath && !isPathInsideOrEqual(expectedParentRealPath, realPath.path)) {
     throw new TransactionError("journal-invalid", "The transaction directory escapes its trusted root.");
   }
   const after = await lstatWithTransactionIdentity(path, fileIdentityOptions);
   if (
     !isTrustedTransactionDirectoryStats(after) ||
-    !hasSameStableFileIdentity(before, after, fileIdentityOptions?.platform)
+    !isTrustedTransactionDirectoryStats(realPath.stats) ||
+    !hasSameStableFileIdentity(before, after, fileIdentityOptions?.platform) ||
+    !hasSameStableFileIdentity(after, realPath.stats, fileIdentityOptions?.platform)
   ) {
     throw new TransactionError("journal-invalid", "The transaction directory changed while being inspected.");
   }
-  return { path, realPath: pathReal, stats: after };
+  return { path, realPath: realPath.path, stats: after };
 }
 
 async function assertTrustedTransactionDirectory(
@@ -1863,6 +1865,7 @@ interface ValidatedByteRestoreTarget {
   readonly expectedVersion?: ByteTargetVersion;
   readonly shouldRestore: boolean;
   readonly backupPath?: string;
+  readonly backupDirectoryRealPath?: string;
   readonly backupHandle?: FileHandle;
   readonly backupStats?: BigIntStats;
 }
@@ -1887,6 +1890,11 @@ async function validateByteRestoreTargets(
 
   const manifest = await readBackupManifest(manifestPath, io, fileIdentityOptions);
   const backupDirectory = dirname(manifestPath);
+  const operationDirectoryRealPath = await realpath(dirname(backupDirectory));
+  const backupDirectoryRealPath = await realpath(backupDirectory);
+  if (!isInsideDirectory(operationDirectoryRealPath, backupDirectoryRealPath)) {
+    throw new TransactionError("rollback-failed", "The backup directory escapes its transaction directory.");
+  }
   const validatedTargets: ValidatedByteRestoreTarget[] = [];
   const seen = new Set<string>();
   try {
@@ -1938,6 +1946,7 @@ async function validateByteRestoreTargets(
       const verifiedBackup = await openVerifiedRestoreBackup(
         backupPath,
         entry.sha256!,
+        backupDirectoryRealPath,
         io,
         fileIdentityOptions,
       );
@@ -1947,6 +1956,7 @@ async function validateByteRestoreTargets(
         expectedVersion,
         shouldRestore: true,
         backupPath,
+        backupDirectoryRealPath,
         backupHandle: verifiedBackup.handle,
         backupStats: verifiedBackup.stats,
       });
@@ -2038,6 +2048,7 @@ interface TrustedRestoreParent {
   readonly operationalPath: string;
   readonly stats: BigIntStats;
   readonly realPath: string;
+  readonly trustedRootRealPaths: readonly string[];
   readonly handle?: FileHandle;
 }
 
@@ -2049,7 +2060,12 @@ async function restoreFileAtomically(
   io?: TransactionIo,
   fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<void> {
-  if (!source.backupPath || !source.backupHandle || !source.backupStats) {
+  if (
+    !source.backupPath ||
+    !source.backupDirectoryRealPath ||
+    !source.backupHandle ||
+    !source.backupStats
+  ) {
     throw new TransactionError("rollback-failed", "The backup manifest is incomplete.");
   }
   const mode = source.entry.mode;
@@ -2080,6 +2096,7 @@ async function restoreFileAtomically(
       source.backupHandle,
       source.backupStats,
       undefined,
+      source.backupDirectoryRealPath,
       fileIdentityOptions,
     );
     await temporaryHandle.chmod(mode);
@@ -2091,6 +2108,7 @@ async function restoreFileAtomically(
       source.backupHandle,
       source.backupStats,
       undefined,
+      source.backupDirectoryRealPath,
       fileIdentityOptions,
     );
     await assertTrustedRestoreParent(parent, fileIdentityOptions);
@@ -2245,11 +2263,16 @@ async function openTrustedRestoreParent(
   const resolvedDestination = resolve(destination);
   assertAllowedBackupTarget(layout, kind, resolvedDestination);
   const logicalPath = dirname(resolvedDestination);
+  const trustedRootRealPaths = await trustedRestoreRootRealPaths(layout, kind);
   const inspected = await inspectTrustedRestoreParent(logicalPath, fileIdentityOptions);
+  if (!isInsideAnyDirectory(trustedRootRealPaths, inspected.realPath)) {
+    throw new TransactionError("rollback-failed", "The restore target parent escapes its trusted root.");
+  }
   if ((fileIdentityOptions?.platform ?? process.platform) !== "linux") {
     return {
       logicalPath,
       operationalPath: logicalPath,
+      trustedRootRealPaths,
       ...inspected,
     };
   }
@@ -2270,6 +2293,7 @@ async function openTrustedRestoreParent(
     return {
       logicalPath,
       operationalPath: `/proc/self/fd/${String(handle.fd)}`,
+      trustedRootRealPaths,
       ...inspected,
       handle,
     };
@@ -2291,7 +2315,8 @@ async function assertTrustedRestoreParent(
   const current = await inspectTrustedRestoreParent(parent.logicalPath, fileIdentityOptions);
   if (
     !hasSameBigIntFileIdentity(parent.stats, current.stats, fileIdentityOptions?.platform) ||
-    !sameResolvedPath(parent.realPath, current.realPath)
+    !sameResolvedPath(parent.realPath, current.realPath) ||
+    !isInsideAnyDirectory(parent.trustedRootRealPaths, current.realPath)
   ) {
     throw new TransactionError("rollback-failed", "The restore target parent changed after validation.");
   }
@@ -2310,6 +2335,23 @@ async function assertTrustedRestoreParent(
   }
 }
 
+async function trustedRestoreRootRealPaths(
+  layout: CodexLayout,
+  kind: BackupKind,
+): Promise<readonly string[]> {
+  if (kind === "config" || kind === "sqlite") {
+    return [await realpath(resolve(layout.codexHome))];
+  }
+  return await Promise.all([
+    realpath(resolve(layout.sessionsDir)),
+    realpath(resolve(layout.archivedSessionsDir)),
+  ]);
+}
+
+function isInsideAnyDirectory(directories: readonly string[], path: string): boolean {
+  return directories.some((directory) => isPathInsideOrEqual(directory, path));
+}
+
 async function inspectTrustedRestoreParent(
   logicalPath: string,
   fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
@@ -2318,16 +2360,17 @@ async function inspectTrustedRestoreParent(
   if (!isSafeRestoreParentStats(before, fileIdentityOptions?.platform)) {
     throw new TransactionError("rollback-failed", "The restore target parent is not a real directory.");
   }
-  const realPath = await realpath(logicalPath);
+  const realPath = await lstatRealPathWithTransactionIdentity(logicalPath, fileIdentityOptions);
   const after = await lstatWithTransactionIdentity(logicalPath, fileIdentityOptions);
   if (
     !isSafeRestoreParentStats(after, fileIdentityOptions?.platform) ||
+    !isSafeRestoreParentStats(realPath.stats, fileIdentityOptions?.platform) ||
     !hasSameBigIntFileIdentity(before, after, fileIdentityOptions?.platform) ||
-    !sameResolvedPath(realPath, logicalPath)
+    !hasSameBigIntFileIdentity(after, realPath.stats, fileIdentityOptions?.platform)
   ) {
     throw new TransactionError("rollback-failed", "The restore target parent is indirect or changed.");
   }
-  return { stats: after, realPath };
+  return { stats: after, realPath: realPath.path };
 }
 
 function isSafeRestoreParentStats(
@@ -2356,6 +2399,7 @@ async function syncTrustedRestoreParent(
 async function openVerifiedRestoreBackup(
   path: string,
   expectedHash: string,
+  trustedDirectoryRealPath: string,
   io?: TransactionIo,
   fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<{ handle: FileHandle; stats: BigIntStats }> {
@@ -2370,6 +2414,7 @@ async function openVerifiedRestoreBackup(
       handle,
       pathStats,
       openedStats,
+      trustedDirectoryRealPath,
       fileIdentityOptions,
     );
     if ((await hashOpenedFile(handle, io)) !== expectedHash) {
@@ -2384,6 +2429,7 @@ async function openVerifiedRestoreBackup(
       handle,
       openedStats,
       verifiedStats,
+      trustedDirectoryRealPath,
       fileIdentityOptions,
     );
     return { handle, stats: verifiedStats };
@@ -2405,6 +2451,7 @@ async function assertVerifiedRestoreBackup(
   handle: FileHandle,
   expectedStats: BigIntStats,
   actualStats?: BigIntStats,
+  trustedDirectoryRealPath?: string,
   fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<void> {
   const handleStats = actualStats ?? await statWithTransactionIdentity(
@@ -2439,7 +2486,13 @@ async function assertVerifiedRestoreBackup(
       "The backup manifest backup path changed after validation.",
     );
   }
-  if (!sameResolvedPath(await realpath(path), path)) {
+  const realPath = await lstatRealPathWithTransactionIdentity(path, fileIdentityOptions);
+  if (
+    !isSafeRestoreBackupStats(realPath.stats, fileIdentityOptions?.platform) ||
+    !hasSameBigIntFileIdentity(handleStats, realPath.stats, fileIdentityOptions?.platform) ||
+    (trustedDirectoryRealPath !== undefined &&
+      !isInsideDirectory(trustedDirectoryRealPath, realPath.path))
+  ) {
     throw new TransactionError(
       "rollback-failed",
       "The backup manifest backup path is indirect.",
@@ -3605,6 +3658,17 @@ async function lstatWithTransactionIdentity(
   );
 }
 
+async function lstatRealPathWithTransactionIdentity(
+  logicalPath: string,
+  options?: HydrateWindowsFileIdentityOptions,
+): Promise<{ readonly path: string; readonly stats: BigIntStats }> {
+  const path = await realpath(logicalPath);
+  return {
+    path,
+    stats: await lstatWithTransactionIdentity(path, options),
+  };
+}
+
 async function statWithTransactionIdentity(
   handle: FileHandle,
   logicalPath: string,
@@ -3794,8 +3858,12 @@ async function assertOpenedBackupSource(
   ) {
     throw new Error("The backup source path changed.");
   }
-  const sourceRealPath = await realpath(sourcePath);
-  if (!sameResolvedPath(sourceRealPath, sourcePath)) {
+  const sourceRealPath = await lstatRealPathWithTransactionIdentity(sourcePath, fileIdentityOptions);
+  if (
+    !isSafeOpenedBackupStats(sourceRealPath.stats, fileIdentityOptions?.platform) ||
+    !hasSameBigIntFileIdentity(openedStats, sourceRealPath.stats, fileIdentityOptions?.platform) ||
+    openedStats.mode !== sourceRealPath.stats.mode
+  ) {
     throw new Error("The backup source path is indirect.");
   }
   const authStats = await lstatBigIntIfPresent(resolve(layout.authPath), fileIdentityOptions);

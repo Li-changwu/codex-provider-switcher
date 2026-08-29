@@ -480,10 +480,12 @@ async function inspectTrustedDirectory(
     }
     const realPath = await realpath(path);
     const after = await lstatWithFileIdentity(path, fileIdentityOptions);
+    const realPathStats = await lstatWithFileIdentity(realPath, fileIdentityOptions);
     if (
       !isSafeDirectory(after) ||
+      !sameFileIdentity(after, realPathStats) ||
       !sameFileIdentity(before, after) ||
-      !sameResolvedPath(realPath, path)
+      !isSafeDirectory(realPathStats)
     ) {
       throw unsafeStateError();
     }

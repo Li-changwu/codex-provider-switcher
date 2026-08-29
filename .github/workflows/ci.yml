@@ -24,9 +24,6 @@ jobs:
       - run: npm ci
       - if: matrix.os == 'windows-latest'
         run: npm run build:windows-file-ops
-      - if: matrix.os == 'windows-latest'
-        run: |
-          node -e "const fs=require('node:fs'); const os=require('node:os'); const path=require('node:path'); const addon=require(path.resolve('native/windows-file-ops/windows_file_ops.node')); const directory=fs.mkdtempSync(path.join(os.tmpdir(),'codex-ci-probe-')); const file=path.join(directory,'probe.txt'); fs.writeFileSync(file,'probe'); for (const target of [process.cwd(), directory, file]) { const stats=fs.lstatSync(target,{bigint:true}); const native=addon.captureFileIdentity(target); console.log(JSON.stringify({target,version:process.version,platform:process.platform,arch:process.arch,dev:stats.dev.toString(),ino:stats.ino.toString(),nlink:stats.nlink.toString(),mode:stats.mode.toString(),native:{...native,linkCount:native.linkCount.toString()}})); } fs.rmSync(directory,{recursive:true,force:true});"
       - run: npm run check
       - run: npm test
       - run: npm run test:integration

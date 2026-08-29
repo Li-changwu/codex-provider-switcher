@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFile as nativeExecFile } from "node:child_process";
 import { lstatSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import {
   chmod,
@@ -18,6 +19,7 @@ import { createRequire, syncBuiltinESMExports } from "node:module";
 import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
+import { promisify } from "node:util";
 import type { CodexLayout, ProfileRecord } from "../../src/core/types";
 import {
   ProfileStore,
@@ -38,6 +40,54 @@ import type {
 } from "../../src/core/windows-file-operations";
 
 const nodeRequire = createRequire(import.meta.url);
+const execFile = promisify(nativeExecFile);
+
+test("accepts a Windows 8.3 alias for Profile storage", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows path aliases are not available on this platform.");
+    return;
+  }
+
+  const canonicalHome = await mkdtemp(join(tmpdir(), "codex-provider-switcher-short-path-"));
+  try {
+    const shortHome = await windowsShortPath(canonicalHome);
+    if (shortHome === undefined || shortHome === canonicalHome) {
+      t.skip("Windows short-path aliases are unavailable on this runner.");
+      return;
+    }
+
+    const layout: CodexLayout = {
+      codexHome: shortHome,
+      configPath: join(shortHome, "config.toml"),
+      authPath: join(shortHome, "auth.json"),
+      sessionsDir: join(shortHome, "sessions"),
+      archivedSessionsDir: join(shortHome, "archived_sessions"),
+      sqlitePath: join(shortHome, "state_5.sqlite"),
+      switcherDir: join(shortHome, "provider-switcher"),
+    };
+    const store = new ProfileStore(layout, {
+      now: () => "2026-08-30T00:00:00.000Z",
+    });
+
+    const created = await store.create({
+      name: "Short Path Proxy",
+      kind: "custom",
+      configText: 'model_provider = "proxy"\n',
+      providerId: "proxy",
+    });
+
+    assert.equal(await store.readConfig(created.id), 'model_provider = "proxy"\n');
+    await store.update(created.id, {
+      name: "Short Path Updated",
+      kind: "custom",
+      configText: 'model_provider = "updated"\n',
+      providerId: "updated",
+    });
+    assert.deepEqual((await store.list()).map((profile) => profile.name), ["Short Path Updated"]);
+  } finally {
+    await rm(canonicalHome, { recursive: true, force: true });
+  }
+});
 
 test("creates normalized profile IDs and deterministic collision suffixes", async () => {
   await withTemporaryLayout(async (layout) => {
@@ -3488,6 +3538,20 @@ function createFileSystemError(
   const error = new Error(message) as NodeJS.ErrnoException;
   error.code = code;
   return error;
+}
+
+async function windowsShortPath(path: string): Promise<string | undefined> {
+  try {
+    const result = await execFile(
+      "cmd.exe",
+      ["/d", "/c", `for %I in (${path}) do @echo %~sI`],
+      { encoding: "utf8" },
+    );
+    const shortPath = result.stdout.trim();
+    return shortPath.length === 0 ? undefined : shortPath;
+  } catch {
+    return undefined;
+  }
 }
 
 function isPersistenceErrorWithCause(

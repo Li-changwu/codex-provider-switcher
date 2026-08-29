@@ -673,7 +673,10 @@ export class ProfileStore {
       }
       return undefined;
     }
-    if (!isSafeProfileFile(stats) || !sameResolvedPath(await nativeRealpath(configPath), configPath)) {
+    if (
+      !isSafeProfileFile(stats) ||
+      !(await sameProfilePathIdentity(configPath, await nativeRealpath(configPath), this.fileIdentityOptions))
+    ) {
       throw profilePersistenceError();
     }
     return { root, directory, config: stats, path: configPath };
@@ -745,7 +748,8 @@ export class ProfileStore {
     const stats = await lstatBigIntIfPresent(path, this.fileIdentityOptions);
     if (
       stats &&
-      (!isSafeProfileFile(stats) || !sameResolvedPath(await nativeRealpath(path), path))
+      (!isSafeProfileFile(stats) ||
+        !(await sameProfilePathIdentity(path, await nativeRealpath(path), this.fileIdentityOptions)))
     ) {
       throw profilePersistenceError();
     }
@@ -877,7 +881,7 @@ async function ensureTrustedProfileDirectory(
   if (
     !isSafeProfileDirectory(parent) ||
     !sameProfileFileIdentity(parent, expectedParent) ||
-    !sameResolvedPath(await nativeRealpath(path), path)
+    !(await sameProfilePathIdentity(path, await nativeRealpath(path), fileIdentityOptions))
   ) {
     throw profilePersistenceError();
   }
@@ -893,7 +897,10 @@ async function inspectTrustedProfileDirectory(
   fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
 ): Promise<ProfileFileIdentityStats> {
   const before = await lstatBigIntWithFileIdentity(path, fileIdentityOptions);
-  if (!isSafeProfileDirectory(before) || !sameResolvedPath(await nativeRealpath(path), path)) {
+  if (
+    !isSafeProfileDirectory(before) ||
+    !(await sameProfilePathIdentity(path, await nativeRealpath(path), fileIdentityOptions))
+  ) {
     throw profilePersistenceError();
   }
   const after = await lstatBigIntWithFileIdentity(path, fileIdentityOptions);
@@ -1019,6 +1026,22 @@ function sameResolvedPath(left: string, right: string): boolean {
   return process.platform === "win32"
     ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
     : normalizedLeft === normalizedRight;
+}
+
+async function sameProfilePathIdentity(
+  logicalPath: string,
+  realPath: string,
+  fileIdentityOptions: HydrateWindowsFileIdentityOptions | undefined,
+): Promise<boolean> {
+  const [logicalStats, realStats] = await Promise.all([
+    lstatBigIntWithFileIdentity(logicalPath, fileIdentityOptions),
+    lstatBigIntWithFileIdentity(realPath, fileIdentityOptions),
+  ]);
+  return sameStableFileIdentity(
+    logicalStats,
+    realStats,
+    profileIdentityPlatform(fileIdentityOptions),
+  );
 }
 
 async function lstatBigIntIfPresent(
