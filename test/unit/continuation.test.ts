@@ -1519,10 +1519,31 @@ async function withZeroInodeStats(callback: () => Promise<void>): Promise<void> 
   syncBuiltinESMExports();
   try {
     await callback();
+  } catch (error: unknown) {
+    console.error("zero-inode continuation diagnostic", describeErrorChain(error));
+    throw error;
   } finally {
     mutableFs.lstat = originalLstat;
     syncBuiltinESMExports();
   }
+}
+
+function describeErrorChain(error: unknown): unknown {
+  if (!(error instanceof Error)) {
+    return error;
+  }
+  const description: Record<string, unknown> = {
+    name: error.name,
+    message: error.message,
+    code: (error as NodeJS.ErrnoException).code,
+  };
+  if (error.cause !== undefined) {
+    description.cause = describeErrorChain(error.cause);
+  }
+  if (error instanceof AggregateError) {
+    description.errors = error.errors.map((entry) => describeErrorChain(entry));
+  }
+  return description;
 }
 
 function withZeroInodeStatsValue<T extends Awaited<ReturnType<typeof lstat>>>(stats: T): T {
