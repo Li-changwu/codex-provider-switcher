@@ -307,7 +307,8 @@ bool OpenAndCapture(
       FILE_SHARE_READ,
       nullptr,
       OPEN_EXISTING,
-      FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+      FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS |
+          FILE_FLAG_OPEN_REPARSE_POINT,
       nullptr);
   if (file == INVALID_HANDLE_VALUE) {
     ThrowWin32Error(env, "CreateFileW");

@@ -119,7 +119,7 @@ test("pins the Windows file-operations build and exposes only its staged addon",
 
 test("builds the Windows native addon before running Windows CI tests", async () => {
   const workflowPath = resolve(dirname(packagePath), ".github/workflows/ci.yml");
-  const workflow = await readFile(workflowPath, "utf8");
+  const workflow = (await readFile(workflowPath, "utf8")).replace(/\r\n/g, "\n");
   const windowsBuildStep =
     "- if: matrix.os == 'windows-latest'\n        run: npm run build:windows-file-ops";
 

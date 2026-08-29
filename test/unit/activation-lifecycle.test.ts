@@ -30,6 +30,14 @@ import type { ProfileRecord } from "../../src/core/types";
 const startupRecoveryWarning =
   "Codex Provider Switcher could not safely complete startup recovery. Provider switching commands are disabled.";
 
+test("activation fixture follows the actual extension host layout", () => {
+  const fixture = activationFixture();
+  const expectedPlatform = process.platform === "win32" ? "win32" : "linux";
+
+  assert.equal(fixture.host.platform, expectedPlatform);
+  assert.equal(fixture.layout.switcherDir, join(fixture.layout.codexHome, "provider-switcher"));
+});
+
 test("registers only status bar lifecycle functionality without command handlers", () => {
   const commandDisposables = commandIds.map((command) => ({
     command,
@@ -637,6 +645,12 @@ function lifecycleCommandHandlers() {
 }
 
 function activationFixture() {
+  const isWindowsHost = process.platform === "win32";
+  const homeDir = isWindowsHost ? "C:\\Users\\Ada" : "/home/ada";
+  const platform: "win32" | "linux" = isWindowsHost ? "win32" : "linux";
+  const globalStoragePath = isWindowsHost
+    ? "C:\\Users\\Ada\\AppData\\Roaming\\Code\\User\\globalStorage"
+    : "/home/ada/.local/share/Code/User/globalStorage";
   const registeredCommands: string[] = [];
   const registeredHandlers = new Map<string, () => unknown>();
   const commandDisposables: Array<{
@@ -705,13 +719,13 @@ function activationFixture() {
     },
     globalStorageUri: {
       scheme: "file",
-      fsPath: "C:\\Users\\Ada\\AppData\\Roaming\\Code\\User\\globalStorage",
+      fsPath: globalStoragePath,
     },
   };
   const host = {
     env: {},
-    platform: "win32" as const,
-    homeDir: "C:\\Users\\Ada",
+    platform,
+    homeDir,
   };
   const prerequisites = createStartupProfilePrerequisites(context, host);
   return {

@@ -47,6 +47,25 @@ const addonPath = resolve(
 );
 
 test(
+  "Windows addon captures directory identities",
+  { skip: process.platform !== "win32" },
+  () => {
+    const temporaryPrefix = join(tmpdir(), "codex-provider-switcher-file-ops-");
+    const temporaryDirectory = mkdtempSync(temporaryPrefix);
+    const addon = require(addonPath) as NativeWindowsFileOperations;
+
+    try {
+      const identity = addon.captureFileIdentity(temporaryDirectory);
+      assert.match(identity.volumeSerial, /^[0-9a-f]{16}$/u);
+      assert.match(identity.fileId, /^[0-9a-f]{32}$/u);
+      assert.equal(identity.linkCount, 1n);
+    } finally {
+      rmSync(temporaryDirectory, { force: true, recursive: true });
+    }
+  },
+);
+
+test(
   "Windows addon rejects deletion of a same-content replacement",
   { skip: process.platform !== "win32" },
   () => {
