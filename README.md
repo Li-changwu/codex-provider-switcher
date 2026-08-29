@@ -20,6 +20,8 @@ Official Profiles use native Codex authentication. Run `codex login` yourself in
 
 Switching materializes the selected Profile, updates provider metadata for local sessions, and reports progress. A cancellation waits for rollback to finish before another command runs. The switch process creates backups, and **Codex: Restore Backup** can recover an interrupted operation.
 
+On Windows volumes that report no inode data, protected file mutations use the native Windows file identity from an open handle. If that identity or the native helper is unavailable, the extension disables the unsafe operation instead of falling back to timestamps or path-only checks.
+
 **Codex: Continue Session** starts native Codex resume only. Session content can be encrypted or otherwise unavailable, so there is no automatic transcript transfer or readable-content fallback without explicit caller confirmation.
 
 ## Commands

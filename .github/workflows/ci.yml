@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - if: matrix.os == 'windows-latest'
+        run: npm run build:windows-file-ops
+      - run: npm run check
+      - run: npm test
+      - run: npm run test:integration
+      - if: matrix.os == 'windows-latest'
+        run: npm run package:win32-x64
+      - if: matrix.os == 'ubuntu-latest'
+        run: npm run package:linux-x64

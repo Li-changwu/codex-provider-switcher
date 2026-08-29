@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
-import { link, mkdtemp, mkdir, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { execFile as nativeExecFile } from "node:child_process";
+import { link, lstat, mkdtemp, mkdir, open, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import sqlite3 from "sqlite3";
 import { ActiveProfileStore } from "../../src/core/active-profile";
 import { ProfileStore } from "../../src/core/profiles";
@@ -24,6 +27,71 @@ const customConfig = [
   'requires_openai_auth = true',
   "",
 ].join("\n");
+const execFile = promisify(nativeExecFile);
+const nodeRequire = createRequire(import.meta.url);
+
+test("switches a stored Profile on a Windows zero-inode filesystem", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows zero-inode file identity is not available on this platform.");
+    return;
+  }
+
+  await withFixture(async ({ layout, secrets, custom }) => {
+    await withZeroInodeFileStats(async () => {
+      const profiles = new ProfileStore(layout);
+      const activeProfiles = new ActiveProfileStore(layout);
+      const result = await switchStoredProfile(
+        { targetProfileId: custom.id },
+        { layout, profiles, secrets, activeProfiles },
+      );
+
+      assert.equal(result.status, "committed");
+      assert.equal(await readFile(layout.configPath, "utf8"), customConfig);
+    });
+  });
+});
+
+test("switches through a Windows 8.3 Codex Home alias", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows path aliases are not available on this platform.");
+    return;
+  }
+
+  await withFixture(async ({ layout, secrets, custom }) => {
+    const shortHome = await windowsShortPath(layout.codexHome);
+    if (shortHome === undefined || shortHome === layout.codexHome) {
+      t.skip("Windows short-path aliases are unavailable on this runner.");
+      return;
+    }
+    const shortLayout: CodexLayout = {
+      codexHome: shortHome,
+      configPath: join(shortHome, "config.toml"),
+      authPath: join(shortHome, "auth.json"),
+      sessionsDir: join(shortHome, "sessions"),
+      archivedSessionsDir: join(shortHome, "archived_sessions"),
+      sqlitePath: join(shortHome, "state_5.sqlite"),
+      switcherDir: join(shortHome, "provider-switcher"),
+    };
+    const indexPath = join(shortLayout.switcherDir, "profiles", "index.json");
+    const index = JSON.parse(await readFile(indexPath, "utf8")) as {
+      profiles: Array<{ configFile: string }>;
+    };
+    for (const profile of index.profiles) {
+      profile.configFile = profile.configFile.replace(layout.switcherDir, shortLayout.switcherDir);
+    }
+    await writeFile(indexPath, `${JSON.stringify(index, undefined, 2)}\n`, "utf8");
+    const profiles = new ProfileStore(shortLayout);
+    const activeProfiles = new ActiveProfileStore(shortLayout);
+
+    const result = await switchStoredProfile(
+      { targetProfileId: custom.id },
+      { layout: shortLayout, profiles, secrets, activeProfiles },
+    );
+
+    assert.equal(result.status, "committed");
+    assert.equal(await readFile(shortLayout.configPath, "utf8"), customConfig);
+  });
+});
 
 test("switches official and custom Profiles through config, auth, rollout, SQLite, and active state", async () => {
   await withFixture(async ({ layout, profiles, secrets, active, official, custom, rolloutPath }) => {
@@ -571,6 +639,67 @@ function sessionMetaLine(sessionId: string, provider: string): string {
     type: "session_meta",
     payload: { id: sessionId, model_provider: provider, title: "Fixture" },
   });
+}
+
+async function windowsShortPath(path: string): Promise<string | undefined> {
+  try {
+    const result = await execFile(
+      "cmd.exe",
+      ["/d", "/c", `for %I in (${path}) do @echo %~sI`],
+      { encoding: "utf8" },
+    );
+    const shortPath = result.stdout.trim();
+    return shortPath.length === 0 ? undefined : shortPath;
+  } catch {
+    return undefined;
+  }
+}
+
+async function withZeroInodeFileStats(callback: () => Promise<void>): Promise<void> {
+  const mutableFs = nodeRequire("node:fs/promises") as {
+    lstat: typeof lstat;
+    open: typeof open;
+  };
+  const originalLstat = mutableFs.lstat;
+  const originalOpen = mutableFs.open;
+  mutableFs.lstat = (async (...args: Parameters<typeof lstat>) => {
+    return zeroInodeStats(await originalLstat(...args));
+  }) as typeof lstat;
+  mutableFs.open = (async (...args: Parameters<typeof open>) => {
+    const handle = await originalOpen(...args);
+    return new Proxy(handle, {
+      get(target, property) {
+        if (property === "stat") {
+          return async (...statArgs: Parameters<typeof target.stat>) =>
+            zeroInodeStats(await target.stat(...statArgs));
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  }) as typeof open;
+  syncBuiltinESMExports();
+  try {
+    await callback();
+  } finally {
+    mutableFs.lstat = originalLstat;
+    mutableFs.open = originalOpen;
+    syncBuiltinESMExports();
+  }
+}
+
+function zeroInodeStats<T extends Awaited<ReturnType<typeof lstat>>>(stats: T): T {
+  const copy = Object.create(
+    Object.getPrototypeOf(stats),
+    Object.getOwnPropertyDescriptors(stats),
+  ) as T;
+  Object.defineProperty(copy, "ino", {
+    configurable: true,
+    enumerable: true,
+    value: 0n,
+    writable: false,
+  });
+  return copy;
 }
 
 async function seedDatabase(path: string, provider: string): Promise<void> {

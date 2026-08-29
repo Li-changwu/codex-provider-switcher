@@ -3,6 +3,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { buildWindowsFileOps } from "../../scripts/build-windows-file-ops.mjs";
 
 const packagePath = resolve(
   dirname(fileURLToPath(import.meta.url)),
@@ -11,6 +12,10 @@ const packagePath = resolve(
 const vscodeIgnorePath = resolve(
   dirname(fileURLToPath(import.meta.url)),
   "../../.vscodeignore",
+);
+const windowsFileOperationsSourcePath = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  "../../native/windows-file-ops/src/windows_file_ops.cc",
 );
 
 test("packages verified platform-specific native dependencies", async () => {
@@ -82,4 +87,107 @@ test("packages verified platform-specific native dependencies", async () => {
   assert.match(vscodeIgnore, /^!node_modules\/bindings\/bindings\.js$/m);
   assert.match(vscodeIgnore, /^!node_modules\/file-uri-to-path\/index\.js$/m);
 
+});
+
+test("pins the Windows file-operations build and exposes only its staged addon", async () => {
+  const manifest = JSON.parse(await readFile(packagePath, "utf8")) as {
+    devDependencies?: Record<string, string | undefined>;
+    scripts?: Record<string, string | undefined>;
+  };
+  const gitIgnore = await readFile(
+    resolve(dirname(vscodeIgnorePath), ".gitignore"),
+    "utf8",
+  );
+  const vscodeIgnore = await readFile(vscodeIgnorePath, "utf8");
+
+  assert.equal(manifest.devDependencies?.["node-gyp"], "12.4.0");
+  assert.equal(
+    manifest.scripts?.["build:windows-file-ops"],
+    "node scripts/build-windows-file-ops.mjs",
+  );
+  assert.match(gitIgnore, /^native\/windows-file-ops\/build\/$/m);
+  assert.match(gitIgnore, /^native\/windows-file-ops\/windows_file_ops\.node$/m);
+  assert.match(vscodeIgnore, /^native\/\*\*$/m);
+
+  const nativeAllowlistEntries = vscodeIgnore
+    .split(/\r?\n/)
+    .filter((entry) => entry.startsWith("!native/"));
+  assert.deepEqual(nativeAllowlistEntries, [
+    "!native/windows-file-ops/windows_file_ops.node",
+  ]);
+});
+
+test("builds the Windows native addon before running Windows CI tests", async () => {
+  const workflowPath = resolve(dirname(packagePath), ".github/workflows/ci.yml");
+  const workflow = (await readFile(workflowPath, "utf8")).replace(/\r\n/g, "\n");
+  const windowsBuildStep =
+    "- if: matrix.os == 'windows-latest'\n        run: npm run build:windows-file-ops";
+
+  assert.ok(workflow.includes(windowsBuildStep));
+  assert.ok(workflow.indexOf(windowsBuildStep) < workflow.indexOf("- run: npm test"));
+});
+
+test("runs target-specific packaging commands on both CI platforms", async () => {
+  const workflowPath = resolve(dirname(packagePath), ".github/workflows/package.yml");
+  const workflow = await readFile(workflowPath, "utf8");
+
+  assert.match(workflow, /if: matrix\.os == 'windows-latest'[\s\S]*?npm run package:win32-x64/);
+  assert.match(workflow, /if: matrix\.os == 'ubuntu-latest'[\s\S]*?npm run package:linux-x64/);
+});
+
+test("runs target-specific packaging in the CI test matrix", async () => {
+  const workflowPath = resolve(dirname(packagePath), ".github/workflows/ci.yml");
+  const workflow = await readFile(workflowPath, "utf8");
+
+  assert.match(workflow, /if: matrix\.os == 'windows-latest'[\s\S]*?npm run package:win32-x64/);
+  assert.match(workflow, /if: matrix\.os == 'ubuntu-latest'[\s\S]*?npm run package:linux-x64/);
+});
+
+test("formats the complete 64-bit Windows volume serial in native file identities", async () => {
+  // Real test volumes may have a zero high half, so this source contract prevents
+  // a future narrowing conversion from silently discarding it.
+  const source = await readFile(windowsFileOperationsSourcePath, "utf8");
+
+  assert.match(source, /std::string FormatVolumeSerial\(uint64_t serial\)/);
+  assert.doesNotMatch(source, /std::string FormatVolumeSerial\(ULONG serial\)/);
+  assert.match(
+    source,
+    /identity->volume_serial = FormatVolumeSerial\(file_id\.VolumeSerialNumber\);/,
+  );
+});
+
+test("refuses unsupported Windows-addon hosts before filesystem mutation", async () => {
+  let filesystemMutations = 0;
+  const fsOps = {
+    async rm(): Promise<void> {
+      filesystemMutations += 1;
+      throw new Error("filesystem mutation occurred");
+    },
+    async stat(): Promise<never> {
+      throw new Error("stat should not run");
+    },
+    async copyFile(): Promise<never> {
+      throw new Error("copy should not run");
+    },
+  };
+
+  for (const [platform, arch] of [
+    ["linux", "x64"],
+    ["win32", "arm64"],
+  ] as const) {
+    await assert.rejects(
+      buildWindowsFileOps({
+        platform,
+        arch,
+        projectRoot: "C:\\extension-root",
+        fsOps,
+        run: async () => {
+          throw new Error("node-gyp should not run");
+        },
+      }),
+      /requires a win32-x64 host/,
+    );
+  }
+
+  assert.equal(filesystemMutations, 0);
 });

@@ -52,6 +52,19 @@ export function runSqliteRequire(cwd, options = {}) {
 }
 
 export function runNodeModuleRequire(cwd, moduleName, options = {}) {
+  if (typeof moduleName !== "string" || moduleName.length === 0) {
+    throw new Error("Module name must be a non-empty string.");
+  }
+  return runNodeScript(cwd, `require(${JSON.stringify(moduleName)});`, [], options);
+}
+
+export function runNodeScript(cwd, script, scriptArgs = [], options = {}) {
+  if (typeof script !== "string" || script.length === 0) {
+    throw new Error("Node child script must be a non-empty string.");
+  }
+  if (!Array.isArray(scriptArgs) || !scriptArgs.every((argument) => typeof argument === "string")) {
+    throw new Error("Node child script arguments must be strings.");
+  }
   const {
     timeoutMs = SQLITE_LOAD_TIMEOUT_MS,
     maxOutputBytes = MAX_NATIVE_MODULE_LOAD_OUTPUT_BYTES,
@@ -60,9 +73,6 @@ export function runNodeModuleRequire(cwd, moduleName, options = {}) {
     sourceEnv = process.env,
     platform = process.platform,
   } = options;
-  if (typeof moduleName !== "string" || moduleName.length === 0) {
-    throw new Error("Module name must be a non-empty string.");
-  }
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new Error(`SQLite load timeout must be a positive finite value: ${timeoutMs}`);
   }
@@ -78,7 +88,7 @@ export function runNodeModuleRequire(cwd, moduleName, options = {}) {
     try {
       child = spawnProcess(
         process.execPath,
-        ["--no-warnings", "-e", `require(${JSON.stringify(moduleName)});`],
+        ["--no-warnings", "-e", script, ...scriptArgs],
         {
           cwd,
           env: createCleanChildEnvironment(sourceEnv, platform),

@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import yauzl from "yauzl";
-import { findNativeBinding, runNodeModuleRequire } from "./sqlite-binding-utils.mjs";
+import {
+  findNativeBinding,
+  runNodeModuleRequire,
+  runNodeScript,
+} from "./sqlite-binding-utils.mjs";
 
 export const sqlitePrefix = "extension/node_modules/sqlite3/";
 // The current sqlite3 VSIX has about 1,400 files and 12 MiB of payload.
@@ -39,7 +43,7 @@ const requiredTomlRuntimeEntries = [
   "extension/node_modules/@iarna/toml/lib/create-time.js",
   "extension/node_modules/@iarna/toml/lib/format-num.js",
 ];
-const requiredVsixEntries = [
+const baseRequiredVsixEntries = [
   "[Content_Types].xml",
   "extension.vsixmanifest",
   "extension/.gitignore",
@@ -47,6 +51,16 @@ const requiredVsixEntries = [
   "extension/package.json",
   "extension/dist/extension.js",
 ];
+const windowsFileOperationsAddonEntry =
+  "extension/native/windows-file-ops/windows_file_ops.node";
+const windowsFileOperationsVerificationScript = [
+  "const addonPath = process.argv[1];",
+  "const addon = require(addonPath);",
+  'if (typeof addon.captureFileIdentity !== "function") {',
+  '  throw new TypeError("Windows file-operations addon does not export captureFileIdentity.");',
+  "}",
+  "addon.captureFileIdentity(addonPath);",
+].join("\n");
 const installerDependencies = ["node-gyp", "prebuild-install", "tar"];
 const typeScriptDeclarationExtensions = [".d.ts", ".d.mts", ".d.cts"];
 const sourceOrArchiveExtensions = [
@@ -73,15 +87,16 @@ const sourceOrArchiveExtensions = [
 export async function verifyVsix(vsixPath, options = {}) {
   const fsOps = { mkdtemp, rm, ...options.fsOps };
   const limits = resolveLimits(options.limits);
+  const requiredEntries = requiredVsixEntriesForTarget(options.target);
   const expectedNativeBindingEntry = await resolveExpectedNativeBindingEntry(
     options.expectedNativeBindingEntry,
   );
-  const archiveRules = createArchiveRules(expectedNativeBindingEntry);
+  const archiveRules = createArchiveRules(expectedNativeBindingEntry, options.target);
   const listedEntries = await listZipEntries(vsixPath, limits);
   validateArchiveEntries(listedEntries, archiveRules);
   const entries = new Set(listedEntries);
 
-  for (const entry of requiredVsixEntries) {
+  for (const entry of requiredEntries) {
     if (!entries.has(entry)) {
       throw new Error(`VSIX is missing required entry: ${entry}`);
     }
@@ -111,6 +126,9 @@ export async function verifyVsix(vsixPath, options = {}) {
     }
     await verifyExtractedModule(extensionRoot, "sqlite3", "Native SQLite binding");
     await verifyExtractedModule(extensionRoot, "@iarna/toml", "TOML runtime");
+    if (options.target === "win32-x64") {
+      await verifyWindowsFileOperationsAddon(extensionRoot);
+    }
 
     return entries;
   } catch (error) {
@@ -148,9 +166,9 @@ async function resolveExpectedNativeBindingEntry(configuredEntry) {
   )}`;
 }
 
-function createArchiveRules(expectedNativeBindingEntry) {
+export function createArchiveRules(expectedNativeBindingEntry, target) {
   const allowedEntries = [
-    ...requiredVsixEntries,
+    ...requiredVsixEntriesForTarget(target),
     ...requiredSqliteRuntimeEntries,
     ...requiredTomlRuntimeEntries,
     expectedNativeBindingEntry,
@@ -173,7 +191,7 @@ function createArchiveRules(expectedNativeBindingEntry) {
   return { entriesByCanonicalPath, directoriesByCanonicalPath };
 }
 
-function validateArchiveEntries(entries, archiveRules) {
+export function validateArchiveEntries(entries, archiveRules) {
   const sourceMaps = [...entries].filter((entry) =>
     canonicalArchiveEntryPath(entry).endsWith(".map"),
   );
@@ -198,6 +216,12 @@ function validateArchiveEntries(entries, archiveRules) {
     }
     validateArchiveEntry(entry, archiveRules);
   }
+}
+
+function requiredVsixEntriesForTarget(target) {
+  return target === "win32-x64"
+    ? [...baseRequiredVsixEntries, windowsFileOperationsAddonEntry]
+    : baseRequiredVsixEntries;
 }
 
 function validateArchiveEntry(entry, archiveRules) {
@@ -246,6 +270,31 @@ async function verifyExtractedModule(extensionRoot, moduleName, moduleLabel) {
   if (result.exitCode !== 0) {
     throw new Error(
       [`${moduleLabel} failed to load from extracted VSIX.`, result.output].join("\n"),
+    );
+  }
+}
+
+async function verifyWindowsFileOperationsAddon(extensionRoot) {
+  const addonPath = resolve(
+    extensionRoot,
+    "native/windows-file-ops/windows_file_ops.node",
+  );
+  const result = await runNodeScript(
+    extensionRoot,
+    windowsFileOperationsVerificationScript,
+    [addonPath],
+  );
+  if (result.timedOut) {
+    throw new Error(
+      `Windows file-operations addon validation timed out after ${result.timeoutMs}ms from extracted VSIX.`,
+    );
+  }
+  if (result.exitCode !== 0) {
+    throw new Error(
+      [
+        "Windows file-operations addon failed to load or validate from extracted VSIX.",
+        result.output,
+      ].join("\n"),
     );
   }
 }

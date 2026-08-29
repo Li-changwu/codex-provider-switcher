@@ -24,6 +24,12 @@ import {
   type SwitchResult,
 } from "./switch-service";
 import type { ActiveProfileSnapshot } from "./active-profile";
+import {
+  hasComparableFileIdentity,
+  hydrateWindowsFileIdentity,
+  sameStableFileIdentity,
+  type FileIdentity,
+} from "./file-identity";
 import type { AuthJournalTarget } from "./transaction";
 import type { ProgressEvent } from "../ui/progress";
 import { throwIfProgressCancelled } from "../ui/progress";
@@ -347,34 +353,50 @@ async function readTrustedStoredConfig(
     throw new Error("Profile configuration path is not managed.");
   }
 
-  const rootBefore = await lstat(profilesRoot, { bigint: true });
-  const directoryBefore = await lstat(profileDirectory, { bigint: true });
-  const configBefore = await lstat(expectedPath, { bigint: true });
+  const rootBefore = await lstatWithFileIdentity(profilesRoot);
+  const directoryBefore = await lstatWithFileIdentity(profileDirectory);
+  const configBefore = await lstatWithFileIdentity(expectedPath);
   assertSafeProfileDirectory(rootBefore);
   assertSafeProfileDirectory(directoryBefore);
   assertSafeProfileConfig(configBefore);
+  const codexHomeRealPath = await realpath(codexHome);
   const rootRealPath = await realpath(profilesRoot);
   const directoryRealPath = await realpath(profileDirectory);
   const configRealPath = await realpath(expectedPath);
+  const rootRealStats = await lstatWithFileIdentity(rootRealPath);
+  const directoryRealStats = await lstatWithFileIdentity(directoryRealPath);
+  const configRealStats = await lstatWithFileIdentity(configRealPath);
   if (
-    !isPathInsideOrEqual(codexHome, rootRealPath) ||
+    !isPathInsideOrEqual(codexHomeRealPath, rootRealPath) ||
     !isDirectChild(rootRealPath, directoryRealPath) ||
-    !sameResolvedPath(dirname(configRealPath), directoryRealPath)
+    !sameResolvedPath(dirname(configRealPath), directoryRealPath) ||
+    !isSafeProfileDirectory(rootRealStats) ||
+    !isSafeProfileDirectory(directoryRealStats) ||
+    !isSafeProfileConfig(configRealStats) ||
+    !sameFileIdentity(rootBefore, rootRealStats) ||
+    !sameFileIdentity(directoryBefore, directoryRealStats) ||
+    !sameFileIdentity(configBefore, configRealStats)
   ) {
     throw new Error("Profile configuration escapes its managed directory.");
   }
 
   const handle = await open(expectedPath, "r");
   try {
-    const opened = await handle.stat({ bigint: true });
+    const opened = await statWithFileIdentity(handle, expectedPath);
     if (!sameFileIdentity(configBefore, opened) || !isSafeProfileConfig(opened)) {
       throw new Error("Profile configuration changed before opening.");
     }
     const contents = await handle.readFile({ encoding: "utf8" });
-    const afterRead = await handle.stat({ bigint: true });
-    const rootAfter = await lstat(profilesRoot, { bigint: true });
-    const directoryAfter = await lstat(profileDirectory, { bigint: true });
-    const configAfter = await lstat(expectedPath, { bigint: true });
+    const afterRead = await statWithFileIdentity(handle, expectedPath);
+    const rootAfter = await lstatWithFileIdentity(profilesRoot);
+    const directoryAfter = await lstatWithFileIdentity(profileDirectory);
+    const configAfter = await lstatWithFileIdentity(expectedPath);
+    const rootAfterRealPath = await realpath(profilesRoot);
+    const directoryAfterRealPath = await realpath(profileDirectory);
+    const configAfterRealPath = await realpath(expectedPath);
+    const rootAfterRealStats = await lstatWithFileIdentity(rootAfterRealPath);
+    const directoryAfterRealStats = await lstatWithFileIdentity(directoryAfterRealPath);
+    const configAfterRealStats = await lstatWithFileIdentity(configAfterRealPath);
     if (
       !sameFileIdentity(configBefore, afterRead) ||
       !sameFileIdentity(configBefore, configAfter) ||
@@ -384,9 +406,15 @@ async function readTrustedStoredConfig(
       !isSafeProfileConfig(configAfter) ||
       !isSafeProfileDirectory(rootAfter) ||
       !isSafeProfileDirectory(directoryAfter) ||
-      !sameResolvedPath(await realpath(profilesRoot), rootRealPath) ||
-      !sameResolvedPath(await realpath(profileDirectory), directoryRealPath) ||
-      !sameResolvedPath(await realpath(expectedPath), configRealPath)
+      !isSafeProfileDirectory(rootAfterRealStats) ||
+      !isSafeProfileDirectory(directoryAfterRealStats) ||
+      !isSafeProfileConfig(configAfterRealStats) ||
+      !sameFileIdentity(rootAfter, rootAfterRealStats) ||
+      !sameFileIdentity(directoryAfter, directoryAfterRealStats) ||
+      !sameFileIdentity(configAfter, configAfterRealStats) ||
+      !sameResolvedPath(rootAfterRealPath, rootRealPath) ||
+      !sameResolvedPath(directoryAfterRealPath, directoryRealPath) ||
+      !sameResolvedPath(configAfterRealPath, configRealPath)
     ) {
       throw new Error("Profile configuration changed while being read.");
     }
@@ -449,7 +477,8 @@ function assertSafeProfileDirectory(stats: BigIntStats): void {
 }
 
 function isSafeProfileDirectory(stats: BigIntStats): boolean {
-  return stats.isDirectory() && !stats.isSymbolicLink() && stats.ino !== 0n;
+  return stats.isDirectory() && !stats.isSymbolicLink() &&
+    hasComparableFileIdentity(stats as FileIdentity);
 }
 
 function assertSafeProfileConfig(stats: BigIntStats): void {
@@ -459,11 +488,12 @@ function assertSafeProfileConfig(stats: BigIntStats): void {
 }
 
 function isSafeProfileConfig(stats: BigIntStats): boolean {
-  return stats.isFile() && !stats.isSymbolicLink() && stats.nlink === 1n && stats.ino !== 0n;
+  return stats.isFile() && !stats.isSymbolicLink() && stats.nlink === 1n &&
+    hasComparableFileIdentity(stats as FileIdentity);
 }
 
-function sameFileIdentity(left: BigIntStats, right: BigIntStats): boolean {
-  return left.dev === right.dev && left.ino !== 0n && left.ino === right.ino;
+function sameFileIdentity(left: FileIdentity, right: FileIdentity): boolean {
+  return sameStableFileIdentity(left, right);
 }
 
 function isDirectChild(parent: string, child: string): boolean {
@@ -481,6 +511,35 @@ function sameResolvedPath(left: string, right: string): boolean {
   return process.platform === "win32"
     ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
     : normalizedLeft === normalizedRight;
+}
+
+type ProfileFileStats = BigIntStats & FileIdentity;
+
+async function lstatWithFileIdentity(path: string): Promise<ProfileFileStats> {
+  return hydrateFileIdentity(path, await lstat(path, { bigint: true }));
+}
+
+async function statWithFileIdentity(
+  handle: Awaited<ReturnType<typeof open>>,
+  logicalPath: string,
+): Promise<ProfileFileStats> {
+  return hydrateFileIdentity(logicalPath, await handle.stat({ bigint: true }));
+}
+
+async function hydrateFileIdentity(
+  path: string,
+  stats: BigIntStats,
+): Promise<ProfileFileStats> {
+  const identity = await hydrateWindowsFileIdentity(path, stats);
+  if (identity.windowsFileIdentity !== undefined) {
+    Object.defineProperty(stats, "windowsFileIdentity", {
+      configurable: false,
+      enumerable: true,
+      value: identity.windowsFileIdentity,
+      writable: false,
+    });
+  }
+  return stats as ProfileFileStats;
 }
 
 function validateStoredConfig(configText: string, profile: ProfileRecord) {

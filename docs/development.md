@@ -96,9 +96,10 @@ the release-gate child disabled TLS verification. Do not suppress or scope away
 a nonzero audit result, even when generated-VSIX verification proves that
 installation-only paths are excluded from the shipped artifact.
 
-Task 8 will add the release CI workflow: Windows x64 and Linux x64 jobs will
-install Node 20, run `npm ci`, `npm test`, `npm run check`, `npm run build`,
-`npm run verify:binding`, and their matching `package:<target>` commands, then
-upload the distinct `@win32-x64` and `@linux-x64` VSIX artifacts. Until then,
-the local commands above generate and verify target-specific artifacts only on
-their matching hosts.
+The CI workflow runs Windows x64 and Linux x64 jobs with Node 22. Each job
+runs `npm ci`, type checking, unit tests, integration tests, and its matching
+target package command. The Windows job builds the file-operations addon
+before tests; the package workflow uploads distinct `@win32-x64` and
+`@linux-x64` VSIX artifacts only after CI succeeds. The local commands above
+still generate and verify target-specific artifacts only on their matching
+target host.

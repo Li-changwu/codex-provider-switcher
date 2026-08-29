@@ -268,6 +268,9 @@ export async function packageExtension({
   const artifacts = packageArtifactPaths(projectRoot, manifest, target);
   try {
     await removeArtifacts(artifacts, fsOps);
+    if (target === "win32-x64") {
+      await run(nodePath, [npmCliPath, "run", "build:windows-file-ops"]);
+    }
     await run(nodePath, [npmCliPath, "run", "check"]);
     await run(nodePath, [npmCliPath, "run", "build"]);
     if (target === "linux-x64") {
@@ -283,7 +286,7 @@ export async function packageExtension({
       "--out",
       artifacts.temporary,
     ]);
-    await verifyVsix(artifacts.temporary);
+    await verifyVsix(artifacts.temporary, { target });
     await fsOps.rename(artifacts.temporary, artifacts.final);
     return artifacts.final;
   } catch (operationError) {

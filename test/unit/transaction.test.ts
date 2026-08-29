@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { execFile as nativeExecFile } from "node:child_process";
 import { access, chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import {
   beginTransaction,
   hasSameStableFileIdentity,
@@ -21,6 +23,12 @@ import {
   createRolloutInversePatches,
 } from "../../src/core/rollouts";
 import type { CodexLayout } from "../../src/core/types";
+import {
+  createWindowsFileOperations,
+  type WindowsFileIdentity,
+} from "../../src/core/windows-file-operations";
+
+const execFile = promisify(nativeExecFile);
 
 test("requires comparable exact filesystem identity for trusted directories", () => {
   const matching: FileIdentity = { dev: 1n, ino: 2n, nlink: 1n };
@@ -55,6 +63,127 @@ test("requires comparable exact filesystem identity for trusted directories", ()
     ),
     false,
   );
+});
+
+test("compares canonical native identities for zero-inode transaction files", () => {
+  const nativeIdentity: WindowsFileIdentity = {
+    volumeSerial: "0000000000000001",
+    fileId: "0123456789abcdef0123456789abcdef",
+    linkCount: 1n,
+  };
+  const matching: FileIdentity = {
+    dev: 0n,
+    ino: 0n,
+    nlink: 1n,
+    windowsFileIdentity: nativeIdentity,
+  };
+
+  assert.equal(
+    hasSameStableFileIdentity(matching, {
+      dev: 0n,
+      ino: 0n,
+      nlink: 1n,
+      windowsFileIdentity: nativeIdentity,
+    }, "win32"),
+    true,
+  );
+  assert.equal(
+    hasSameStableFileIdentity(matching, {
+      dev: 0n,
+      ino: 0n,
+      nlink: 1n,
+      windowsFileIdentity: {
+        ...nativeIdentity,
+        fileId: "fedcba9876543210fedcba9876543210",
+      },
+    }, "win32"),
+    false,
+  );
+  assert.equal(
+    hasSameStableFileIdentity(matching, { dev: 0n, ino: 0n, nlink: 1n }, "win32"),
+    false,
+  );
+});
+
+test("runs a transaction with native identities on Windows zero-inode filesystems", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows native file identities require Windows");
+    return;
+  }
+
+  await withLayout(async (layout) => {
+    const stats = await lstat(layout.codexHome, { bigint: true });
+    if (stats.ino !== 0n) {
+      t.skip("This Windows Node runtime exposes nonzero inode values");
+      return;
+    }
+
+    const transaction = await beginTransaction(layout, {
+      operationId: "windows-zero-inode",
+      fileIdentityOptions: {
+        platform: "win32",
+        windowsFileOperations: createWindowsFileOperations(),
+      },
+    });
+    try {
+      const target = { kind: "config" as const, path: layout.configPath };
+      await transaction.backupTargets([target]);
+      await transaction.markApplying([target]);
+      await transaction.prepareTarget(target);
+      await writeFile(layout.configPath, "model_provider = 'after'\n", "utf8");
+      await transaction.markTargetApplied(target);
+      await transaction.rollback();
+      assert.equal(
+        await readFile(layout.configPath, "utf8"),
+        "model_provider = 'before'\n",
+      );
+    } finally {
+      await transaction.release();
+    }
+  });
+});
+
+test("accepts Windows 8.3 aliases for transaction paths", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows path aliases are not available on this platform.");
+    return;
+  }
+
+  await withLayout(async (layout) => {
+    const shortHome = await windowsShortPath(layout.codexHome);
+    if (shortHome === undefined || shortHome === layout.codexHome) {
+      t.skip("Windows short-path aliases are unavailable on this runner.");
+      return;
+    }
+
+    const aliasedLayout: CodexLayout = {
+      codexHome: shortHome,
+      configPath: join(shortHome, "config.toml"),
+      authPath: join(shortHome, "auth.json"),
+      sessionsDir: join(shortHome, "sessions"),
+      archivedSessionsDir: join(shortHome, "archived_sessions"),
+      sqlitePath: join(shortHome, "state_5.sqlite"),
+      switcherDir: join(shortHome, "provider-switcher"),
+    };
+    const transaction = await beginTransaction(aliasedLayout, {
+      operationId: "windows-short-path-alias",
+    });
+    try {
+      const target = { kind: "config" as const, path: aliasedLayout.configPath };
+      await transaction.backupTargets([target]);
+      await transaction.markApplying([target]);
+      await transaction.prepareTarget(target);
+      await writeFile(aliasedLayout.configPath, "model_provider = 'after'\n", "utf8");
+      await transaction.markTargetApplied(target);
+      await transaction.rollback();
+      assert.equal(
+        await readFile(aliasedLayout.configPath, "utf8"),
+        "model_provider = 'before'\n",
+      );
+    } finally {
+      await transaction.release();
+    }
+  });
 });
 
 test("backs up config, sqlite, and managed rollout files without backing up auth", async () => {
@@ -1617,6 +1746,49 @@ test("rejects a symbolic backup manifest during restoration", async (t) => {
   });
 });
 
+test("rejects a backup directory redirected outside its operation", async (t) => {
+  await withLayout(async (layout) => {
+    const externalBackupDirectory = join(layout.codexHome, "external-backup");
+    const displacedBackupDirectory = `${join(layout.switcherDir, "transactions", "backup-directory-race", "backup")}.displaced`;
+    const transaction = await beginTransaction(layout, {
+      operationId: "backup-directory-race",
+    });
+
+    try {
+      await transaction.backupTargets([{ kind: "config", path: layout.configPath }]);
+      await transaction.markApplying([{ kind: "config", path: layout.configPath }]);
+      await writeFile(layout.configPath, "changed config", "utf8");
+
+      await mkdir(externalBackupDirectory);
+      for (const name of await readdir(transaction.backupDirectory)) {
+        await writeFile(
+          join(externalBackupDirectory, name),
+          await readFile(join(transaction.backupDirectory, name)),
+        );
+      }
+      await rename(transaction.backupDirectory, displacedBackupDirectory);
+      try {
+        await symlink(externalBackupDirectory, transaction.backupDirectory, "dir");
+      } catch (error: unknown) {
+        if (isWindowsSymlinkPrivilegeError(error)) {
+          t.skip("creating directory symlinks requires Windows developer mode or equivalent privilege");
+          return;
+        }
+        throw error;
+      }
+
+      await assert.rejects(
+        () => transaction.rollback(),
+        (error: unknown) => error instanceof Error && "code" in error && error.code === "rollback-failed",
+      );
+      assert.equal(await readFile(layout.configPath, "utf8"), "changed config");
+    } finally {
+      await transaction.release().catch(() => undefined);
+      await rm(externalBackupDirectory, { recursive: true, force: true });
+    }
+  });
+});
+
 test("rejects a hard-linked backup manifest during restoration", async () => {
   await withLayout(async (layout) => {
     const transaction = await beginTransaction(layout, { operationId: "hardlink-manifest" });
@@ -1768,6 +1940,51 @@ test("rejects a restore parent replaced before temporary creation", async (t) =>
     } finally {
       await transaction.release().catch(() => undefined);
       await rm(externalDirectory, { recursive: true, force: true });
+    }
+  });
+});
+
+test("rejects a restore parent whose ancestor real path changes", async (t) => {
+  await withLayout(async (layout) => {
+    const restoreRoot = join(layout.codexHome, "restore-root");
+    const restoreParent = join(restoreRoot, "nested");
+    const displacedRoot = `${restoreRoot}.displaced`;
+    layout.configPath = join(restoreParent, "config.toml");
+    await mkdir(restoreParent, { recursive: true });
+    await writeFile(layout.configPath, "original config", "utf8");
+
+    const transaction = await beginTransaction(layout, {
+      operationId: "restore-ancestor-race",
+      io: {
+        async beforeRestoreTemporaryCreate(destination: string) {
+          assert.equal(destination, layout.configPath);
+          await rename(restoreRoot, displacedRoot);
+          await symlink(displacedRoot, restoreRoot, "dir");
+        },
+      },
+    });
+
+    try {
+      await transaction.backupTargets([{ kind: "config", path: layout.configPath }]);
+      await transaction.markApplying([{ kind: "config", path: layout.configPath }]);
+      await writeFile(layout.configPath, "changed config", "utf8");
+
+      try {
+        await assert.rejects(
+          () => transaction.rollback(),
+          (error: unknown) => error instanceof Error && "code" in error && error.code === "rollback-failed",
+        );
+      } catch (error: unknown) {
+        if (isWindowsSymlinkPrivilegeError(error)) {
+          t.skip("creating directory symlinks requires Windows developer mode or equivalent privilege");
+          return;
+        }
+        throw error;
+      }
+    } finally {
+      await transaction.release().catch(() => undefined);
+      await rm(restoreRoot, { recursive: true, force: true });
+      await rm(displacedRoot, { recursive: true, force: true });
     }
   });
 });
@@ -3585,6 +3802,20 @@ async function withLayout(callback: (layout: CodexLayout) => Promise<void>): Pro
     await callback(layout);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+}
+
+async function windowsShortPath(path: string): Promise<string | undefined> {
+  try {
+    const result = await execFile(
+      "cmd.exe",
+      ["/d", "/c", `for %I in (${path}) do @echo %~sI`],
+      { encoding: "utf8" },
+    );
+    const shortPath = result.stdout.trim();
+    return shortPath.length === 0 ? undefined : shortPath;
+  } catch {
+    return undefined;
   }
 }
 
