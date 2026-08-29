@@ -35,6 +35,7 @@ export interface MutationApplyContext {
 export interface PreparedSwitchMutation {
   readonly name: string;
   readonly target: JournalMutationTarget;
+  readonly markTargetAppliedBeforeApply?: boolean;
   readonly apply: (context: MutationApplyContext) => Promise<void>;
   // Retained while existing mutation-plan builders migrate. Durable recovery
   // is exclusively driven by the journal and never invokes this callback.
@@ -384,11 +385,17 @@ async function runPlannedMutations(
     assertCompensableMutation(mutation, context.layout);
     assertMutationAllowedInStage(stage, mutation);
     await context.transaction.prepareTarget(mutation.target);
+    if (mutation.markTargetAppliedBeforeApply === true) {
+      await context.transaction.markTargetApplied(mutation.target);
+    }
     try {
       await mutation.apply({
         assertTargetUnchanged: () => context.transaction.assertTargetUnchanged(mutation.target),
       });
     } catch (error: unknown) {
+      if (mutation.markTargetAppliedBeforeApply === true) {
+        await refreshAppliedTargetEvidence(mutation.target, context.transaction);
+      }
       await recordPublishedRolloutFailure(
         mutation.target,
         context.layout,
@@ -401,6 +408,17 @@ async function runPlannedMutations(
     throwIfProgressCancelled(context.signal);
   }
   progress.emit([{ stage, completed: 1, total: 1 }]);
+}
+
+async function refreshAppliedTargetEvidence(
+  target: JournalMutationTarget,
+  transaction: SwitchStageContext["transaction"],
+): Promise<void> {
+  try {
+    await transaction.markTargetApplied(target);
+  } catch {
+    // Preserve the original mutation error; rollback will fail closed without fresh evidence.
+  }
 }
 
 async function recordPublishedRolloutFailure(
@@ -556,7 +574,17 @@ function assertCompensableMutation(
       "Every switch mutation must provide a target plus apply and rollback functions before it can run.",
     );
   }
-  assertValidJournalMutationTarget(layout, (mutation as { target: unknown }).target);
+  const target = (mutation as { target: JournalMutationTarget }).target;
+  assertValidJournalMutationTarget(layout, target);
+  const hasPreApplyMarker = Object.hasOwn(mutation, "markTargetAppliedBeforeApply");
+  const marker = (mutation as { markTargetAppliedBeforeApply?: unknown })
+    .markTargetAppliedBeforeApply;
+  if (
+    (hasPreApplyMarker && typeof marker !== "boolean") ||
+    (hasPreApplyMarker && target.kind !== "auth")
+  ) {
+    throw new TypeError("Only auth mutations may use pre-apply target evidence.");
+  }
 }
 
 interface ProgressEmitter {

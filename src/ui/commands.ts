@@ -17,6 +17,7 @@ import {
   type StoredProfileSwitchDependencies,
   type StoredProfileSwitchResult,
 } from "../core/profile-switch-orchestrator";
+import type { OfficialLoginExecutor } from "../core/official-login";
 import type { ActiveProfileState, ProfileLookup } from "../core/profile-switch-orchestrator";
 import type { ProfileSecretReader } from "../core/profile-switch-orchestrator";
 import type { SwitchRequest } from "../core/switch-service";
@@ -113,6 +114,7 @@ export interface ProfileCommandDependencies {
   readonly secrets: CommandSecretStore;
   readonly activeProfiles: ActiveProfileState;
   readonly ui: ProfileCommandUi;
+  readonly officialLogin?: OfficialLoginExecutor;
   readonly switchStoredProfile?: StoredProfileSwitcher;
   readonly continueSession?: SessionContinuation;
   readonly recoverPendingSwitches?: BackupRecovery;
@@ -190,11 +192,6 @@ export function createProfileCommandHandlers(
         }
       }
       await dependencies.ui.info("Profile created.");
-      if (kind === "official") {
-        await dependencies.ui.info(
-          "Official Profiles use native Codex login. Run codex login in a terminal when needed.",
-        );
-      }
     } catch {
       await dependencies.ui.error(
         "Could not create the Profile. Check its non-secret TOML and try again.",
@@ -302,7 +299,7 @@ export function createProfileCommandHandlers(
         return;
       }
       const result = await switchWithProgress(selectedProfile.id, "Switching Codex Profile");
-      await reportSwitchResult(result, selectedProfile.kind);
+      await reportSwitchResult(result);
     } catch {
       await dependencies.ui.error("Could not switch the Codex Profile.");
     } finally {
@@ -323,7 +320,7 @@ export function createProfileCommandHandlers(
         return;
       }
       const result = await switchWithProgress(profile.id, "Synchronizing Codex Sessions");
-      await reportSwitchResult(result, profile.kind);
+      await reportSwitchResult(result);
     } catch {
       await dependencies.ui.error("Could not synchronize Codex sessions.");
     } finally {
@@ -452,6 +449,7 @@ export function createProfileCommandHandlers(
             profiles: dependencies.profiles,
             secrets: dependencies.secrets,
             activeProfiles: dependencies.activeProfiles,
+            officialLogin: dependencies.officialLogin,
             onProgress: (event) => {
               previousPercentage = reportProgress(event, progress, previousPercentage);
             },
@@ -489,7 +487,6 @@ export function createProfileCommandHandlers(
 
   async function reportSwitchResult(
     result: StoredProfileSwitchResult,
-    kind: ProfileKind,
   ): Promise<void> {
     if (result.status === "cancelled") {
       await dependencies.ui.info("Profile switch cancelled after rollback completed.");
@@ -500,11 +497,6 @@ export function createProfileCommandHandlers(
       return;
     }
     await dependencies.ui.info("Profile switch completed.");
-    if (kind === "official") {
-      await dependencies.ui.info(
-        "Official Profiles use native Codex login. Run codex login in a terminal when needed.",
-      );
-    }
   }
 
   async function refreshStatus(): Promise<void> {

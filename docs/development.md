@@ -2,6 +2,21 @@
 
 Install dependencies with `npm ci` and build with `npm run build`.
 
+## Official Profile Login
+
+Switching to an official Profile runs native `codex login` in the current
+Extension Host terminal, then validates it with `codex login status`. A failed
+login, cancellation, or failed status validation is reported only after the
+transaction has completed its rollback. OAuth credentials remain managed by
+Codex and must not be read, copied, or written by the extension to Profiles,
+logs, backups, or SecretStorage.
+
+This behavior uses the native Extension Host on Windows or Linux, including
+VS Code Remote SSH when the Extension Host is Linux. macOS, WSL, cross-device
+switching, and cloud Profile or session synchronization remain unsupported.
+Session synchronization remains local to the current Extension Host and Codex
+Home.
+
 `sqlite3` 6.0.1 requires Node 20.17 or later. The extension therefore requires
 VS Code `^1.98.0`, whose Extension Host meets that runtime baseline. Do not use
 `--ignore-scripts` in the normal setup path: it can skip installation work
