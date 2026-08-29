@@ -21,6 +21,7 @@ import {
   type RolloutInversePatch,
 } from "./rollouts";
 import type { CodexLayout } from "./types";
+import type { WindowsFileIdentity } from "./windows-file-operations";
 
 export type TransactionState =
   | "prepared"
@@ -370,6 +371,7 @@ export interface FileIdentity {
   readonly dev: number | bigint;
   readonly ino: number | bigint;
   readonly nlink: number | bigint;
+  readonly windowsFileIdentity?: WindowsFileIdentity;
 }
 
 export function hasSameStableFileIdentity(
@@ -3436,23 +3438,99 @@ function hasSameComparableFileIdentity(
   left: FileIdentity,
   right: FileIdentity,
 ): boolean {
-  return (
-    hasComparableFileIdentity(left) &&
-    hasComparableFileIdentity(right) &&
-    left.dev === right.dev &&
-    left.ino === right.ino
-  );
+  const leftSnapshot = snapshotComparableFileIdentity(left);
+  const rightSnapshot = snapshotComparableFileIdentity(right);
+  if (!leftSnapshot || !rightSnapshot) {
+    return false;
+  }
+  if (leftSnapshot.ino !== 0n && rightSnapshot.ino !== 0n) {
+    return leftSnapshot.dev === rightSnapshot.dev && leftSnapshot.ino === rightSnapshot.ino;
+  }
+  return leftSnapshot.ino === 0n &&
+    rightSnapshot.ino === 0n &&
+    leftSnapshot.windowsFileIdentity !== undefined &&
+    rightSnapshot.windowsFileIdentity !== undefined &&
+    leftSnapshot.windowsFileIdentity.volumeSerial === rightSnapshot.windowsFileIdentity.volumeSerial &&
+    leftSnapshot.windowsFileIdentity.fileId === rightSnapshot.windowsFileIdentity.fileId &&
+    leftSnapshot.windowsFileIdentity.linkCount === rightSnapshot.windowsFileIdentity.linkCount;
 }
 
 function hasComparableFileIdentity(stats: FileIdentity): boolean {
-  if (typeof stats.dev === "bigint" && typeof stats.ino === "bigint") {
-    return stats.ino !== 0n;
+  return snapshotComparableFileIdentity(stats) !== undefined;
+}
+
+interface ComparableTransactionFileIdentity {
+  readonly dev: number | bigint;
+  readonly ino: number | bigint;
+  readonly nlink: number | bigint;
+  readonly windowsFileIdentity?: WindowsFileIdentity;
+}
+
+function snapshotComparableFileIdentity(
+  stats: FileIdentity,
+): ComparableTransactionFileIdentity | undefined {
+  try {
+    const dev = readOwnDataProperty(stats, "dev");
+    const ino = readOwnDataProperty(stats, "ino");
+    const nlink = readOwnDataProperty(stats, "nlink");
+    if (!isSafeTransactionIdentityValue(dev) ||
+      !isSafeTransactionIdentityValue(ino) ||
+      !isSafeTransactionIdentityValue(nlink)) {
+      return undefined;
+    }
+    if (ino !== 0n && ino !== 0) {
+      return Object.freeze({ dev, ino, nlink });
+    }
+    const native = snapshotTransactionWindowsIdentity(
+      readOwnDataProperty(stats, "windowsFileIdentity"),
+    );
+    if (!native || !sameTransactionIdentityValue(nlink, native.linkCount)) {
+      return undefined;
+    }
+    return Object.freeze({ dev, ino, nlink, windowsFileIdentity: native });
+  } catch {
+    return undefined;
   }
-  return (
-    Number.isSafeInteger(stats.dev) &&
-    Number.isSafeInteger(stats.ino) &&
-    stats.ino !== 0
-  );
+}
+
+function readOwnDataProperty(value: object, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  return descriptor !== undefined && "value" in descriptor ? descriptor.value : undefined;
+}
+
+function isSafeTransactionIdentityValue(value: unknown): value is number | bigint {
+  return typeof value === "bigint"
+    ? value >= 0n
+    : typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function sameTransactionIdentityValue(
+  left: number | bigint,
+  right: number | bigint,
+): boolean {
+  if (typeof left === typeof right) {
+    return left === right;
+  }
+  return typeof left === "number" ? BigInt(left) === right : left === BigInt(right);
+}
+
+function snapshotTransactionWindowsIdentity(value: unknown): WindowsFileIdentity | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const volumeSerial = readOwnDataProperty(value, "volumeSerial");
+  const fileId = readOwnDataProperty(value, "fileId");
+  const linkCount = readOwnDataProperty(value, "linkCount");
+  if (
+    typeof volumeSerial !== "string" ||
+    !/^[0-9a-f]{16}$/u.test(volumeSerial) ||
+    typeof fileId !== "string" ||
+    !/^[0-9a-f]{32}$/u.test(fileId) ||
+    linkCount !== 1n
+  ) {
+    return undefined;
+  }
+  return Object.freeze({ volumeSerial, fileId, linkCount });
 }
 
 function hasMultipleHardLinks(stats: Stats): boolean {
