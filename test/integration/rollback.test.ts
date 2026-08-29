@@ -4,6 +4,9 @@ import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:f
 import { join } from "node:path";
 import test from "node:test";
 import sqlite3 from "sqlite3";
+import { ActiveProfileStore } from "../../src/core/active-profile";
+import { ProfileStore } from "../../src/core/profiles";
+import { switchStoredProfile } from "../../src/core/profile-switch-orchestrator";
 import {
   applyRolloutChanges,
   collectRolloutChanges,
@@ -27,7 +30,145 @@ import {
 import type { CodexLayout } from "../../src/core/types";
 
 const customApiKey = "rollback-test-api-key-must-never-be-journaled";
+const oauthValue = "rollback-test-oauth-value-must-never-be-journaled";
 const transcriptBody = "private-transcript-body-must-never-be-journaled";
+
+const officialConfig = 'model_provider = "openai"\n';
+const customConfig = [
+  'model_provider = "custom"',
+  'model = "gpt-5.6-sol"',
+  '[model_providers.custom]',
+  'name = "Fixture proxy"',
+  'base_url = "https://example.test/v1"',
+  'wire_api = "responses"',
+  'requires_openai_auth = true',
+  "",
+].join("\n");
+
+test("rolls back a stored official switch when native login fails", async () => {
+  await withStoredProfileFixture(async ({ fixture, profiles, secrets, active, official }) => {
+    const before = await takeSnapshot(fixture);
+    const beforeActive = await active.snapshot();
+    const executorLayouts: string[] = [];
+
+    const result = await switchStoredProfile(
+      { targetProfileId: official.id },
+      {
+        layout: fixture.layout,
+        profiles,
+        secrets,
+        activeProfiles: active,
+        officialLogin: {
+          run: async (layout) => {
+            executorLayouts.push(layout.codexHome);
+            await writeFile(
+              layout.authPath,
+              JSON.stringify({ oauth_access_token: oauthValue }),
+              "utf8",
+            );
+            return { loginExitCode: 1, statusExitCode: undefined };
+          },
+        },
+      },
+    );
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.journalState, "rolledBack");
+    assert.deepEqual(executorLayouts, [fixture.layout.codexHome]);
+    await assertSnapshotRestored(fixture, before);
+    assert.deepEqual(await active.snapshot(), beforeActive);
+    await assertBoundedTransactionBackups(fixture.layout, result.operationId, before.rollouts);
+    await assertNoSensitiveTransactionData(fixture.layout, result.operationId);
+  });
+});
+
+test("commits a stored official switch only after login and status succeed", async () => {
+  await withStoredProfileFixture(async ({ fixture, profiles, secrets, active, official, custom }) => {
+    const executorLayouts: string[] = [];
+    const executorSteps: string[] = [];
+    let executorStartConfig: string | undefined;
+    let executorStartProvider: string | undefined;
+    let executorStartActiveProfile: string | undefined;
+    let executorCompleted = false;
+    const activeForSwitch = {
+      snapshot: () => active.snapshot(),
+      set: async (profileId: string) => {
+        assert.equal(executorCompleted, true);
+        executorSteps.push("active marker");
+        return active.set(profileId);
+      },
+    };
+
+    const result = await switchStoredProfile(
+      { targetProfileId: official.id },
+      {
+        layout: fixture.layout,
+        profiles,
+        secrets,
+        activeProfiles: activeForSwitch,
+        officialLogin: {
+          run: async (layout) => {
+            executorLayouts.push(layout.codexHome);
+            executorSteps.push("executor started");
+            executorStartConfig = await readFile(layout.configPath, "utf8");
+            executorStartProvider = await readProvider(layout.sqlitePath);
+            executorStartActiveProfile = (await active.get())?.profileId;
+            executorCompleted = true;
+            executorSteps.push("executor completed");
+            return { loginExitCode: 0, statusExitCode: 0 };
+          },
+        },
+      },
+    );
+
+    assert.equal(result.status, "committed", JSON.stringify(result));
+    assert.equal(result.journalState, "committed");
+    assert.deepEqual(executorLayouts, [fixture.layout.codexHome]);
+    assert.deepEqual(executorSteps, ["executor started", "executor completed", "active marker"]);
+    assert.equal(executorCompleted, true);
+    assert.equal(executorStartConfig, officialConfig);
+    assert.equal(executorStartProvider, "openai");
+    assert.equal(executorStartActiveProfile, custom.id);
+    assert.equal(await readFile(fixture.layout.configPath, "utf8"), officialConfig);
+    assert.equal(await readProvider(fixture.layout.sqlitePath), "openai");
+    assert.equal((await active.get())?.profileId, official.id);
+    await assertNoSensitiveTransactionData(fixture.layout, result.operationId);
+  });
+});
+
+test("rolls back a stored official switch when login status fails", async () => {
+  await withStoredProfileFixture(async ({ fixture, profiles, secrets, active, official }) => {
+    const before = await takeSnapshot(fixture);
+    const beforeActive = await active.snapshot();
+
+    const result = await switchStoredProfile(
+      { targetProfileId: official.id },
+      {
+        layout: fixture.layout,
+        profiles,
+        secrets,
+        activeProfiles: active,
+        officialLogin: {
+          run: async (layout) => {
+            await writeFile(
+              layout.authPath,
+              JSON.stringify({ oauth_access_token: oauthValue }),
+              "utf8",
+            );
+            return { loginExitCode: 0, statusExitCode: 1 };
+          },
+        },
+      },
+    );
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.journalState, "rolledBack");
+    await assertSnapshotRestored(fixture, before);
+    assert.deepEqual(await active.snapshot(), beforeActive);
+    await assertBoundedTransactionBackups(fixture.layout, result.operationId, before.rollouts);
+    await assertNoSensitiveTransactionData(fixture.layout, result.operationId);
+  });
+});
 
 test("rolls back a preflight failure before any backup or mutation", async () => {
   await withFixture(async (fixture) => {
@@ -493,6 +634,7 @@ interface Fixture {
   readonly root: string;
   readonly layout: CodexLayout;
   readonly rolloutPaths: readonly string[];
+  readonly activeProfilePath: string;
   authMode: "official" | "custom";
   restoreAuthMode(target: AuthJournalTarget): Promise<void>;
 }
@@ -502,8 +644,19 @@ interface Snapshot {
   readonly rollouts: ReadonlyMap<string, Buffer>;
   readonly rolloutHashes: ReadonlyMap<string, string>;
   readonly sqlite: Buffer;
+  readonly auth: Buffer | undefined;
+  readonly activeProfile: Buffer | undefined;
   readonly authMode: "official" | "custom";
   readonly authPathExists: boolean;
+}
+
+interface StoredProfileFixture {
+  readonly fixture: Fixture;
+  readonly profiles: ProfileStore;
+  readonly secrets: { get(profileSecretId: string): Promise<string | undefined> };
+  readonly active: ActiveProfileStore;
+  readonly official: Awaited<ReturnType<ProfileStore["create"]>>;
+  readonly custom: Awaited<ReturnType<ProfileStore["create"]>>;
 }
 
 function dependencies(
@@ -546,6 +699,7 @@ async function withFixture(callback: (fixture: Fixture) => Promise<void>): Promi
     root,
     layout,
     rolloutPaths,
+    activeProfilePath: join(layout.switcherDir, "active-profile.json"),
     authMode: "official",
     async restoreAuthMode(target) {
       fixture.authMode = target.previousMode;
@@ -567,6 +721,43 @@ async function withFixture(callback: (fixture: Fixture) => Promise<void>): Promi
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+}
+
+async function withStoredProfileFixture(
+  callback: (fixture: StoredProfileFixture) => Promise<void>,
+): Promise<void> {
+  await withFixture(async (fixture) => {
+    const profiles = new ProfileStore(fixture.layout);
+    const official = await profiles.create({
+      name: "Official",
+      kind: "official",
+      configText: officialConfig,
+      providerId: "openai",
+    });
+    const custom = await profiles.create({
+      name: "Custom",
+      kind: "custom",
+      configText: customConfig,
+      providerId: "custom",
+    });
+    const active = new ActiveProfileStore(fixture.layout, {
+      now: () => "2026-08-30T00:00:00.000Z",
+    });
+    await active.set(official.id);
+    const secrets = {
+      async get(profileSecretId: string): Promise<string | undefined> {
+        return profileSecretId === custom.apiKeySecretId ? customApiKey : undefined;
+      },
+    };
+
+    const customResult = await switchStoredProfile(
+      { targetProfileId: custom.id },
+      { layout: fixture.layout, profiles, secrets, activeProfiles: active },
+    );
+    assert.equal(customResult.status, "committed");
+    fixture.authMode = "custom";
+    await callback({ fixture, profiles, secrets, active, official, custom });
+  });
 }
 
 function createLayout(codexHome: string): CodexLayout {
@@ -605,6 +796,8 @@ async function takeSnapshot(fixture: Fixture): Promise<Snapshot> {
       [...rollouts].map(([path, bytes]) => [path, sha256(bytes)] as const),
     ),
     sqlite: await readFile(fixture.layout.sqlitePath),
+    auth: await readOptionalFile(fixture.layout.authPath),
+    activeProfile: await readOptionalFile(fixture.activeProfilePath),
     authMode: fixture.authMode,
     authPathExists: await fileExists(fixture.layout.authPath),
   };
@@ -618,6 +811,8 @@ async function assertSnapshotRestored(fixture: Fixture, before: Snapshot): Promi
     assert.equal(sha256(current), before.rolloutHashes.get(path), `${path} SHA-256`);
   }
   assert.deepEqual(await readFile(fixture.layout.sqlitePath), before.sqlite);
+  assert.deepEqual(await readOptionalFile(fixture.layout.authPath), before.auth);
+  assert.deepEqual(await readOptionalFile(fixture.activeProfilePath), before.activeProfile);
   assert.equal(fixture.authMode, before.authMode);
   assert.equal(await fileExists(fixture.layout.authPath), before.authPathExists);
 }
@@ -631,14 +826,37 @@ async function assertNoSensitiveTransactionData(
   operationId: string,
 ): Promise<void> {
   const directory = join(layout.switcherDir, "transactions", operationId);
+  const backupNames = await readdir(join(directory, "backup"));
+  assert.equal(backupNames.some((name) => /auth/i.test(name)), false);
   const metadataPaths = [join(directory, "journal.jsonl")];
   const manifestPath = join(directory, "backup", "manifest.json");
   if (await fileExists(manifestPath)) {
     metadataPaths.push(manifestPath);
   }
-  const contents = Buffer.concat(await Promise.all(metadataPaths.map((path) => readFile(path))));
-  assert.equal(contents.includes(Buffer.from(transcriptBody)), false);
-  assert.equal(contents.includes(Buffer.from(customApiKey)), false);
+  const metadataBytes = Buffer.concat(
+    await Promise.all(metadataPaths.map((path) => readFile(path))),
+  );
+  assert.equal(metadataBytes.includes(Buffer.from(transcriptBody)), false);
+
+  const transactionBytes = await readTransactionDirectory(directory);
+  for (const credentialValue of [customApiKey, oauthValue]) {
+    assert.equal(transactionBytes.includes(Buffer.from(credentialValue)), false);
+  }
+}
+
+async function readTransactionDirectory(directory: string): Promise<Buffer> {
+  const entries = await readdir(directory, { withFileTypes: true });
+  const contents = await Promise.all(entries.map(async (entry) => {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) {
+      return readTransactionDirectory(path);
+    }
+    if (entry.isSymbolicLink() || !entry.isFile()) {
+      throw new Error("Unexpected non-regular transaction entry.");
+    }
+    return readFile(path);
+  }));
+  return Buffer.concat(contents);
 }
 
 async function fileExists(path: string): Promise<boolean> {
@@ -648,6 +866,42 @@ async function fileExists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+async function readOptionalFile(path: string): Promise<Buffer | undefined> {
+  try {
+    return await readFile(path);
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+function readProvider(path: string): Promise<string | undefined> {
+  return new Promise((resolve, reject) => {
+    const database = new sqlite3.Database(path, (openError) => {
+      if (openError) {
+        reject(openError);
+        return;
+      }
+      database.get(
+        "SELECT model_provider FROM threads WHERE id = 'thread-1'",
+        (error, row: { model_provider?: string } | undefined) => {
+          database.close((closeError) => {
+            if (error) {
+              reject(error);
+            } else if (closeError) {
+              reject(closeError);
+            } else {
+              resolve(row?.model_provider);
+            }
+          });
+        },
+      );
+    });
+  });
 }
 
 function createRolloutMutations(

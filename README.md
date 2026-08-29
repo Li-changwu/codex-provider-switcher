@@ -14,11 +14,11 @@ macOS, WSL, cross-device switching, and cloud profile/session synchronization ar
 
 Create a named Profile with non-secret TOML configuration. Custom provider API keys are stored separately in VS Code SecretStorage; the TOML must not contain credentials.
 
-Official Profiles use native Codex authentication. Run `codex login` yourself in a native terminal when it is needed. The extension does not read, copy, or store native login credentials.
+Official Profiles use native Codex authentication. When switching to an official Profile, the extension runs native `codex login` in the current Extension Host terminal and then checks `codex login status`. If login fails, is cancelled, or status cannot be verified, the switch finishes its rollback before the command ends. OAuth credentials remain managed by Codex; the extension does not read, copy, or write them to Profiles, logs, backups, or SecretStorage.
 
 ## Switching and Recovery
 
-Switching materializes the selected Profile, updates provider metadata for local sessions, and reports progress. A cancellation waits for rollback to finish before another command runs. The switch process creates backups, and **Codex: Restore Backup** can recover an interrupted operation.
+Switching materializes the selected Profile, updates provider metadata for local sessions, and reports progress. A cancellation waits for rollback to finish before another command runs. The switch process creates backups, and **Codex: Restore Backup** can recover an interrupted operation. Session synchronization remains local to the current Extension Host and Codex Home; cross-device and cloud session synchronization are not supported.
 
 On Windows volumes that report no inode data, protected file mutations use the native Windows file identity from an open handle. If that identity or the native helper is unavailable, the extension disables the unsafe operation instead of falling back to timestamps or path-only checks.
 
