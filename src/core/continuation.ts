@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { lstat, mkdir, realpath } from "node:fs/promises";
+import type { BigIntStats } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import sqlite3 from "sqlite3";
 import {
@@ -7,6 +8,13 @@ import {
   retainCompletedTransactionBackups,
   selectMappedBranchesForArchival,
 } from "./retention";
+import {
+  hasComparableFileIdentity,
+  hydrateWindowsFileIdentity,
+  sameStableFileIdentity,
+  type FileIdentity,
+  type HydrateWindowsFileIdentityOptions,
+} from "./file-identity";
 import type { CodexLayout } from "./types";
 
 const stateDatabaseName = "state.sqlite";
@@ -83,6 +91,7 @@ export interface ContinueSessionRequest {
   readonly capabilityProbeTimeoutMs?: number;
   /** Allows the extension host to supply its SQLite execution boundary. */
   readonly stateStoreStatementRunner?: StateStoreStatementRunner;
+  readonly fileIdentityOptions?: HydrateWindowsFileIdentityOptions;
   readonly codexCommand?: string;
   readonly codexCommandPrefixArgs?: readonly string[];
   readonly archiveBranch?: (branchSessionId: string) => Promise<void>;
@@ -156,6 +165,7 @@ export async function continueSession(
 
   const store = new SqliteBranchMappingStore(
     request.layout,
+    request.fileIdentityOptions,
     request.now,
     request.stateStoreStatementRunner,
   );
@@ -323,8 +333,12 @@ async function completeSuccessfulLaunch(
   result: ContinueSessionResult,
 ): Promise<ContinueSessionResult> {
   const cleanup = await Promise.allSettled([
-    retainCompletedTransactionBackups(request.layout),
-    cleanupTemporaryContexts(request.layout),
+    retainCompletedTransactionBackups(request.layout, {
+      fileIdentityOptions: request.fileIdentityOptions,
+    }),
+    cleanupTemporaryContexts(request.layout, {
+      fileIdentityOptions: request.fileIdentityOptions,
+    }),
   ]);
   return cleanup.some((entry) => entry.status === "rejected")
     ? { ...result, retentionWarning: true }
@@ -740,8 +754,11 @@ async function defaultCommandRunner(
   });
 }
 
-export async function listBranchMappings(layout: CodexLayout): Promise<BranchMapping[]> {
-  const store = new SqliteBranchMappingStore(layout);
+export async function listBranchMappings(
+  layout: CodexLayout,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
+): Promise<BranchMapping[]> {
+  const store = new SqliteBranchMappingStore(layout, fileIdentityOptions);
   return store.listAll();
 }
 
@@ -780,6 +797,7 @@ class ForkOperationFailure extends Error {
 class SqliteBranchMappingStore {
   constructor(
     private readonly layout: CodexLayout,
+    private readonly fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
     private readonly clock: () => string = () => new Date().toISOString(),
     private readonly statementRunner: StateStoreStatementRunner = runStatement,
   ) {}
@@ -983,9 +1001,16 @@ class SqliteBranchMappingStore {
     let primaryError: unknown;
     let result: Result | undefined;
     try {
-      const statePath = await assertTrustedStateStorePath(this.layout);
-      database = await openDatabase(statePath);
-      await assertTrustedStateStorePath(this.layout);
+      const trustedStateStore = await assertTrustedStateStorePath(
+        this.layout,
+        this.fileIdentityOptions,
+      );
+      database = await openDatabase(trustedStateStore.path);
+      await assertTrustedStateStorePath(
+        this.layout,
+        this.fileIdentityOptions,
+        trustedStateStore.stateStats,
+      );
       database.configure("busyTimeout", continuationDatabaseBusyTimeoutMs);
       database.serialize();
       await initializeStateDatabase(database, this.statementRunner);
@@ -1148,7 +1173,18 @@ function saveBranchMapping(
   );
 }
 
-async function assertTrustedStateStorePath(layout: CodexLayout): Promise<string> {
+type StateStoreFileIdentityStats = BigIntStats & FileIdentity;
+
+interface TrustedStateStorePath {
+  readonly path: string;
+  readonly stateStats?: StateStoreFileIdentityStats;
+}
+
+async function assertTrustedStateStorePath(
+  layout: CodexLayout,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
+  expectedStateStats?: StateStoreFileIdentityStats,
+): Promise<TrustedStateStorePath> {
   const codexHomePath = resolve(layout.codexHome);
   const switcherPath = resolve(layout.switcherDir);
   const expectedSwitcherPath = join(codexHomePath, "provider-switcher");
@@ -1159,20 +1195,22 @@ async function assertTrustedStateStorePath(layout: CodexLayout): Promise<string>
   try {
     await mkdir(switcherPath, { recursive: true });
     const codexHomeRealPath = await realpath(codexHomePath);
-    const before = await lstat(switcherPath, { bigint: true });
-    if (before.isSymbolicLink() || !before.isDirectory()) {
+    const platform = fileIdentityOptions?.platform ?? process.platform;
+    const before = await lstatWithFileIdentity(switcherPath, fileIdentityOptions);
+    if (!isSafeStateStoreDirectory(before, platform)) {
       throw stateStorePathError();
     }
     const switcherRealPath = await realpath(switcherPath);
     if (!pathsEqual(relative(codexHomeRealPath, switcherRealPath), "provider-switcher")) {
       throw stateStorePathError();
     }
-    const after = await lstat(switcherPath, { bigint: true });
+    const after = await lstatWithFileIdentity(switcherPath, fileIdentityOptions);
+    const switcherRealPathStats = await lstatWithFileIdentity(switcherRealPath, fileIdentityOptions);
     if (
-      after.isSymbolicLink() ||
-      !after.isDirectory() ||
-      before.dev !== after.dev ||
-      before.ino !== after.ino ||
+      !isSafeStateStoreDirectory(after, platform) ||
+      !isSafeStateStoreDirectory(switcherRealPathStats, platform) ||
+      !sameStableFileIdentity(before, after, platform) ||
+      !sameStableFileIdentity(after, switcherRealPathStats, platform) ||
       (await realpath(codexHomePath)) !== codexHomeRealPath ||
       !isPathInsideOrEqual(codexHomeRealPath, switcherRealPath)
     ) {
@@ -1180,30 +1218,71 @@ async function assertTrustedStateStorePath(layout: CodexLayout): Promise<string>
     }
 
     const statePath = join(switcherPath, stateDatabaseName);
-    let stateStats;
+    let stateStats: StateStoreFileIdentityStats;
     try {
-      stateStats = await lstat(statePath, { bigint: true });
+      stateStats = await lstatWithFileIdentity(statePath, fileIdentityOptions);
     } catch (error: unknown) {
       if (isMissingFileError(error)) {
-        return statePath;
+        if (expectedStateStats !== undefined) {
+          throw stateStorePathError();
+        }
+        return { path: statePath };
       }
       throw error;
     }
+    const stateRealPath = await realpath(statePath);
+    const stateRealPathStats = await lstatWithFileIdentity(stateRealPath, fileIdentityOptions);
     if (
-      stateStats.isSymbolicLink() ||
-      !stateStats.isFile() ||
-      stateStats.nlink !== 1n ||
-      relative(switcherRealPath, await realpath(statePath)) !== stateDatabaseName
+      !isSafeStateStoreFile(stateStats, platform) ||
+      !isSafeStateStoreFile(stateRealPathStats, platform) ||
+      !sameStableFileIdentity(stateStats, stateRealPathStats, platform) ||
+      (expectedStateStats !== undefined &&
+        !sameStableFileIdentity(expectedStateStats, stateStats, platform)) ||
+      relative(switcherRealPath, stateRealPath) !== stateDatabaseName
     ) {
       throw stateStorePathError();
     }
-    return statePath;
+    return { path: statePath, stateStats };
   } catch (error: unknown) {
     if (error instanceof ContinuationError) {
       throw error;
     }
     throw stateStorePathError(error);
   }
+}
+
+async function lstatWithFileIdentity(
+  path: string,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
+): Promise<StateStoreFileIdentityStats> {
+  const stats = await lstat(path, { bigint: true });
+  const identity = await hydrateWindowsFileIdentity(path, stats, fileIdentityOptions);
+  if (identity.windowsFileIdentity !== undefined) {
+    Object.defineProperty(stats, "windowsFileIdentity", {
+      configurable: false,
+      enumerable: true,
+      value: identity.windowsFileIdentity,
+      writable: false,
+    });
+  }
+  return stats as StateStoreFileIdentityStats;
+}
+
+function isSafeStateStoreDirectory(
+  stats: StateStoreFileIdentityStats,
+  platform: NodeJS.Platform,
+): boolean {
+  return stats.isDirectory() && !stats.isSymbolicLink() && hasComparableFileIdentity(stats, platform);
+}
+
+function isSafeStateStoreFile(
+  stats: StateStoreFileIdentityStats,
+  platform: NodeJS.Platform,
+): boolean {
+  return stats.isFile() &&
+    !stats.isSymbolicLink() &&
+    stats.nlink === 1n &&
+    hasComparableFileIdentity(stats, platform);
 }
 
 function isPathInsideOrEqual(directory: string, candidate: string): boolean {

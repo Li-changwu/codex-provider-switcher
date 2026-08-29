@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { access, copyFile, link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { realpathSync, renameSync, writeFileSync } from "node:fs";
+import { access, copyFile, link, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import test from "node:test";
 import {
@@ -12,6 +14,120 @@ import {
   type TerminalInvocation,
 } from "../../src/core/continuation";
 import type { CodexLayout } from "../../src/core/types";
+import type {
+  WindowsFileIdentity,
+  WindowsFileOperations,
+} from "../../src/core/windows-file-operations";
+
+const nodeRequire = createRequire(import.meta.url);
+
+test("opens an existing zero-inode state database and lists its fork mapping", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  await withZeroInodeStats(async () => {
+    await withLayout(async (layout) => {
+      clearCodexCapabilityCacheForTests();
+      const fileIdentityOptions = zeroInodeIdentityOptions();
+      await continueSession({
+        layout,
+        sessionId: "source-1",
+        mode: "fork",
+        targetProfileId: "custom",
+        sourceEventHash: hash("initial zero-inode state"),
+        terminal: new FakeTerminal([{ branchSessionId: "branch-1" }]),
+        commandRunner: successfulHelp,
+        fileIdentityOptions,
+      });
+
+      const result = await continueSession({
+        layout,
+        sessionId: "source-1",
+        mode: "fork",
+        targetProfileId: "custom",
+        sourceEventHash: hash("existing zero-inode state"),
+        terminal: new FakeTerminal([{ branchSessionId: "branch-2" }]),
+        commandRunner: successfulHelp,
+        fileIdentityOptions,
+      });
+
+      assert.equal(result.branchSessionId, "branch-2");
+      assert.deepEqual(
+        (await listBranchMappings(layout, fileIdentityOptions)).map((mapping) => mapping.branchSessionId),
+        ["branch-2", "branch-1"],
+      );
+    });
+  });
+});
+
+test("rejects a zero-inode state database replaced between trust checks", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  await withZeroInodeStats(async () => {
+    await withLayout(async (layout) => {
+      clearCodexCapabilityCacheForTests();
+      const windowsFileOperations = new DeterministicWindowsFileOperations();
+      const fileIdentityOptions = zeroInodeIdentityOptions(windowsFileOperations);
+      await continueSession({
+        layout,
+        sessionId: "source-1",
+        mode: "fork",
+        targetProfileId: "custom",
+        sourceEventHash: hash("initial zero-inode state"),
+        terminal: new FakeTerminal([{ branchSessionId: "branch-1" }]),
+        commandRunner: successfulHelp,
+        fileIdentityOptions,
+      });
+      windowsFileOperations.replaceStateAfterNextTrustCheck(layout);
+
+      await assert.rejects(
+        () => continueSession({
+          layout,
+          sessionId: "source-1",
+          mode: "fork",
+          targetProfileId: "custom",
+          sourceEventHash: hash("replaced zero-inode state"),
+          terminal: new FakeTerminal([{ branchSessionId: "branch-2" }]),
+          commandRunner: successfulHelp,
+          fileIdentityOptions,
+        }),
+        /continuation mapping store/i,
+      );
+    });
+  });
+});
+
+test("creates a missing zero-inode state database and lists its fork mapping", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows File IDs are not available on this platform.");
+    return;
+  }
+  await withZeroInodeStats(async () => {
+    await withLayout(async (layout) => {
+      clearCodexCapabilityCacheForTests();
+      const fileIdentityOptions = zeroInodeIdentityOptions();
+      await continueSession({
+        layout,
+        sessionId: "source-1",
+        mode: "fork",
+        targetProfileId: "custom",
+        sourceEventHash: hash("missing zero-inode state"),
+        terminal: new FakeTerminal([{ branchSessionId: "branch-1" }]),
+        commandRunner: successfulHelp,
+        fileIdentityOptions,
+      });
+
+      assert.equal((await lstat(join(layout.switcherDir, "state.sqlite"), { bigint: true })).ino, 0n);
+      assert.deepEqual(
+        (await listBranchMappings(layout, fileIdentityOptions)).map((mapping) => mapping.branchSessionId),
+        ["branch-1"],
+      );
+    });
+  });
+});
 
 test("launches native resume with an argument array after one capability check", async () => {
   await withLayout(async (layout) => {
@@ -1388,5 +1504,97 @@ async function withLayout(callback: (layout: CodexLayout) => Promise<void>): Pro
     await callback(layout);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+}
+
+async function withZeroInodeStats(callback: () => Promise<void>): Promise<void> {
+  const mutableFs = nodeRequire("node:fs/promises") as {
+    lstat: typeof lstat;
+  };
+  const originalLstat = mutableFs.lstat;
+  mutableFs.lstat = (async (...args: Parameters<typeof lstat>) => {
+    const stats = await originalLstat(...args);
+    return withZeroInodeStatsValue(stats);
+  }) as typeof lstat;
+  syncBuiltinESMExports();
+  try {
+    await callback();
+  } finally {
+    mutableFs.lstat = originalLstat;
+    syncBuiltinESMExports();
+  }
+}
+
+function withZeroInodeStatsValue<T extends Awaited<ReturnType<typeof lstat>>>(stats: T): T {
+  const copy = Object.create(
+    Object.getPrototypeOf(stats),
+    Object.getOwnPropertyDescriptors(stats),
+  ) as T;
+  Object.defineProperty(copy, "ino", {
+    configurable: true,
+    enumerable: true,
+    value: 0n,
+    writable: false,
+  });
+  return copy;
+}
+
+function zeroInodeIdentityOptions(
+  windowsFileOperations: WindowsFileOperations = new DeterministicWindowsFileOperations(),
+) {
+  return {
+    platform: "win32" as const,
+    windowsFileOperations,
+  };
+}
+
+class DeterministicWindowsFileOperations implements WindowsFileOperations {
+  private readonly identities = new Map<string, WindowsFileIdentity>();
+  private readonly captureCounts = new Map<string, number>();
+  private replacement?: { key: string; path: string; afterCaptureCount: number };
+
+  captureFileIdentity(path: string): WindowsFileIdentity {
+    const key = this.canonicalKey(path);
+    const count = (this.captureCounts.get(key) ?? 0) + 1;
+    this.captureCounts.set(key, count);
+    const identity = this.identities.get(key) ?? this.createIdentity(this.identities.size + 1);
+    this.identities.set(key, identity);
+    if (this.replacement?.key === key && this.replacement.afterCaptureCount === count) {
+      const replacementPath = `${path}.replacement`;
+      writeFileSync(replacementPath, "replacement state", "utf8");
+      renameSync(replacementPath, path);
+      this.identities.set(key, this.createIdentity(this.identities.size + 1));
+      this.replacement = undefined;
+    }
+    return identity;
+  }
+
+  deleteFileIfMatches(): "deleted" | "identity-mismatch" {
+    throw new Error("deleteFileIfMatches is not used by continuation tests");
+  }
+
+  holdFileIfMatches(): { close: () => void } {
+    throw new Error("holdFileIfMatches is not used by continuation tests");
+  }
+
+  replaceStateAfterNextTrustCheck(layout: CodexLayout): void {
+    const path = join(layout.switcherDir, "state.sqlite");
+    this.replacement = {
+      key: this.canonicalKey(path),
+      path,
+      afterCaptureCount: (this.captureCounts.get(this.canonicalKey(path)) ?? 0) + 2,
+    };
+  }
+
+  private canonicalKey(path: string): string {
+    return realpathSync.native(path).toLowerCase();
+  }
+
+  private createIdentity(index: number): WindowsFileIdentity {
+    return {
+      volumeSerial: "0000000000000001",
+      fileId: index.toString(16).padStart(32, "0"),
+      linkCount: 1n,
+    };
   }
 }
