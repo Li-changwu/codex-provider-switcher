@@ -1578,12 +1578,14 @@ class DeterministicWindowsFileOperations implements WindowsFileOperations {
     const key = path.toLowerCase();
     const count = (this.captureCounts.get(key) ?? 0) + 1;
     this.captureCounts.set(key, count);
+    console.error("zero-inode capture", { count, path });
     const identity = this.identities.get(key) ?? this.createIdentity(this.identities.size + 1);
     this.identities.set(key, identity);
     if (this.replacement?.path.toLowerCase() === key && this.replacement.afterCaptureCount === count) {
       const replacementPath = `${path}.replacement`;
       writeFileSync(replacementPath, "replacement state", "utf8");
       renameSync(replacementPath, path);
+      console.error("zero-inode replacement", { path });
       this.identities.set(key, this.createIdentity(this.identities.size + 1));
       this.replacement = undefined;
     }
