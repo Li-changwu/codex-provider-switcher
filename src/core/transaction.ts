@@ -2103,7 +2103,44 @@ async function restoreFileAtomically(
         fileIdentityOptions,
       );
     }
-    await rename(temporary, join(parent.operationalPath, basename(destination)));
+    const operationalDestination = join(parent.operationalPath, basename(destination));
+    const platform = fileIdentityOptions?.platform ?? process.platform;
+    if (platform === "win32" && expectedVersion?.inode === "0") {
+      const expectedIdentity = snapshotTransactionWindowsIdentity({
+        volumeSerial: expectedVersion.volumeSerial,
+        fileId: expectedVersion.fileId,
+        linkCount: 1n,
+      });
+      const operations = fileIdentityOptions?.windowsFileOperations ?? createWindowsFileOperations();
+      if (!expectedIdentity || typeof operations.replaceFileIfMatches !== "function") {
+        throw new TransactionError(
+          "rollback-failed",
+          "The Windows restore target cannot be safely restored.",
+        );
+      }
+      let result: "replaced" | "identity-mismatch";
+      try {
+        result = operations.replaceFileIfMatches(
+          temporary,
+          operationalDestination,
+          expectedIdentity,
+        );
+      } catch (error: unknown) {
+        throw new TransactionError(
+          "rollback-failed",
+          "The Windows restore target could not be safely restored.",
+          { cause: error },
+        );
+      }
+      if (result === "identity-mismatch") {
+        throw new TransactionError(
+          "rollback-failed",
+          "The Windows restore target changed before restore.",
+        );
+      }
+    } else {
+      await rename(temporary, operationalDestination);
+    }
     await assertTrustedRestoreParent(parent, fileIdentityOptions);
     await syncTrustedRestoreParent(parent, io);
   } catch (error: unknown) {

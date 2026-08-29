@@ -31,6 +31,11 @@ interface NativeWindowsFileOperations {
     path: string,
     expected: NativeFileIdentity,
   ): "deleted" | "identity-mismatch";
+  replaceFileIfMatches(
+    source: string,
+    destination: string,
+    expected: NativeFileIdentity,
+  ): "replaced" | "identity-mismatch";
   holdFileIfMatches(path: string, expected: NativeFileIdentity): object;
   releaseFileHold(hold: object): void;
 }
@@ -114,6 +119,68 @@ test(
       );
       assert.equal(readFileSync(replacedSourcePath, "utf8"), "replacement lock\n");
       assert.equal(readFileSync(replacedDestinationPath, "utf8"), "original lock\n");
+    } finally {
+      rmSync(temporaryDirectory, { force: true, recursive: true });
+    }
+  },
+);
+
+test(
+  "Windows addon restores a matching target through verified handles",
+  { skip: process.platform !== "win32" },
+  () => {
+    const temporaryPrefix = join(tmpdir(), "codex-provider-switcher-file-ops-");
+    const temporaryDirectory = mkdtempSync(temporaryPrefix);
+    assert.ok(temporaryDirectory.startsWith(temporaryPrefix));
+
+    const sourcePath = join(temporaryDirectory, "config.restore");
+    const destinationPath = join(temporaryDirectory, "config.toml");
+    const addon = require(addonPath) as NativeWindowsFileOperations;
+
+    try {
+      writeFileSync(destinationPath, "original config\n", "utf8");
+      writeFileSync(sourcePath, "restored config\n", "utf8");
+      const originalIdentity = addon.captureFileIdentity(destinationPath);
+
+      assert.equal(
+        addon.replaceFileIfMatches(sourcePath, destinationPath, originalIdentity),
+        "replaced",
+      );
+      assert.equal(existsSync(sourcePath), false);
+      assert.equal(readFileSync(destinationPath, "utf8"), "restored config\n");
+      assert.equal(addon.captureFileIdentity(destinationPath).fileId, originalIdentity.fileId);
+    } finally {
+      rmSync(temporaryDirectory, { force: true, recursive: true });
+    }
+  },
+);
+
+test(
+  "Windows addon preserves a replacement when the target identity mismatches",
+  { skip: process.platform !== "win32" },
+  () => {
+    const temporaryPrefix = join(tmpdir(), "codex-provider-switcher-file-ops-");
+    const temporaryDirectory = mkdtempSync(temporaryPrefix);
+    assert.ok(temporaryDirectory.startsWith(temporaryPrefix));
+
+    const sourcePath = join(temporaryDirectory, "config.restore");
+    const destinationPath = join(temporaryDirectory, "config.toml");
+    const replacementPath = join(temporaryDirectory, "config.replacement");
+    const addon = require(addonPath) as NativeWindowsFileOperations;
+
+    try {
+      writeFileSync(destinationPath, "original config\n", "utf8");
+      writeFileSync(sourcePath, "restored config\n", "utf8");
+      const originalIdentity = addon.captureFileIdentity(destinationPath);
+      writeFileSync(replacementPath, "replacement config\n", "utf8");
+      renameSync(replacementPath, destinationPath);
+
+      assert.equal(
+        addon.replaceFileIfMatches(sourcePath, destinationPath, originalIdentity),
+        "identity-mismatch",
+      );
+      assert.equal(existsSync(sourcePath), true);
+      assert.equal(readFileSync(destinationPath, "utf8"), "replacement config\n");
     } finally {
       rmSync(temporaryDirectory, { force: true, recursive: true });
     }

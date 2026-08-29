@@ -154,6 +154,50 @@ test("deletes a hard-link handoff through the dedicated native operation", () =>
   assert.ok(receivedIdentity && Object.isFrozen(receivedIdentity));
 });
 
+test("replaces a target through the dedicated native identity operation", () => {
+  const callerIdentity = { ...IDENTITY };
+  let receivedSource: string | undefined;
+  let receivedDestination: string | undefined;
+  let receivedIdentity: WindowsFileIdentity | undefined;
+  const operations = createWindowsFileOperations({
+    platform: "win32",
+    arch: "x64",
+    extensionRoot: EXTENSION_ROOT,
+    loadBinding: () => ({
+      ...validBinding(),
+      replaceFileIfMatches: (
+        source: string,
+        destination: string,
+        expected: WindowsFileIdentity,
+      ) => {
+        receivedSource = source;
+        receivedDestination = destination;
+        receivedIdentity = expected;
+        return "replaced";
+      },
+    }),
+  });
+
+  const replaceFileIfMatches = (
+    operations as unknown as {
+      replaceFileIfMatches(
+        source: string,
+        destination: string,
+        expected: WindowsFileIdentity,
+      ): "replaced" | "identity-mismatch";
+    }
+  ).replaceFileIfMatches;
+  assert.equal(
+    replaceFileIfMatches("C:\\profiles\\replacement.tmp", CONFIG_PATH, callerIdentity),
+    "replaced",
+  );
+  assert.equal(receivedSource, "C:\\profiles\\replacement.tmp");
+  assert.equal(receivedDestination, CONFIG_PATH);
+  assert.notStrictEqual(receivedIdentity, callerIdentity);
+  assert.deepEqual(receivedIdentity, IDENTITY);
+  assert.ok(receivedIdentity && Object.isFrozen(receivedIdentity));
+});
+
 test("retries a failed hold release and releases no more than once after success", () => {
   const holdToken = {};
   let releases = 0;

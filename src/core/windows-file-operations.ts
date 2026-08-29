@@ -22,6 +22,11 @@ export interface WindowsFileOperations {
     path: string,
     expected: WindowsFileIdentity,
   ): "deleted" | "identity-mismatch";
+  replaceFileIfMatches?(
+    source: string,
+    destination: string,
+    expected: WindowsFileIdentity,
+  ): "replaced" | "identity-mismatch";
   holdFileIfMatches(path: string, expected: WindowsFileIdentity): WindowsFileHold;
 }
 
@@ -48,6 +53,11 @@ interface NativeWindowsFileOperationsBinding {
   captureFileIdentity(path: string): unknown;
   deleteFileIfMatches(path: string, expected: WindowsFileIdentity): unknown;
   deleteHardLinkIfMatches?(path: string, expected: WindowsFileIdentity): unknown;
+  replaceFileIfMatches?(
+    source: string,
+    destination: string,
+    expected: WindowsFileIdentity,
+  ): unknown;
   holdFileIfMatches(path: string, expected: WindowsFileIdentity): unknown;
   releaseFileHold(hold: object): unknown;
 }
@@ -130,6 +140,28 @@ export function createWindowsFileOperations(
       return result;
     },
 
+    replaceFileIfMatches(
+      source,
+      destination,
+      expected,
+    ): "replaced" | "identity-mismatch" {
+      assertWindowsPath(source);
+      assertWindowsPath(destination);
+      const expectedSnapshot = createIdentitySnapshot(expected);
+      const native = getBinding();
+      if (typeof native.replaceFileIfMatches !== "function") {
+        throw unavailableError();
+      }
+      const result = callBinding(
+        () => native,
+        (current) => current.replaceFileIfMatches!(source, destination, expectedSnapshot),
+      );
+      if (result !== "replaced" && result !== "identity-mismatch") {
+        throw invalidError();
+      }
+      return result;
+    },
+
     holdFileIfMatches(path, expected): WindowsFileHold {
       assertWindowsPath(path);
       const expectedSnapshot = createIdentitySnapshot(expected);
@@ -169,6 +201,7 @@ function unavailableOperations(): WindowsFileOperations {
     captureFileIdentity: unavailable,
     deleteFileIfMatches: unavailable,
     deleteHardLinkIfMatches: unavailable,
+    replaceFileIfMatches: unavailable,
     holdFileIfMatches: unavailable,
   };
 }

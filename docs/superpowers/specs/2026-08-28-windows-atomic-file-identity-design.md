@@ -70,8 +70,9 @@ For every Windows zero-inode mutation, the following invariants apply:
 
 If an attacker replaces a managed final file before the helper opens it, the
 handle-derived ID mismatches and the operation does nothing. If replacement
-happens after the helper opens it for deletion, deletion applies to that
-already-opened original handle, never to the later replacement.
+happens after the helper opens it for deletion or protected restoration, the
+restricted share mode prevents the replacement; deletion or writes apply only
+to the already-opened original handle.
 
 ## Native Addon
 
@@ -98,10 +99,16 @@ type WindowsFileIdentity = Readonly<{
 }>;
 
 type DeleteResult = "deleted" | "identity-mismatch";
+type RestoreResult = "replaced" | "identity-mismatch";
 
 captureFileIdentity(path: string): WindowsFileIdentity;
 deleteFileIfMatches(path: string, expected: WindowsFileIdentity): DeleteResult;
 deleteHardLinkIfMatches(path: string, expected: WindowsFileIdentity): DeleteResult;
+replaceFileIfMatches(
+  source: string,
+  destination: string,
+  expected: WindowsFileIdentity,
+): RestoreResult;
 holdFileIfMatches(path: string, expected: WindowsFileIdentity): object;
 releaseFileHold(hold: object): void;
 ```
@@ -121,6 +128,19 @@ no-replace hard-link publication. It performs the same handle-derived identity
 comparison, requires the selected source to have exactly two hard links, and
 then applies the disposition to that source handle. A path replacement is
 therefore reported as `"identity-mismatch"` without deleting the replacement.
+
+`replaceFileIfMatches` is used only for transaction restore targets. It opens
+the source for reading and the destination for read/write with
+`FILE_SHARE_READ` only, compares the destination identity from that open
+handle, streams the source bytes into the still-open destination handle,
+truncates and flushes it, and finally marks the source handle for deletion.
+The destination is restored in place and keeps its native File ID; the
+operation does not attempt a path-level rename. A mismatch is returned before
+any destination write and leaves both source and destination untouched. This
+protected overwrite is intentional: a public Windows rename/replace API
+cannot be combined with the no-delete-sharing directory handle used to close
+the final path race. The restore caller must treat a write failure as a
+rollback failure and retain its existing recovery path.
 
 `holdFileIfMatches` owns two verified handles. First it opens the config file
 with `FILE_READ_ATTRIBUTES` and `FILE_SHARE_READ` only. Then it opens the
@@ -219,13 +239,15 @@ injected operation implementation:
 
 Windows integration tests build and call the real addon. They verify that the
 identity returned by a handle changes on replacement, final reparse points are
-rejected, `deleteFileIfMatches` never removes a replacement, and a live config
-hold rejects both replacement-at-target and source rename while preserving the
-original path and bytes until release. Windows may surface a sharing violation
-as `EPERM`, `EACCES`, or `EBUSY`; the test accepts those mappings but must prove
-the filesystem state. ProfileStore integration tests inject a deterministic
-replacement hook just before deletion and before index publication to prove the
-operation fails closed.
+rejected, `deleteFileIfMatches` never removes a replacement,
+`replaceFileIfMatches` restores matching content without changing the target
+File ID, and a mismatching target preserves both the replacement and source.
+A live config hold still rejects both replacement-at-target and source rename
+while preserving the original path and bytes until release. Windows may
+surface a sharing violation as `EPERM`, `EACCES`, or `EBUSY`; the test accepts
+those mappings but must prove the filesystem state. ProfileStore integration
+tests inject a deterministic replacement hook just before deletion and before
+index publication to prove the operation fails closed.
 
 The full Windows CI run executes native build, type checking, unit tests,
 integration tests, and VSIX verification. The Ubuntu CI run executes the same

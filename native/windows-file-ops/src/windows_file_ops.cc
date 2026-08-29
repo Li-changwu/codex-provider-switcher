@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <new>
 #include <string>
 #include <utility>
@@ -297,7 +298,8 @@ bool OpenAndCapture(
     DWORD desired_access,
     ScopedHandle* handle,
     CapturedIdentity* identity,
-    uint64_t expected_link_count = 1) {
+    uint64_t expected_link_count = 1,
+    FILE_STANDARD_INFO* standard_info_output = nullptr) {
   static_assert(sizeof(wchar_t) == sizeof(char16_t));
   const HANDLE file = CreateFileW(
       reinterpret_cast<LPCWSTR>(path.c_str()),
@@ -342,9 +344,83 @@ bool OpenAndCapture(
     ThrowError(env, "Windows file has an unexpected hard-link count.");
     return false;
   }
+  if (standard_info_output != nullptr) {
+    *standard_info_output = standard_info;
+  }
 
   identity->volume_serial = FormatVolumeSerial(file_id.VolumeSerialNumber);
   identity->file_id = FormatFileId(file_id.FileId);
+  return true;
+}
+
+bool RestoreFileContents(
+    napi_env env,
+    HANDLE source,
+    HANDLE destination) {
+  // Keep the destination handle open while comparing and restoring it. Its
+  // restricted share mode prevents a path replacement during the write.
+  constexpr DWORD kCopyBufferSize = 64 * 1024;
+  std::array<BYTE, kCopyBufferSize> buffer{};
+  LARGE_INTEGER zero{};
+  if (!SetFilePointerEx(source, zero, nullptr, FILE_BEGIN)) {
+    ThrowWin32Error(env, "SetFilePointerEx(source)");
+    return false;
+  }
+  if (!SetFilePointerEx(destination, zero, nullptr, FILE_BEGIN)) {
+    ThrowWin32Error(env, "SetFilePointerEx(destination)");
+    return false;
+  }
+
+  uint64_t total_written = 0;
+  for (;;) {
+    DWORD bytes_read = 0;
+    if (!ReadFile(
+            source, buffer.data(), static_cast<DWORD>(buffer.size()), &bytes_read,
+            nullptr)) {
+      ThrowWin32Error(env, "ReadFile(source)");
+      return false;
+    }
+    if (bytes_read == 0) {
+      break;
+    }
+
+    DWORD bytes_written = 0;
+    while (bytes_written < bytes_read) {
+      DWORD written = 0;
+      if (!WriteFile(
+              destination, buffer.data() + bytes_written,
+              bytes_read - bytes_written, &written, nullptr)) {
+        ThrowWin32Error(env, "WriteFile(destination)");
+        return false;
+      }
+      if (written == 0) {
+        ThrowError(env, "Windows file replacement made no write progress.");
+        return false;
+      }
+      bytes_written += written;
+      if (written > std::numeric_limits<uint64_t>::max() - total_written) {
+        ThrowError(env, "Windows file replacement is too large.");
+        return false;
+      }
+      total_written += written;
+    }
+  }
+
+  FILE_END_OF_FILE_INFO end_of_file{};
+  if (total_written > static_cast<uint64_t>(std::numeric_limits<LONGLONG>::max())) {
+    ThrowError(env, "Windows file replacement is too large.");
+    return false;
+  }
+  end_of_file.EndOfFile.QuadPart = static_cast<LONGLONG>(total_written);
+  if (!SetFileInformationByHandle(
+          destination, FileEndOfFileInfo, &end_of_file, sizeof(end_of_file))) {
+    ThrowWin32Error(env, "SetFileInformationByHandle(FileEndOfFileInfo)");
+    return false;
+  }
+  if (!FlushFileBuffers(destination)) {
+    ThrowWin32Error(env, "FlushFileBuffers(destination)");
+    return false;
+  }
   return true;
 }
 
@@ -506,6 +582,69 @@ napi_value DeleteHardLinkIfMatches(napi_env env, napi_callback_info info) {
   return DeleteFileIfMatchesInternal(env, info, 2);
 }
 
+napi_value ReplaceFileIfMatches(napi_env env, napi_callback_info info) {
+  napi_value arguments[3];
+  if (!GetArguments(env, info, 3, arguments)) {
+    return nullptr;
+  }
+
+  std::u16string source;
+  std::u16string destination;
+  CapturedIdentity expected;
+  if (!GetUtf16String(env, arguments[0], &source) ||
+      !GetUtf16String(env, arguments[1], &destination) ||
+      !GetExpectedIdentity(env, arguments[2], &expected)) {
+    return nullptr;
+  }
+  if (source == destination) {
+    ThrowError(env, "Windows file replacement source and destination must differ.");
+    return nullptr;
+  }
+
+  ScopedHandle source_handle;
+  CapturedIdentity unused_source_identity;
+  FILE_STANDARD_INFO source_info{};
+  if (!OpenAndCapture(
+          env, source, GENERIC_READ | DELETE, &source_handle, &unused_source_identity, 1,
+          &source_info)) {
+    return nullptr;
+  }
+  if (source_info.Directory) {
+    ThrowError(env, "Windows file replacement source must be a regular file.");
+    return nullptr;
+  }
+
+  ScopedHandle destination_handle;
+  CapturedIdentity actual;
+  FILE_STANDARD_INFO destination_info{};
+  if (!OpenAndCapture(
+          env, destination, GENERIC_READ | GENERIC_WRITE, &destination_handle,
+          &actual, 1, &destination_info)) {
+    return nullptr;
+  }
+  if (destination_info.Directory) {
+    ThrowError(env, "Windows file replacement destination must be a regular file.");
+    return nullptr;
+  }
+  if (!SameIdentity(actual, expected)) {
+    return CreateResultString(env, "identity-mismatch");
+  }
+  if (!RestoreFileContents(env, source_handle.get(), destination_handle.get())) {
+    return nullptr;
+  }
+
+  FILE_DISPOSITION_INFO disposition{};
+  disposition.DeleteFile = TRUE;
+  if (!SetFileInformationByHandle(
+          source_handle.get(), FileDispositionInfo, &disposition,
+          sizeof(disposition))) {
+    ThrowWin32Error(env, "SetFileInformationByHandle(FileDispositionInfo)");
+    return nullptr;
+  }
+  source_handle.Close();
+  return CreateResultString(env, "replaced");
+}
+
 bool CloseHeldHandles(HeldHandle* hold) {
   bool all_closed = true;
   if (hold->directory_handle != INVALID_HANDLE_VALUE) {
@@ -643,6 +782,8 @@ napi_value Initialize(napi_env env, napi_value exports) {
        napi_default, nullptr},
       {"deleteHardLinkIfMatches", nullptr, DeleteHardLinkIfMatches, nullptr, nullptr,
        nullptr, napi_default, nullptr},
+      {"replaceFileIfMatches", nullptr, ReplaceFileIfMatches, nullptr, nullptr, nullptr,
+       napi_default, nullptr},
       {"holdFileIfMatches", nullptr, HoldFileIfMatches, nullptr, nullptr, nullptr,
        napi_default, nullptr},
       {"releaseFileHold", nullptr, ReleaseFileHold, nullptr, nullptr, nullptr,
