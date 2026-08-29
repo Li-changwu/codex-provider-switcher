@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   existsSync,
+  linkSync,
   mkdtempSync,
   readFileSync,
   renameSync,
@@ -23,6 +24,10 @@ interface NativeFileIdentity {
 interface NativeWindowsFileOperations {
   captureFileIdentity(path: string): NativeFileIdentity;
   deleteFileIfMatches(
+    path: string,
+    expected: NativeFileIdentity,
+  ): "deleted" | "identity-mismatch";
+  deleteHardLinkIfMatches(
     path: string,
     expected: NativeFileIdentity,
   ): "deleted" | "identity-mismatch";
@@ -64,6 +69,51 @@ test(
       );
       assert.equal(existsSync(targetPath), true);
       assert.equal(readFileSync(targetPath, "utf8"), configContents);
+    } finally {
+      rmSync(temporaryDirectory, { force: true, recursive: true });
+    }
+  },
+);
+
+test(
+  "Windows addon safely removes a hard-link handoff source",
+  { skip: process.platform !== "win32" },
+  () => {
+    const temporaryPrefix = join(tmpdir(), "codex-provider-switcher-file-ops-");
+    const temporaryDirectory = mkdtempSync(temporaryPrefix);
+    assert.ok(temporaryDirectory.startsWith(temporaryPrefix));
+
+    const sourcePath = join(temporaryDirectory, "lock.handoff");
+    const destinationPath = join(temporaryDirectory, "lock");
+    const addon = require(addonPath) as NativeWindowsFileOperations;
+
+    try {
+      writeFileSync(sourcePath, "original lock\n", "utf8");
+      const originalIdentity = addon.captureFileIdentity(sourcePath);
+      linkSync(sourcePath, destinationPath);
+
+      assert.equal(
+        addon.deleteHardLinkIfMatches(sourcePath, originalIdentity),
+        "deleted",
+      );
+      assert.equal(existsSync(sourcePath), false);
+      assert.equal(existsSync(destinationPath), true);
+      assert.equal(readFileSync(destinationPath, "utf8"), "original lock\n");
+
+      const replacedSourcePath = join(temporaryDirectory, "replaced.handoff");
+      const replacedDestinationPath = join(temporaryDirectory, "replaced.lock");
+      writeFileSync(replacedSourcePath, "original lock\n", "utf8");
+      const replacedIdentity = addon.captureFileIdentity(replacedSourcePath);
+      linkSync(replacedSourcePath, replacedDestinationPath);
+      rmSync(replacedSourcePath);
+      writeFileSync(replacedSourcePath, "replacement lock\n", "utf8");
+
+      assert.equal(
+        addon.deleteHardLinkIfMatches(replacedSourcePath, replacedIdentity),
+        "identity-mismatch",
+      );
+      assert.equal(readFileSync(replacedSourcePath, "utf8"), "replacement lock\n");
+      assert.equal(readFileSync(replacedDestinationPath, "utf8"), "original lock\n");
     } finally {
       rmSync(temporaryDirectory, { force: true, recursive: true });
     }

@@ -25,6 +25,7 @@ constexpr napi_type_tag kHoldTypeTag = {
 struct CapturedIdentity {
   std::string volume_serial;
   std::string file_id;
+  uint64_t link_count = 0;
 };
 
 class ScopedHandle {
@@ -266,6 +267,7 @@ bool GetExpectedIdentity(
     ThrowError(env, "Windows file identity link count must be 1n.");
     return false;
   }
+  output->link_count = 1;
   return true;
 }
 
@@ -294,7 +296,8 @@ bool OpenAndCapture(
     const std::u16string& path,
     DWORD desired_access,
     ScopedHandle* handle,
-    CapturedIdentity* identity) {
+    CapturedIdentity* identity,
+    uint64_t expected_link_count = 1) {
   static_assert(sizeof(wchar_t) == sizeof(char16_t));
   const HANDLE file = CreateFileW(
       reinterpret_cast<LPCWSTR>(path.c_str()),
@@ -334,8 +337,9 @@ bool OpenAndCapture(
     ThrowWin32Error(env, "GetFileInformationByHandleEx(FileStandardInfo)");
     return false;
   }
-  if (standard_info.NumberOfLinks != 1) {
-    ThrowError(env, "Windows file must have exactly one hard link.");
+  identity->link_count = standard_info.NumberOfLinks;
+  if (expected_link_count != 0 && identity->link_count != expected_link_count) {
+    ThrowError(env, "Windows file has an unexpected hard-link count.");
     return false;
   }
 
@@ -416,7 +420,7 @@ napi_value CreateIdentityValue(napi_env env, const CapturedIdentity& identity) {
           &volume_serial) != napi_ok ||
       napi_create_string_utf8(env, identity.file_id.c_str(), identity.file_id.size(),
                               &file_id) != napi_ok ||
-      napi_create_bigint_uint64(env, 1, &link_count) != napi_ok ||
+      napi_create_bigint_uint64(env, identity.link_count, &link_count) != napi_ok ||
       napi_set_named_property(env, result, "volumeSerial", volume_serial) != napi_ok ||
       napi_set_named_property(env, result, "fileId", file_id) != napi_ok ||
       napi_set_named_property(env, result, "linkCount", link_count) != napi_ok) {
@@ -454,7 +458,10 @@ napi_value CaptureFileIdentity(napi_env env, napi_callback_info info) {
   return CreateIdentityValue(env, identity);
 }
 
-napi_value DeleteFileIfMatches(napi_env env, napi_callback_info info) {
+napi_value DeleteFileIfMatchesInternal(
+    napi_env env,
+    napi_callback_info info,
+    uint64_t expected_link_count) {
   napi_value arguments[2];
   if (!GetArguments(env, info, 2, arguments)) {
     return nullptr;
@@ -470,11 +477,15 @@ napi_value DeleteFileIfMatches(napi_env env, napi_callback_info info) {
   ScopedHandle handle;
   CapturedIdentity actual;
   if (!OpenAndCapture(
-          env, path, DELETE | FILE_READ_ATTRIBUTES, &handle, &actual)) {
+          env, path, DELETE | FILE_READ_ATTRIBUTES, &handle, &actual, 0)) {
     return nullptr;
   }
   if (!SameIdentity(actual, expected)) {
     return CreateResultString(env, "identity-mismatch");
+  }
+  if (actual.link_count != expected_link_count) {
+    ThrowError(env, "Windows file has an unexpected hard-link count.");
+    return nullptr;
   }
 
   FILE_DISPOSITION_INFO disposition{};
@@ -485,6 +496,14 @@ napi_value DeleteFileIfMatches(napi_env env, napi_callback_info info) {
     return nullptr;
   }
   return CreateResultString(env, "deleted");
+}
+
+napi_value DeleteFileIfMatches(napi_env env, napi_callback_info info) {
+  return DeleteFileIfMatchesInternal(env, info, 1);
+}
+
+napi_value DeleteHardLinkIfMatches(napi_env env, napi_callback_info info) {
+  return DeleteFileIfMatchesInternal(env, info, 2);
 }
 
 bool CloseHeldHandles(HeldHandle* hold) {
@@ -622,6 +641,8 @@ napi_value Initialize(napi_env env, napi_value exports) {
        napi_default, nullptr},
       {"deleteFileIfMatches", nullptr, DeleteFileIfMatches, nullptr, nullptr, nullptr,
        napi_default, nullptr},
+      {"deleteHardLinkIfMatches", nullptr, DeleteHardLinkIfMatches, nullptr, nullptr,
+       nullptr, napi_default, nullptr},
       {"holdFileIfMatches", nullptr, HoldFileIfMatches, nullptr, nullptr, nullptr,
        napi_default, nullptr},
       {"releaseFileHold", nullptr, ReleaseFileHold, nullptr, nullptr, nullptr,

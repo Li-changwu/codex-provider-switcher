@@ -101,6 +101,7 @@ type DeleteResult = "deleted" | "identity-mismatch";
 
 captureFileIdentity(path: string): WindowsFileIdentity;
 deleteFileIfMatches(path: string, expected: WindowsFileIdentity): DeleteResult;
+deleteHardLinkIfMatches(path: string, expected: WindowsFileIdentity): DeleteResult;
 holdFileIfMatches(path: string, expected: WindowsFileIdentity): object;
 releaseFileHold(hold: object): void;
 ```
@@ -114,6 +115,12 @@ hard-link operations on the selected file while this comparison and deletion
 are in progress; an already conflicting handle makes acquisition fail. It
 returns `"identity-mismatch"` without deleting anything when the selected
 object does not match.
+
+`deleteHardLinkIfMatches` is used only while restoring a lock handoff after a
+no-replace hard-link publication. It performs the same handle-derived identity
+comparison, requires the selected source to have exactly two hard links, and
+then applies the disposition to that source handle. A path replacement is
+therefore reported as `"identity-mismatch"` without deleting the replacement.
 
 `holdFileIfMatches` owns two verified handles. First it opens the config file
 with `FILE_READ_ATTRIBUTES` and `FILE_SHARE_READ` only. Then it opens the
@@ -155,9 +162,11 @@ link count. A mixed zero/nonzero pair is never equal.
 ProfileStore receives the following changes:
 
 - Every current identity-checked delete selects `deleteFileIfMatches` for a
-  Windows zero-inode expected identity. Its `identity-mismatch` result becomes
-  the existing persistence failure, leaving the replacement in place. Other
-  platforms retain their present checked path operation.
+  Windows zero-inode expected identity. Lock-handoff restoration selects
+  `deleteHardLinkIfMatches` after its no-replace hard-link publication. Each
+  `identity-mismatch` result becomes the existing persistence failure, leaving
+  the replacement in place. Other platforms retain their present checked path
+  operation.
 - This applies to lock release, stale lock reclamation, recovery guard and
   claim cleanup, and temporary file cleanup. The old `read then unlink` and
   `read then unlinkStaleLock` implementations are not used on this path.

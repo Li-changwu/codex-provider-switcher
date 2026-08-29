@@ -21,7 +21,10 @@ import {
   createRolloutInversePatches,
 } from "../../src/core/rollouts";
 import type { CodexLayout } from "../../src/core/types";
-import type { WindowsFileIdentity } from "../../src/core/windows-file-operations";
+import {
+  createWindowsFileOperations,
+  type WindowsFileIdentity,
+} from "../../src/core/windows-file-operations";
 
 test("requires comparable exact filesystem identity for trusted directories", () => {
   const matching: FileIdentity = { dev: 1n, ino: 2n, nlink: 1n };
@@ -77,7 +80,7 @@ test("compares canonical native identities for zero-inode transaction files", ()
       ino: 0n,
       nlink: 1n,
       windowsFileIdentity: nativeIdentity,
-    }),
+    }, "win32"),
     true,
   );
   assert.equal(
@@ -89,13 +92,51 @@ test("compares canonical native identities for zero-inode transaction files", ()
         ...nativeIdentity,
         fileId: "fedcba9876543210fedcba9876543210",
       },
-    }),
+    }, "win32"),
     false,
   );
   assert.equal(
-    hasSameStableFileIdentity(matching, { dev: 0n, ino: 0n, nlink: 1n }),
+    hasSameStableFileIdentity(matching, { dev: 0n, ino: 0n, nlink: 1n }, "win32"),
     false,
   );
+});
+
+test("runs a transaction with native identities on Windows zero-inode filesystems", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows native file identities require Windows");
+    return;
+  }
+
+  await withLayout(async (layout) => {
+    const stats = await lstat(layout.codexHome, { bigint: true });
+    if (stats.ino !== 0n) {
+      t.skip("This Windows Node runtime exposes nonzero inode values");
+      return;
+    }
+
+    const transaction = await beginTransaction(layout, {
+      operationId: "windows-zero-inode",
+      fileIdentityOptions: {
+        platform: "win32",
+        windowsFileOperations: createWindowsFileOperations(),
+      },
+    });
+    try {
+      const target = { kind: "config" as const, path: layout.configPath };
+      await transaction.backupTargets([target]);
+      await transaction.markApplying([target]);
+      await transaction.prepareTarget(target);
+      await writeFile(layout.configPath, "model_provider = 'after'\n", "utf8");
+      await transaction.markTargetApplied(target);
+      await transaction.rollback();
+      assert.equal(
+        await readFile(layout.configPath, "utf8"),
+        "model_provider = 'before'\n",
+      );
+    } finally {
+      await transaction.release();
+    }
+  });
 });
 
 test("backs up config, sqlite, and managed rollout files without backing up auth", async () => {

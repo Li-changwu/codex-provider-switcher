@@ -21,7 +21,14 @@ import {
   type RolloutInversePatch,
 } from "./rollouts";
 import type { CodexLayout } from "./types";
-import type { WindowsFileIdentity } from "./windows-file-operations";
+import {
+  createWindowsFileOperations,
+  type WindowsFileIdentity,
+} from "./windows-file-operations";
+import {
+  hydrateWindowsFileIdentity,
+  type HydrateWindowsFileIdentityOptions,
+} from "./file-identity";
 
 export type TransactionState =
   | "prepared"
@@ -105,6 +112,8 @@ interface ByteTargetVersion {
   device?: string;
   inode?: string;
   links?: string;
+  volumeSerial?: string;
+  fileId?: string;
   size?: string;
   modifiedAtNs?: string;
   changedAtNs?: string;
@@ -129,6 +138,7 @@ export interface TransactionOptions {
   isProcessAlive?: (pid: number) => boolean | undefined;
   io?: TransactionIo;
   requireSourceVersionProtocol?: boolean;
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions;
 }
 
 export interface TransactionIo {
@@ -292,6 +302,7 @@ export function operationLockPath(layout: CodexLayout): string {
 async function ensureTrustedTransactionRoot(
   layout: CodexLayout,
   io?: TransactionIo,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<TrustedTransactionDirectory> {
   try {
     const codexHomePath = resolve(layout.codexHome);
@@ -303,12 +314,16 @@ async function ensureTrustedTransactionRoot(
         "The transaction root is not located under Codex Home.",
       );
     }
-    const codexHome = await inspectTrustedTransactionDirectory(codexHomePath);
+    const codexHome = await inspectTrustedTransactionDirectory(codexHomePath, undefined, fileIdentityOptions);
     await ensureTransactionDirectory(switcherPath, io);
-    const switcher = await inspectTrustedTransactionDirectory(switcherPath, codexHome.realPath);
+    const switcher = await inspectTrustedTransactionDirectory(
+      switcherPath,
+      codexHome.realPath,
+      fileIdentityOptions,
+    );
     const rootPath = join(switcherPath, transactionsDirectoryName);
     await ensureTransactionDirectory(rootPath, io);
-    return inspectTrustedTransactionDirectory(rootPath, switcher.realPath);
+    return inspectTrustedTransactionDirectory(rootPath, switcher.realPath, fileIdentityOptions);
   } catch (error: unknown) {
     if (error instanceof TransactionError) {
       throw error;
@@ -321,7 +336,10 @@ async function ensureTrustedTransactionRoot(
   }
 }
 
-async function ensureTransactionDirectory(path: string, io?: TransactionIo): Promise<void> {
+async function ensureTransactionDirectory(
+  path: string,
+  io?: TransactionIo,
+): Promise<void> {
   const stats = await lstatIfPresent(path);
   if (!stats) {
     await mkdir(path);
@@ -332,8 +350,9 @@ async function ensureTransactionDirectory(path: string, io?: TransactionIo): Pro
 async function inspectTrustedTransactionDirectory(
   path: string,
   expectedParentRealPath?: string,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<TrustedTransactionDirectory> {
-  const before = await lstat(path, { bigint: true });
+  const before = await lstatWithTransactionIdentity(path, fileIdentityOptions);
   if (!isTrustedTransactionDirectoryStats(before)) {
     throw new TransactionError("journal-invalid", "The transaction directory is not a real directory.");
   }
@@ -341,10 +360,10 @@ async function inspectTrustedTransactionDirectory(
   if (expectedParentRealPath && !isPathInsideOrEqual(expectedParentRealPath, pathReal)) {
     throw new TransactionError("journal-invalid", "The transaction directory escapes its trusted root.");
   }
-  const after = await lstat(path, { bigint: true });
+  const after = await lstatWithTransactionIdentity(path, fileIdentityOptions);
   if (
     !isTrustedTransactionDirectoryStats(after) ||
-    !hasSameStableFileIdentity(before, after)
+    !hasSameStableFileIdentity(before, after, fileIdentityOptions?.platform)
   ) {
     throw new TransactionError("journal-invalid", "The transaction directory changed while being inspected.");
   }
@@ -353,11 +372,16 @@ async function inspectTrustedTransactionDirectory(
 
 async function assertTrustedTransactionDirectory(
   expected: TrustedTransactionDirectory,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<void> {
-  const current = await inspectTrustedTransactionDirectory(expected.path);
+  const current = await inspectTrustedTransactionDirectory(
+    expected.path,
+    undefined,
+    fileIdentityOptions,
+  );
   if (
     current.realPath !== expected.realPath ||
-    !hasSameStableFileIdentity(expected.stats, current.stats)
+    !hasSameStableFileIdentity(expected.stats, current.stats, fileIdentityOptions?.platform)
   ) {
     throw new TransactionError("journal-invalid", "The transaction directory changed after inspection.");
   }
@@ -377,10 +401,11 @@ export interface FileIdentity {
 export function hasSameStableFileIdentity(
   left: FileIdentity,
   right: FileIdentity,
+  platform: NodeJS.Platform = process.platform,
 ): boolean {
   return (
     left.nlink === right.nlink &&
-    hasSameComparableFileIdentity(left, right)
+    hasSameComparableFileIdentity(left, right, platform)
   );
 }
 
@@ -395,7 +420,7 @@ export async function beginTransaction(
 ): Promise<TransactionHandle> {
   const operationId = options.operationId ?? randomUUID();
   assertOperationId(operationId);
-  const root = await ensureTrustedTransactionRoot(layout, options.io);
+  const root = await ensureTrustedTransactionRoot(layout, options.io, options.fileIdentityOptions);
   const lock = await acquireOperationLock(root, operationId, options);
   return beginTransactionWithLock(layout, root, lock, operationId, options);
 }
@@ -424,14 +449,18 @@ async function beginTransactionWithLock(
     await syncPublishedParentDirectory(directory, options.io);
     await mkdir(backupDirectory);
     await syncPublishedParentDirectory(backupDirectory, options.io);
-    operationDirectory = await inspectTrustedTransactionDirectory(directory, root.realPath);
+    operationDirectory = await inspectTrustedTransactionDirectory(
+      directory,
+      root.realPath,
+      options.fileIdentityOptions,
+    );
     await appendJournal(journalPath, {
       version: 1,
       operationId,
       state: "prepared",
       timestamp: now(),
       ...(options.requireSourceVersionProtocol ? { sourceVersionProtocol: true as const } : {}),
-    }, operationDirectory, options.io);
+    }, operationDirectory, options.io, options.fileIdentityOptions);
     preparedPersisted = true;
   } catch (error: unknown) {
     const errors: unknown[] = [error];
@@ -484,7 +513,7 @@ async function beginTransactionWithLock(
         ...(targetUpdate?.appliedVersions
           ? { appliedTargetVersions: [...targetUpdate.appliedVersions] }
           : {}),
-      }, operationDirectory, options.io);
+      }, operationDirectory, options.io, options.fileIdentityOptions);
       state = nextState;
     } catch (error: unknown) {
       const directorySyncError = findJournalDirectorySyncError(error);
@@ -518,6 +547,7 @@ async function beginTransactionWithLock(
           targets,
           options.io,
           backupManifest?.entries,
+          options.fileIdentityOptions,
       );
       await writeJsonAtomically(
         join(backupDirectory, manifestFileName),
@@ -555,6 +585,7 @@ async function beginTransactionWithLock(
           backupManifest,
           appliedTargetVersions,
           options.io,
+          options.fileIdentityOptions,
         );
       } catch (error: unknown) {
         await setState("recoveryRequired");
@@ -575,6 +606,7 @@ async function beginTransactionWithLock(
         backupManifest,
         appliedTargetVersions,
         options.io,
+        options.fileIdentityOptions,
       );
     },
     async markTargetApplied(target) {
@@ -591,7 +623,12 @@ async function beginTransactionWithLock(
           "A mutation target must be prepared before it is applied.",
         );
       }
-      const version = await captureAppliedByteTargetVersion(layout, normalized, options.io);
+      const version = await captureAppliedByteTargetVersion(
+        layout,
+        normalized,
+        options.io,
+        options.fileIdentityOptions,
+      );
       if (version) {
         // Keep the evidence for this process even if publishing the journal record fails.
         // A later crash still recovers conservatively because the failed record is not durable.
@@ -655,6 +692,7 @@ async function beginTransactionWithLock(
           options.io,
           appliedTargetVersions,
           options.requireSourceVersionProtocol === true,
+          options.fileIdentityOptions,
         );
         await setState("rolledBack");
       } catch (error: unknown) {
@@ -688,6 +726,7 @@ async function beginTransactionWithLock(
         options.io,
         appliedTargetVersions,
         options.requireSourceVersionProtocol === true,
+        options.fileIdentityOptions,
       );
       await closeValidatedBackupTargets(backupTargets);
     },
@@ -707,7 +746,11 @@ export async function recoverPendingSwitches(
   layout: CodexLayout,
   dependencies: RecoveryDependencies = {},
 ): Promise<RecoveryResult> {
-  const root = await ensureTrustedTransactionRoot(layout, dependencies.io);
+  const root = await ensureTrustedTransactionRoot(
+    layout,
+    dependencies.io,
+    dependencies.fileIdentityOptions,
+  );
   const lock = await acquireOperationLock(root, "recovery", dependencies);
   try {
     return await recoverPendingSwitchesWithLock(layout, root, dependencies);
@@ -722,7 +765,11 @@ export async function recoverAndBeginTransaction(
 ): Promise<RecoverAndBeginTransactionResult> {
   const operationId = dependencies.operationId ?? randomUUID();
   assertOperationId(operationId);
-  const root = await ensureTrustedTransactionRoot(layout, dependencies.io);
+  const root = await ensureTrustedTransactionRoot(
+    layout,
+    dependencies.io,
+    dependencies.fileIdentityOptions,
+  );
   const lock = await acquireOperationLock(root, operationId, dependencies);
   let lockTransferred = false;
   try {
@@ -783,10 +830,15 @@ async function recoverPendingSwitchesWithLock(
     const operationDirectory = await inspectTrustedTransactionDirectory(
       join(root.path, operationId),
       root.realPath,
+      dependencies.fileIdentityOptions,
     );
     const directory = operationDirectory.path;
     const journalPath = join(directory, journalFileName);
-    const journal = await readJournal(journalPath, dependencies.io);
+    const journal = await readJournal(
+      journalPath,
+      dependencies.io,
+      dependencies.fileIdentityOptions,
+    );
     const last = journal.at(-1);
     if (!last) {
       throw new TransactionError("journal-invalid", "The transaction journal is invalid.");
@@ -815,6 +867,7 @@ async function recoverPendingSwitchesWithLock(
           dependencies.io,
           appliedTargetVersions,
           enforceSourceVersionProtocol,
+          dependencies.fileIdentityOptions,
         );
       }
       await appendJournal(journalPath, {
@@ -822,7 +875,7 @@ async function recoverPendingSwitchesWithLock(
         operationId,
         state: "rolledBack",
         timestamp: (dependencies.now ?? (() => new Date().toISOString()))(),
-      }, operationDirectory, dependencies.io);
+      }, operationDirectory, dependencies.io, dependencies.fileIdentityOptions);
       recoveredOperationIds.push(operationId);
     } catch (recoveryError: unknown) {
       let recoveryRequiredJournalWritten = true;
@@ -833,7 +886,7 @@ async function recoverPendingSwitchesWithLock(
           operationId,
           state: "recoveryRequired",
           timestamp: (dependencies.now ?? (() => new Date().toISOString()))(),
-        }, operationDirectory, dependencies.io);
+        }, operationDirectory, dependencies.io, dependencies.fileIdentityOptions);
       } catch (error: unknown) {
         recoveryRequiredJournalWritten = false;
         journalAppendError = error;
@@ -862,8 +915,9 @@ interface OperationLock {
 
 export async function readTransactionJournal(
   journalPath: string,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<JournalEntry[]> {
-  return readJournal(journalPath);
+  return readJournal(journalPath, undefined, fileIdentityOptions);
 }
 
 async function acquireOperationLock(
@@ -871,7 +925,7 @@ async function acquireOperationLock(
   operationId: string,
   options: TransactionOptions,
 ): Promise<OperationLock> {
-  await assertTrustedTransactionDirectory(root);
+  await assertTrustedTransactionDirectory(root, options.fileIdentityOptions);
   const path = join(root.path, operationLockFileName);
   const contents = JSON.stringify({
     pid: process.pid,
@@ -879,7 +933,7 @@ async function acquireOperationLock(
     createdAt: Date.now(),
   });
   while (true) {
-    await removeOrphanedLockHandoffs(root, path);
+    await removeOrphanedLockHandoffs(root, path, options);
     try {
       const handle = await open(path, "wx", 0o600);
       let setupFailed = false;
@@ -904,18 +958,20 @@ async function acquireOperationLock(
       }
       if (setupFailed) {
         try {
-          await (options.io?.unlink ?? unlink)(path);
+          await removeIncompleteLock(path, options);
         } catch (cleanupError: unknown) {
-          if (!isMissingFileError(cleanupError)) {
-            throw new AggregateError(
-              [setupError, cleanupError],
-              "Lock setup failed and the incomplete lock could not be removed.",
-            );
-          }
+          throw new AggregateError(
+            [setupError, cleanupError],
+            "Lock setup failed and the incomplete lock could not be removed.",
+          );
         }
         throw setupError;
       }
-      const verifiedLock = await openVerifiedLock(path, contents);
+      const verifiedLock = await openVerifiedLock(
+        path,
+        contents,
+        options.fileIdentityOptions,
+      );
       let released = false;
       let releaseFailure: unknown;
       return {
@@ -944,7 +1000,7 @@ async function acquireOperationLock(
       if (!isExistsError(error)) {
         throw error;
       }
-      const existing = await readVerifiedLock(path);
+      const existing = await readVerifiedLock(path, options.fileIdentityOptions);
       if (!existing) {
         continue;
       }
@@ -985,11 +1041,12 @@ async function acquireOperationLock(
 async function removeOrphanedLockHandoffs(
   root: TrustedTransactionDirectory,
   lockPath: string,
+  options: TransactionOptions,
 ): Promise<void> {
   if (await lstatIfPresent(lockPath)) {
     return;
   }
-  await assertTrustedTransactionDirectory(root);
+  await assertTrustedTransactionDirectory(root, options.fileIdentityOptions);
   const entries = await readdir(root.path, { withFileTypes: true });
   for (const entry of entries) {
     if (!operationLockHandoffPattern.test(entry.name)) {
@@ -1000,19 +1057,19 @@ async function removeOrphanedLockHandoffs(
     }
 
     const handoffPath = join(root.path, entry.name);
-    const handoff = await openVerifiedLock(handoffPath);
+    const handoff = await openVerifiedLock(handoffPath, undefined, options.fileIdentityOptions);
     try {
       if (!parseCompleteLockRecord(handoff.contents)) {
         throw lockUnverifiable("A Codex Home operation lock handoff has invalid contents.");
       }
-      await assertTrustedTransactionDirectory(root);
-      await assertVerifiedLockOwnership(handoffPath, handoff);
+      await assertTrustedTransactionDirectory(root, options.fileIdentityOptions);
+      await assertVerifiedLockOwnership(handoffPath, handoff, options.fileIdentityOptions);
       if (await lstatIfPresent(lockPath)) {
         return;
       }
-      await assertTrustedTransactionDirectory(root);
-      await assertVerifiedLockOwnership(handoffPath, handoff);
-      await unlink(handoffPath);
+      await assertTrustedTransactionDirectory(root, options.fileIdentityOptions);
+      await assertVerifiedLockOwnership(handoffPath, handoff, options.fileIdentityOptions);
+      await removeVerifiedLock(handoffPath, handoff, "stale-reclaim", options);
     } finally {
       await closeLockHandle(handoff.handle);
     }
@@ -1028,22 +1085,23 @@ interface VerifiedLock {
 async function openVerifiedLock(
   path: string,
   expectedContents?: string,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<VerifiedLock> {
   let handle: FileHandle | undefined;
   try {
-    const before = await lstat(path, { bigint: true });
-    assertVerifiableLockStats(before);
+    const before = await lstatWithTransactionIdentity(path, fileIdentityOptions);
+    assertVerifiableLockStats(before, fileIdentityOptions?.platform);
     handle = await open(path, "r");
-    const handleStats = await handle.stat({ bigint: true });
-    assertVerifiableLockStats(handleStats);
-    if (!hasSameVerifiableFileIdentity(before, handleStats)) {
+    const handleStats = await statWithTransactionIdentity(handle, path, fileIdentityOptions);
+    assertVerifiableLockStats(handleStats, fileIdentityOptions?.platform);
+    if (!hasSameVerifiableFileIdentity(before, handleStats, fileIdentityOptions?.platform)) {
       throw lockUnverifiable("The Codex Home operation lock changed while being opened.");
     }
     const contents = await readLockHandle(handle, handleStats);
     if (expectedContents !== undefined && contents !== expectedContents) {
       throw lockUnverifiable("The Codex Home operation lock ownership changed after creation.");
     }
-    await assertLockPathIdentity(path, handleStats);
+    await assertLockPathIdentity(path, handleStats, fileIdentityOptions);
     return { handle, stats: handleStats, contents };
   } catch (error: unknown) {
     if (handle) {
@@ -1056,9 +1114,12 @@ async function openVerifiedLock(
   }
 }
 
-async function readVerifiedLock(path: string): Promise<VerifiedLock | undefined> {
+async function readVerifiedLock(
+  path: string,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
+): Promise<VerifiedLock | undefined> {
   try {
-    return await openVerifiedLock(path);
+    return await openVerifiedLock(path, undefined, fileIdentityOptions);
   } catch (error: unknown) {
     if (isMissingFileError(error)) {
       return undefined;
@@ -1076,21 +1137,37 @@ async function removeVerifiedLock(
   const tombstonePath = join(dirname(path), `${operationLockFileName}.handoff-${randomUUID()}`);
   let handedOff = false;
   try {
-    await assertVerifiedLockOwnership(path, lock);
+    await assertVerifiedLockOwnership(path, lock, options.fileIdentityOptions);
     await options.io?.afterLockOwnershipVerified?.(path, phase);
-    await assertLockPathIdentity(path, lock.stats);
+    await assertLockPathIdentity(path, lock.stats, options.fileIdentityOptions);
 
     // Node has no portable rename-if-same-inode primitive. Rename narrows the race to
     // an atomic handoff; identity is checked again before only the tombstone is removed.
     await rename(path, tombstonePath);
     handedOff = true;
-    const tombstoneStats = await lstat(tombstonePath, { bigint: true });
-    if (!hasSameVerifiableFileIdentity(lock.stats, tombstoneStats)) {
-      await restoreHandedOffLock(tombstonePath, path);
+    const tombstoneStats = await lstatWithTransactionIdentity(
+      tombstonePath,
+      options.fileIdentityOptions,
+    );
+    if (!hasSameVerifiableFileIdentity(
+      lock.stats,
+      tombstoneStats,
+      options.fileIdentityOptions?.platform,
+    )) {
+      await restoreHandedOffLock(
+        tombstonePath,
+        path,
+        lock.stats,
+        options.fileIdentityOptions,
+      );
       handedOff = false;
       throw lockUnverifiable("The Codex Home operation lock ownership changed during handoff.");
     }
-    await (options.io?.releaseLock ?? unlink)(tombstonePath);
+    const deletion = await removeLockPathByIdentity(tombstonePath, tombstoneStats, options);
+    if (deletion === "missing") {
+      handedOff = false;
+      return;
+    }
     handedOff = false;
   } catch (error: unknown) {
     if (handedOff) {
@@ -1099,7 +1176,12 @@ async function removeVerifiedLock(
         return;
       }
       try {
-        await restoreHandedOffLock(tombstonePath, path);
+        await restoreHandedOffLock(
+          tombstonePath,
+          path,
+          lock.stats,
+          options.fileIdentityOptions,
+        );
       } catch (restoreError: unknown) {
         throw lockUnverifiable(
           "The Codex Home operation lock handoff could not be safely restored.",
@@ -1116,53 +1198,65 @@ async function removeVerifiedLock(
 async function assertVerifiedLockOwnership(
   path: string,
   lock: VerifiedLock,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<void> {
-  const handleStats = await lock.handle.stat({ bigint: true });
-  assertVerifiableLockStats(handleStats);
-  if (!hasSameVerifiableFileIdentity(lock.stats, handleStats)) {
+  const handleStats = await statWithTransactionIdentity(
+    lock.handle,
+    path,
+    fileIdentityOptions,
+  );
+  assertVerifiableLockStats(handleStats, fileIdentityOptions?.platform);
+  if (!hasSameVerifiableFileIdentity(lock.stats, handleStats, fileIdentityOptions?.platform)) {
     throw lockUnverifiable("The Codex Home operation lock handle ownership changed.");
   }
   if ((await readLockHandle(lock.handle, handleStats)) !== lock.contents) {
     throw lockUnverifiable("The Codex Home operation lock contents changed.");
   }
-  await assertLockPathIdentity(path, handleStats);
+  await assertLockPathIdentity(path, handleStats, fileIdentityOptions);
 }
 
-async function assertLockPathIdentity(path: string, expected: BigIntStats): Promise<void> {
+async function assertLockPathIdentity(
+  path: string,
+  expected: BigIntStats,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
+): Promise<void> {
   let current: BigIntStats;
   try {
-    current = await lstat(path, { bigint: true });
+    current = await lstatWithTransactionIdentity(path, fileIdentityOptions);
   } catch (error: unknown) {
     if (isMissingFileError(error)) {
       throw error;
     }
     throw lockUnverifiable("The Codex Home operation lock path could not be inspected.", error);
   }
-  assertVerifiableLockStats(current);
-  if (!hasSameVerifiableFileIdentity(expected, current)) {
+  assertVerifiableLockStats(current, fileIdentityOptions?.platform);
+  if (!hasSameVerifiableFileIdentity(expected, current, fileIdentityOptions?.platform)) {
     throw lockUnverifiable("The Codex Home operation lock ownership changed.");
   }
 }
 
-function assertVerifiableLockStats(stats: BigIntStats): void {
+function assertVerifiableLockStats(
+  stats: BigIntStats,
+  platform: NodeJS.Platform = process.platform,
+): void {
   if (
     !stats.isFile() ||
     stats.isSymbolicLink() ||
     stats.nlink !== 1n ||
-    stats.ino === 0n
+    !hasComparableFileIdentity(stats as FileIdentity, platform)
   ) {
     throw lockUnverifiable("The Codex Home operation lock is not safely identifiable.");
   }
 }
 
-function hasSameVerifiableFileIdentity(left: BigIntStats, right: BigIntStats): boolean {
+function hasSameVerifiableFileIdentity(
+  left: BigIntStats,
+  right: BigIntStats,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
   return (
-    left.nlink === 1n &&
-    right.nlink === 1n &&
-    left.ino !== 0n &&
-    right.ino !== 0n &&
-    left.dev === right.dev &&
-    left.ino === right.ino
+    hasSameComparableFileIdentity(left, right, platform) &&
+    left.nlink === right.nlink
   );
 }
 
@@ -1182,7 +1276,12 @@ async function readLockHandle(handle: FileHandle, stats: BigIntStats): Promise<s
   return buffer.toString("utf8");
 }
 
-async function restoreHandedOffLock(source: string, destination: string): Promise<void> {
+async function restoreHandedOffLock(
+  source: string,
+  destination: string,
+  expectedStats: BigIntStats,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
+): Promise<void> {
   // Hard-link publication is no-replace on Windows and POSIX. It cannot overwrite a
   // newer lock that appeared after handoff, so a conflict leaves that lock untouched.
   try {
@@ -1193,7 +1292,41 @@ async function restoreHandedOffLock(source: string, destination: string): Promis
     }
     throw error;
   }
-  await unlink(source);
+
+  const platform = fileIdentityOptions?.platform ?? process.platform;
+  if (platform !== "win32" || expectedStats.ino !== 0n) {
+    await unlink(source);
+    return;
+  }
+
+  const expectedIdentity = snapshotTransactionWindowsIdentity(
+    readOwnDataProperty(expectedStats, "windowsFileIdentity"),
+  );
+  if (!expectedIdentity) {
+    throw lockUnverifiable(
+      "The handed-off Codex Home operation lock has no verifiable Windows identity.",
+    );
+  }
+  const operations = fileIdentityOptions?.windowsFileOperations ?? createWindowsFileOperations();
+  if (typeof operations.deleteHardLinkIfMatches !== "function") {
+    throw lockUnverifiable(
+      "The handed-off Codex Home operation lock cannot be safely restored on Windows.",
+    );
+  }
+  let result: "deleted" | "identity-mismatch";
+  try {
+    result = operations.deleteHardLinkIfMatches(source, expectedIdentity);
+  } catch (error: unknown) {
+    throw lockUnverifiable(
+      "The handed-off Codex Home operation lock could not be safely removed.",
+      error,
+    );
+  }
+  if (result === "identity-mismatch") {
+    throw lockUnverifiable(
+      "The handed-off Codex Home operation lock changed before restoration.",
+    );
+  }
 }
 
 async function closeLockHandle(handle: FileHandle): Promise<void> {
@@ -1271,6 +1404,7 @@ async function createBackupManifest(
   targets: readonly BackupTarget[],
   io?: TransactionIo,
   existingEntries: readonly BackupManifestEntry[] = [],
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<BackupManifest> {
   const entries: BackupManifestEntry[] = [...existingEntries];
   const seen = new Set(entries.map((entry) => `${entry.kind}:${entry.path}`));
@@ -1282,7 +1416,7 @@ async function createBackupManifest(
       continue;
     }
     seen.add(key);
-    const sourceStats = await lstatBigIntIfPresent(path);
+    const sourceStats = await lstatBigIntIfPresent(path, fileIdentityOptions);
     if (!sourceStats) {
       entries.push({
         kind: target.kind,
@@ -1292,7 +1426,7 @@ async function createBackupManifest(
       });
       continue;
     }
-    await assertSafeByteBackupSource(layout, path, sourceStats);
+    await assertSafeByteBackupSource(layout, path, sourceStats, fileIdentityOptions);
     await io?.afterBackupSourceLstat?.(path);
     const index = entries.length.toString().padStart(4, "0");
     const backupPath = join(backupDirectory, `${index}-${basename(path)}`);
@@ -1302,6 +1436,7 @@ async function createBackupManifest(
       sourceStats,
       backupPath,
       io,
+      fileIdentityOptions,
     );
     await syncFile(backupPath, io);
     entries.push({
@@ -1323,24 +1458,26 @@ async function assertPreparedByteTargetVersion(
   manifest: BackupManifest | undefined,
   appliedVersions: readonly AppliedByteTargetVersion[],
   io?: TransactionIo,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<void> {
   if (target.kind === "auth") {
     return;
   }
   const entry = findBackupManifestEntry(manifest, target);
   const expected = latestAppliedTargetVersion(appliedVersions, target) ?? entry.sourceVersion;
-  await assertByteTargetVersion(layout, target, expected, io);
+  await assertByteTargetVersion(layout, target, expected, io, fileIdentityOptions);
 }
 
 async function captureAppliedByteTargetVersion(
   layout: CodexLayout,
   target: JournalMutationTarget,
   io?: TransactionIo,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<AppliedByteTargetVersion | undefined> {
   if (target.kind === "auth") {
     return {
       target,
-      version: await captureAuthTargetVersion(layout, target, io),
+      version: await captureAuthTargetVersion(layout, target, io, fileIdentityOptions),
     };
   }
   if (target.kind !== "config" && target.kind !== "sqlite" && target.kind !== "rollout") {
@@ -1348,7 +1485,7 @@ async function captureAppliedByteTargetVersion(
   }
   return {
     target,
-    version: await captureByteTargetVersion(layout, target, io),
+    version: await captureByteTargetVersion(layout, target, io, fileIdentityOptions),
   };
 }
 
@@ -1384,11 +1521,12 @@ async function assertByteTargetVersion(
   target: ByteBackedTarget,
   expected: ByteTargetVersion,
   io?: TransactionIo,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<void> {
   if (!isValidByteTargetVersion(expected)) {
     throw new TransactionError("rollback-failed", "The transaction byte target version is invalid.");
   }
-  const actual = await captureByteTargetVersion(layout, target, io);
+  const actual = await captureByteTargetVersion(layout, target, io, fileIdentityOptions);
   if (!sameByteTargetVersion(expected, actual)) {
     throw new TransactionError(
       "rollback-failed",
@@ -1401,25 +1539,26 @@ async function captureByteTargetVersion(
   layout: CodexLayout,
   target: ByteBackedTarget,
   io?: TransactionIo,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<ByteTargetVersion> {
   const path = resolve(target.path);
   assertAllowedBackupTarget(layout, target.kind, path);
   let handle: FileHandle | undefined;
   let primaryError: unknown;
   try {
-    const pathStats = await lstatBigIntIfPresent(path);
+    const pathStats = await lstatBigIntIfPresent(path, fileIdentityOptions);
     if (!pathStats) {
       return { existed: false };
     }
-    await assertSafeByteBackupSource(layout, path, pathStats);
+    await assertSafeByteBackupSource(layout, path, pathStats, fileIdentityOptions);
     handle = await open(path, "r");
-    const openedStats = await handle.stat({ bigint: true });
-    await assertOpenedBackupSource(layout, path, pathStats, openedStats);
+    const openedStats = await statWithTransactionIdentity(handle, path, fileIdentityOptions);
+    await assertOpenedBackupSource(layout, path, pathStats, openedStats, fileIdentityOptions);
     const sha256 = await hashOpenedFile(handle, io);
-    const finalStats = await handle.stat({ bigint: true });
-    await assertOpenedBackupSource(layout, path, openedStats, finalStats);
-    const pathAfter = await lstat(path, { bigint: true });
-    if (!sameStableByteSourceStats(finalStats, pathAfter)) {
+    const finalStats = await statWithTransactionIdentity(handle, path, fileIdentityOptions);
+    await assertOpenedBackupSource(layout, path, openedStats, finalStats, fileIdentityOptions);
+    const pathAfter = await lstatWithTransactionIdentity(path, fileIdentityOptions);
+    if (!sameStableByteSourceStats(finalStats, pathAfter, fileIdentityOptions?.platform)) {
       throw new Error("The byte target changed while being versioned.");
     }
     const version = byteTargetVersion(finalStats, sha256);
@@ -1450,6 +1589,7 @@ async function captureAuthTargetVersion(
   layout: CodexLayout,
   target: AuthJournalTarget,
   io?: TransactionIo,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<ByteTargetVersion> {
   const path = resolve(target.path);
   if (path !== resolve(layout.authPath)) {
@@ -1459,24 +1599,24 @@ async function captureAuthTargetVersion(
   let handle: FileHandle | undefined;
   let primaryError: unknown;
   try {
-    const pathStats = await lstatBigIntIfPresent(path);
+    const pathStats = await lstatBigIntIfPresent(path, fileIdentityOptions);
     if (!pathStats) {
       return { existed: false };
     }
-    assertSafeAuthVersionSource(pathStats);
+    assertSafeAuthVersionSource(pathStats, fileIdentityOptions?.platform);
     handle = await open(path, "r");
-    const openedStats = await handle.stat({ bigint: true });
-    assertSafeAuthVersionSource(openedStats);
-    if (!sameStableByteSourceStats(pathStats, openedStats)) {
+    const openedStats = await statWithTransactionIdentity(handle, path, fileIdentityOptions);
+    assertSafeAuthVersionSource(openedStats, fileIdentityOptions?.platform);
+    if (!sameStableByteSourceStats(pathStats, openedStats, fileIdentityOptions?.platform)) {
       throw new Error("The auth target changed before opening.");
     }
     const sha256 = await hashOpenedFile(handle, io);
-    const finalStats = await handle.stat({ bigint: true });
-    assertSafeAuthVersionSource(finalStats);
-    const pathAfter = await lstat(path, { bigint: true });
+    const finalStats = await statWithTransactionIdentity(handle, path, fileIdentityOptions);
+    assertSafeAuthVersionSource(finalStats, fileIdentityOptions?.platform);
+    const pathAfter = await lstatWithTransactionIdentity(path, fileIdentityOptions);
     if (
-      !sameStableByteSourceStats(openedStats, finalStats) ||
-      !sameStableByteSourceStats(finalStats, pathAfter)
+      !sameStableByteSourceStats(openedStats, finalStats, fileIdentityOptions?.platform) ||
+      !sameStableByteSourceStats(finalStats, pathAfter, fileIdentityOptions?.platform)
     ) {
       throw new Error("The auth target changed while being versioned.");
     }
@@ -1504,14 +1644,25 @@ async function captureAuthTargetVersion(
   );
 }
 
-function assertSafeAuthVersionSource(stats: BigIntStats): void {
-  if (!stats.isFile() || stats.isSymbolicLink() || stats.nlink !== 1n || stats.ino === 0n) {
+function assertSafeAuthVersionSource(
+  stats: BigIntStats,
+  platform: NodeJS.Platform = process.platform,
+): void {
+  if (
+    !stats.isFile() ||
+    stats.isSymbolicLink() ||
+    stats.nlink !== 1n ||
+    !hasComparableFileIdentity(stats as FileIdentity, platform)
+  ) {
     throw new Error("The auth target is not a safe regular file.");
   }
 }
 
 function byteTargetVersion(stats: BigIntStats, sha256: string): ByteTargetVersion {
-  return {
+  const nativeIdentity = snapshotTransactionWindowsIdentity(
+    readOwnDataProperty(stats, "windowsFileIdentity"),
+  );
+  const version: ByteTargetVersion = {
     existed: true,
     sha256,
     mode: Number(stats.mode & 0o777n),
@@ -1522,6 +1673,11 @@ function byteTargetVersion(stats: BigIntStats, sha256: string): ByteTargetVersio
     modifiedAtNs: stats.mtimeNs.toString(),
     changedAtNs: stats.ctimeNs.toString(),
   };
+  if (nativeIdentity) {
+    version.volumeSerial = nativeIdentity.volumeSerial;
+    version.fileId = nativeIdentity.fileId;
+  }
+  return version;
 }
 
 function sameByteTargetVersion(
@@ -1531,9 +1687,13 @@ function sameByteTargetVersion(
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function sameStableByteSourceStats(left: BigIntStats, right: BigIntStats): boolean {
+function sameStableByteSourceStats(
+  left: BigIntStats,
+  right: BigIntStats,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
   return (
-    hasSameBigIntFileIdentity(left, right) &&
+    hasSameBigIntFileIdentity(left, right, platform) &&
     left.nlink === right.nlink &&
     left.mode === right.mode &&
     left.size === right.size &&
@@ -1550,6 +1710,7 @@ async function restoreBackupManifest(
   io?: TransactionIo,
   appliedTargetVersions: readonly AppliedByteTargetVersion[] = [],
   enforceSourceVersionProtocol = false,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<void> {
   await restoreTransactionTargets(
     layout,
@@ -1559,6 +1720,7 @@ async function restoreBackupManifest(
     io,
     appliedTargetVersions,
     enforceSourceVersionProtocol,
+    fileIdentityOptions,
   );
 }
 
@@ -1570,6 +1732,7 @@ async function restoreTransactionTargets(
   io?: TransactionIo,
   appliedTargetVersions: readonly AppliedByteTargetVersion[] = [],
   enforceSourceVersionProtocol = false,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<void> {
   const backupTargets = await validateTransactionTargets(
     layout,
@@ -1579,6 +1742,7 @@ async function restoreTransactionTargets(
     io,
     appliedTargetVersions,
     enforceSourceVersionProtocol,
+    fileIdentityOptions,
   );
   try {
     for (const target of [...targets].reverse()) {
@@ -1597,6 +1761,7 @@ async function restoreTransactionTargets(
           target.entry.kind,
           target.expectedVersion,
           io,
+          fileIdentityOptions,
         );
         continue;
       }
@@ -1606,6 +1771,7 @@ async function restoreTransactionTargets(
         target.path,
         target.expectedVersion,
         io,
+        fileIdentityOptions,
       );
     }
   } catch (error: unknown) {
@@ -1622,6 +1788,7 @@ async function validateTransactionTargets(
   io?: TransactionIo,
   appliedTargetVersions: readonly AppliedByteTargetVersion[] = [],
   enforceSourceVersionProtocol = false,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<ValidatedByteRestoreTarget[]> {
   const backupTargets = await validateByteRestoreTargets(
     layout,
@@ -1630,6 +1797,7 @@ async function validateTransactionTargets(
     io,
     appliedTargetVersions,
     enforceSourceVersionProtocol,
+    fileIdentityOptions,
   );
   try {
     for (const target of targets) {
@@ -1649,7 +1817,13 @@ async function validateTransactionTargets(
         );
       }
       if (expectedVersion) {
-        await assertAuthTargetVersion(layout, target, expectedVersion, io);
+        await assertAuthTargetVersion(
+          layout,
+          target,
+          expectedVersion,
+          io,
+          fileIdentityOptions,
+        );
       }
     }
     if (targets.some((target) => target.kind === "auth") && !restoreAuthMode) {
@@ -1669,11 +1843,12 @@ async function assertAuthTargetVersion(
   target: AuthJournalTarget,
   expected: ByteTargetVersion,
   io?: TransactionIo,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<void> {
   if (!isValidByteTargetVersion(expected)) {
     throw new TransactionError("rollback-failed", "The auth target version is invalid.");
   }
-  const actual = await captureAuthTargetVersion(layout, target, io);
+  const actual = await captureAuthTargetVersion(layout, target, io, fileIdentityOptions);
   if (!sameByteTargetVersion(expected, actual)) {
     throw new TransactionError(
       "rollback-failed",
@@ -1699,6 +1874,7 @@ async function validateByteRestoreTargets(
   io?: TransactionIo,
   appliedTargetVersions: readonly AppliedByteTargetVersion[] = [],
   enforceSourceVersionProtocol = false,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<ValidatedByteRestoreTarget[]> {
   const selectedTargets = targets.filter(
     (target): target is ByteBackedJournalTarget => (
@@ -1709,7 +1885,7 @@ async function validateByteRestoreTargets(
     return [];
   }
 
-  const manifest = await readBackupManifest(manifestPath, io);
+  const manifest = await readBackupManifest(manifestPath, io, fileIdentityOptions);
   const backupDirectory = dirname(manifestPath);
   const validatedTargets: ValidatedByteRestoreTarget[] = [];
   const seen = new Set<string>();
@@ -1743,7 +1919,7 @@ async function validateByteRestoreTargets(
         enforceSourceVersionProtocol ? entry.sourceVersion : undefined
       );
       if (expectedVersion) {
-        await assertByteTargetVersion(layout, target, expectedVersion, io);
+        await assertByteTargetVersion(layout, target, expectedVersion, io, fileIdentityOptions);
       }
       if (!entry.existed) {
         validatedTargets.push({
@@ -1759,7 +1935,12 @@ async function validateByteRestoreTargets(
       if (!isInsideDirectory(backupDirectory, backupPath)) {
         throw new TransactionError("rollback-failed", "The backup manifest escapes its transaction directory.");
       }
-      const verifiedBackup = await openVerifiedRestoreBackup(backupPath, entry.sha256!, io);
+      const verifiedBackup = await openVerifiedRestoreBackup(
+        backupPath,
+        entry.sha256!,
+        io,
+        fileIdentityOptions,
+      );
       validatedTargets.push({
         path,
         entry,
@@ -1780,6 +1961,7 @@ async function validateByteRestoreTargets(
 async function readBackupManifest(
   manifestPath: string,
   io?: TransactionIo,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<BackupManifest> {
   let manifest: unknown;
   try {
@@ -1789,6 +1971,7 @@ async function readBackupManifest(
         "rollback-failed",
         "The backup manifest is not a regular file.",
         io?.afterManifestPathValidated,
+        fileIdentityOptions,
       )).toString("utf8"),
     ) as unknown;
   } catch (error: unknown) {
@@ -1864,6 +2047,7 @@ async function restoreFileAtomically(
   destination: string,
   expectedVersion: ByteTargetVersion | undefined,
   io?: TransactionIo,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<void> {
   if (!source.backupPath || !source.backupHandle || !source.backupStats) {
     throw new TransactionError("rollback-failed", "The backup manifest is incomplete.");
@@ -1877,32 +2061,50 @@ async function restoreFileAtomically(
   let temporaryHandle: FileHandle | undefined;
   let primaryError: unknown;
   try {
-    parent = await openTrustedRestoreParent(layout, destination, source.entry.kind);
+    parent = await openTrustedRestoreParent(
+      layout,
+      destination,
+      source.entry.kind,
+      fileIdentityOptions,
+    );
     await io?.beforeRestoreTemporaryCreate?.(destination);
-    await assertTrustedRestoreParent(parent);
+    await assertTrustedRestoreParent(parent, fileIdentityOptions);
     temporary = join(
       parent.operationalPath,
       `.${basename(destination)}.restore-${randomUUID()}`,
     );
     temporaryHandle = await open(temporary, "wx", mode);
     await (io?.copyTemporary ?? copyOpenedFile)(source.backupHandle, temporaryHandle);
-    await assertVerifiedRestoreBackup(source.backupPath, source.backupHandle, source.backupStats);
+    await assertVerifiedRestoreBackup(
+      source.backupPath,
+      source.backupHandle,
+      source.backupStats,
+      undefined,
+      fileIdentityOptions,
+    );
     await temporaryHandle.chmod(mode);
     const handleToSync = temporaryHandle;
     temporaryHandle = undefined;
     await syncAndCloseRestoreTemporary(handleToSync, io);
-    await assertVerifiedRestoreBackup(source.backupPath, source.backupHandle, source.backupStats);
-    await assertTrustedRestoreParent(parent);
+    await assertVerifiedRestoreBackup(
+      source.backupPath,
+      source.backupHandle,
+      source.backupStats,
+      undefined,
+      fileIdentityOptions,
+    );
+    await assertTrustedRestoreParent(parent, fileIdentityOptions);
     if (expectedVersion) {
       await assertByteTargetVersion(
         layout,
         { kind: source.entry.kind, path: destination } as ByteBackedJournalTarget,
         expectedVersion,
         io,
+        fileIdentityOptions,
       );
     }
     await rename(temporary, join(parent.operationalPath, basename(destination)));
-    await assertTrustedRestoreParent(parent);
+    await assertTrustedRestoreParent(parent, fileIdentityOptions);
     await syncTrustedRestoreParent(parent, io);
   } catch (error: unknown) {
     primaryError = error;
@@ -1956,16 +2158,26 @@ async function removeRestoreTargetIfPresent(
   kind: BackupKind,
   expectedVersion: ByteTargetVersion | undefined,
   io?: TransactionIo,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<void> {
-  const parent = await openTrustedRestoreParent(layout, destination, kind);
+  const parent = await openTrustedRestoreParent(layout, destination, kind, fileIdentityOptions);
   let primaryError: unknown;
   try {
-    await assertTrustedRestoreParent(parent);
+    await assertTrustedRestoreParent(parent, fileIdentityOptions);
     if (expectedVersion) {
-      await assertByteTargetVersion(layout, { kind, path: destination }, expectedVersion, io);
+      await assertByteTargetVersion(
+        layout,
+        { kind, path: destination },
+        expectedVersion,
+        io,
+        fileIdentityOptions,
+      );
     }
-    await unlinkIfPresent(join(parent.operationalPath, basename(destination)));
-    await assertTrustedRestoreParent(parent);
+        await removeRestoreTargetFile(
+          join(parent.operationalPath, basename(destination)),
+          fileIdentityOptions,
+        );
+    await assertTrustedRestoreParent(parent, fileIdentityOptions);
     await syncTrustedRestoreParent(parent, io);
   } catch (error: unknown) {
     primaryError = error;
@@ -1991,12 +2203,13 @@ async function openTrustedRestoreParent(
   layout: CodexLayout,
   destination: string,
   kind: BackupKind,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<TrustedRestoreParent> {
   const resolvedDestination = resolve(destination);
   assertAllowedBackupTarget(layout, kind, resolvedDestination);
   const logicalPath = dirname(resolvedDestination);
-  const inspected = await inspectTrustedRestoreParent(logicalPath);
-  if (process.platform !== "linux") {
+  const inspected = await inspectTrustedRestoreParent(logicalPath, fileIdentityOptions);
+  if ((fileIdentityOptions?.platform ?? process.platform) !== "linux") {
     return {
       logicalPath,
       operationalPath: logicalPath,
@@ -2010,8 +2223,11 @@ async function openTrustedRestoreParent(
       logicalPath,
       constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
     );
-    const handleStats = await handle.stat({ bigint: true });
-    if (!isSafeRestoreParentStats(handleStats) || !hasSameBigIntFileIdentity(inspected.stats, handleStats)) {
+    const handleStats = await statWithTransactionIdentity(handle, logicalPath, fileIdentityOptions);
+    if (
+      !isSafeRestoreParentStats(handleStats, fileIdentityOptions?.platform) ||
+      !hasSameBigIntFileIdentity(inspected.stats, handleStats, fileIdentityOptions?.platform)
+    ) {
       throw new TransactionError("rollback-failed", "The restore target parent changed after validation.");
     }
     return {
@@ -2031,17 +2247,27 @@ async function openTrustedRestoreParent(
   }
 }
 
-async function assertTrustedRestoreParent(parent: TrustedRestoreParent): Promise<void> {
-  const current = await inspectTrustedRestoreParent(parent.logicalPath);
+async function assertTrustedRestoreParent(
+  parent: TrustedRestoreParent,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
+): Promise<void> {
+  const current = await inspectTrustedRestoreParent(parent.logicalPath, fileIdentityOptions);
   if (
-    !hasSameBigIntFileIdentity(parent.stats, current.stats) ||
+    !hasSameBigIntFileIdentity(parent.stats, current.stats, fileIdentityOptions?.platform) ||
     !sameResolvedPath(parent.realPath, current.realPath)
   ) {
     throw new TransactionError("rollback-failed", "The restore target parent changed after validation.");
   }
   if (parent.handle) {
-    const handleStats = await parent.handle.stat({ bigint: true });
-    if (!isSafeRestoreParentStats(handleStats) || !hasSameBigIntFileIdentity(parent.stats, handleStats)) {
+    const handleStats = await statWithTransactionIdentity(
+      parent.handle,
+      parent.logicalPath,
+      fileIdentityOptions,
+    );
+    if (
+      !isSafeRestoreParentStats(handleStats, fileIdentityOptions?.platform) ||
+      !hasSameBigIntFileIdentity(parent.stats, handleStats, fileIdentityOptions?.platform)
+    ) {
       throw new TransactionError("rollback-failed", "The restore target parent changed after validation.");
     }
   }
@@ -2049,16 +2275,17 @@ async function assertTrustedRestoreParent(parent: TrustedRestoreParent): Promise
 
 async function inspectTrustedRestoreParent(
   logicalPath: string,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<Pick<TrustedRestoreParent, "stats" | "realPath">> {
-  const before = await lstat(logicalPath, { bigint: true });
-  if (!isSafeRestoreParentStats(before)) {
+  const before = await lstatWithTransactionIdentity(logicalPath, fileIdentityOptions);
+  if (!isSafeRestoreParentStats(before, fileIdentityOptions?.platform)) {
     throw new TransactionError("rollback-failed", "The restore target parent is not a real directory.");
   }
   const realPath = await realpath(logicalPath);
-  const after = await lstat(logicalPath, { bigint: true });
+  const after = await lstatWithTransactionIdentity(logicalPath, fileIdentityOptions);
   if (
-    !isSafeRestoreParentStats(after) ||
-    !hasSameBigIntFileIdentity(before, after) ||
+    !isSafeRestoreParentStats(after, fileIdentityOptions?.platform) ||
+    !hasSameBigIntFileIdentity(before, after, fileIdentityOptions?.platform) ||
     !sameResolvedPath(realPath, logicalPath)
   ) {
     throw new TransactionError("rollback-failed", "The restore target parent is indirect or changed.");
@@ -2066,8 +2293,12 @@ async function inspectTrustedRestoreParent(
   return { stats: after, realPath };
 }
 
-function isSafeRestoreParentStats(stats: BigIntStats): boolean {
-  return stats.isDirectory() && !stats.isSymbolicLink() && stats.ino !== 0n;
+function isSafeRestoreParentStats(
+  stats: BigIntStats,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return stats.isDirectory() && !stats.isSymbolicLink() &&
+    hasComparableFileIdentity(stats as FileIdentity, platform);
 }
 
 async function syncTrustedRestoreParent(
@@ -2089,22 +2320,35 @@ async function openVerifiedRestoreBackup(
   path: string,
   expectedHash: string,
   io?: TransactionIo,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<{ handle: FileHandle; stats: BigIntStats }> {
   let handle: FileHandle | undefined;
   try {
-    const pathStats = await lstat(path, { bigint: true });
-    assertSafeRestoreBackupStats(pathStats);
+    const pathStats = await lstatWithTransactionIdentity(path, fileIdentityOptions);
+    assertSafeRestoreBackupStats(pathStats, fileIdentityOptions?.platform);
     handle = await open(path, "r");
-    const openedStats = await handle.stat({ bigint: true });
-    await assertVerifiedRestoreBackup(path, handle, pathStats, openedStats);
+    const openedStats = await statWithTransactionIdentity(handle, path, fileIdentityOptions);
+    await assertVerifiedRestoreBackup(
+      path,
+      handle,
+      pathStats,
+      openedStats,
+      fileIdentityOptions,
+    );
     if ((await hashOpenedFile(handle, io)) !== expectedHash) {
       throw new TransactionError(
         "rollback-failed",
         "The backup manifest hash does not match its backup data.",
       );
     }
-    const verifiedStats = await handle.stat({ bigint: true });
-    await assertVerifiedRestoreBackup(path, handle, openedStats, verifiedStats);
+    const verifiedStats = await statWithTransactionIdentity(handle, path, fileIdentityOptions);
+    await assertVerifiedRestoreBackup(
+      path,
+      handle,
+      openedStats,
+      verifiedStats,
+      fileIdentityOptions,
+    );
     return { handle, stats: verifiedStats };
   } catch (error: unknown) {
     await closeFileHandleQuietly(handle);
@@ -2124,11 +2368,16 @@ async function assertVerifiedRestoreBackup(
   handle: FileHandle,
   expectedStats: BigIntStats,
   actualStats?: BigIntStats,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<void> {
-  const handleStats = actualStats ?? await handle.stat({ bigint: true });
+  const handleStats = actualStats ?? await statWithTransactionIdentity(
+    handle,
+    path,
+    fileIdentityOptions,
+  );
   if (
-    !isSafeRestoreBackupStats(handleStats) ||
-    !hasSameBigIntFileIdentity(expectedStats, handleStats) ||
+    !isSafeRestoreBackupStats(handleStats, fileIdentityOptions?.platform) ||
+    !hasSameBigIntFileIdentity(expectedStats, handleStats, fileIdentityOptions?.platform) ||
     expectedStats.nlink !== handleStats.nlink ||
     expectedStats.size !== handleStats.size ||
     expectedStats.mtimeNs !== handleStats.mtimeNs ||
@@ -2139,10 +2388,10 @@ async function assertVerifiedRestoreBackup(
       "The backup manifest backup file changed after validation.",
     );
   }
-  const pathStats = await lstat(path, { bigint: true });
+  const pathStats = await lstatWithTransactionIdentity(path, fileIdentityOptions);
   if (
-    !isSafeRestoreBackupStats(pathStats) ||
-    !hasSameBigIntFileIdentity(handleStats, pathStats) ||
+    !isSafeRestoreBackupStats(pathStats, fileIdentityOptions?.platform) ||
+    !hasSameBigIntFileIdentity(handleStats, pathStats, fileIdentityOptions?.platform) ||
     handleStats.nlink !== pathStats.nlink ||
     handleStats.size !== pathStats.size ||
     handleStats.mtimeNs !== pathStats.mtimeNs ||
@@ -2161,8 +2410,11 @@ async function assertVerifiedRestoreBackup(
   }
 }
 
-function assertSafeRestoreBackupStats(stats: BigIntStats): void {
-  if (!isSafeRestoreBackupStats(stats)) {
+function assertSafeRestoreBackupStats(
+  stats: BigIntStats,
+  platform: NodeJS.Platform = process.platform,
+): void {
+  if (!isSafeRestoreBackupStats(stats, platform)) {
     throw new TransactionError(
       "rollback-failed",
       "The backup manifest contains a non-regular backup file.",
@@ -2170,8 +2422,12 @@ function assertSafeRestoreBackupStats(stats: BigIntStats): void {
   }
 }
 
-function isSafeRestoreBackupStats(stats: BigIntStats): boolean {
-  return stats.isFile() && !stats.isSymbolicLink() && stats.nlink === 1n && stats.ino !== 0n;
+function isSafeRestoreBackupStats(
+  stats: BigIntStats,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return stats.isFile() && !stats.isSymbolicLink() && stats.nlink === 1n &&
+    hasComparableFileIdentity(stats as FileIdentity, platform);
 }
 
 async function copyOpenedFile(source: FileHandle, destination: FileHandle): Promise<void> {
@@ -2505,12 +2761,13 @@ async function appendJournal(
   entry: JournalEntry,
   operationDirectory: TrustedTransactionDirectory,
   io?: TransactionIo,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<void> {
-  await assertTrustedTransactionDirectory(operationDirectory);
+  await assertTrustedTransactionDirectory(operationDirectory, fileIdentityOptions);
   if (path !== join(operationDirectory.path, journalFileName)) {
     throw new TransactionError("journal-invalid", "The transaction journal is outside its operation directory.");
   }
-  const existing = await readJournalSnapshot(path, io);
+  const existing = await readJournalSnapshot(path, io, fileIdentityOptions);
   const record = Buffer.from(`${JSON.stringify(entry)}\n`, "utf8");
   const snapshot = Buffer.concat([existing, record]);
   const temporary = join(
@@ -2519,7 +2776,7 @@ async function appendJournal(
   );
   try {
     await writeJournalSnapshot(temporary, snapshot, io);
-    await assertTrustedTransactionDirectory(operationDirectory);
+    await assertTrustedTransactionDirectory(operationDirectory, fileIdentityOptions);
     await assertJournalTemporaryHasNoHardLinks(temporary);
     await (io?.renameJournal ?? rename)(temporary, path);
     try {
@@ -2527,17 +2784,23 @@ async function appendJournal(
     } catch (error: unknown) {
       throw new JournalDirectorySyncError(
         entry.state,
-        await classifyPublishedJournalSnapshot(path, snapshot, operationDirectory),
+          await classifyPublishedJournalSnapshot(
+            path,
+            snapshot,
+            operationDirectory,
+            fileIdentityOptions,
+          ),
         error,
       );
     }
-    await assertTrustedTransactionDirectory(operationDirectory);
+    await assertTrustedTransactionDirectory(operationDirectory, fileIdentityOptions);
   } catch (error: unknown) {
     await rethrowAfterJournalTemporaryCleanup(
       temporary,
       operationDirectory,
       error,
       io?.removeJournalTemporary,
+      fileIdentityOptions,
     );
   }
 }
@@ -2546,12 +2809,13 @@ async function classifyPublishedJournalSnapshot(
   path: string,
   expected: Buffer,
   operationDirectory: TrustedTransactionDirectory,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<JournalSnapshotClassification> {
   try {
-    await assertTrustedTransactionDirectory(operationDirectory);
-    const current = await readJournalFile(path);
+    await assertTrustedTransactionDirectory(operationDirectory, fileIdentityOptions);
+    const current = await readJournalFile(path, undefined, fileIdentityOptions);
     parseJournalEntries(current.toString("utf8"), path);
-    await assertTrustedTransactionDirectory(operationDirectory);
+    await assertTrustedTransactionDirectory(operationDirectory, fileIdentityOptions);
     return current.equals(expected) ? "expected" : "different";
   } catch {
     return "unverifiable";
@@ -2563,9 +2827,10 @@ async function rethrowAfterJournalTemporaryCleanup(
   operationDirectory: TrustedTransactionDirectory,
   primaryError: unknown,
   remove?: (path: string) => Promise<void>,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<never> {
   try {
-    await assertTrustedTransactionDirectory(operationDirectory);
+    await assertTrustedTransactionDirectory(operationDirectory, fileIdentityOptions);
   } catch (cleanupSafetyError: unknown) {
     const reclassified = reclassifyJournalDirectorySyncError(
       primaryError,
@@ -2634,7 +2899,9 @@ function reclassifyJournalDirectorySyncError(
   );
 }
 
-async function assertJournalTemporaryHasNoHardLinks(path: string): Promise<void> {
+async function assertJournalTemporaryHasNoHardLinks(
+  path: string,
+): Promise<void> {
   const stats = await lstat(path);
   if (!isRegularNonLinkFile(stats) || hasMultipleHardLinks(stats)) {
     throw new TransactionError("journal-invalid", "The journal temporary is not a private regular file.");
@@ -2675,9 +2942,14 @@ async function writeJournalSnapshot(
 async function readJournalSnapshot(
   path: string,
   io?: TransactionIo,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<Buffer> {
   try {
-    const contents = await readJournalFile(path, io?.afterJournalPathValidated);
+    const contents = await readJournalFile(
+      path,
+      io?.afterJournalPathValidated,
+      fileIdentityOptions,
+    );
     if (contents.length > 0) {
       parseJournalEntries(contents.toString("utf8"), path);
     }
@@ -2718,10 +2990,17 @@ async function writeAll(
 async function readJournal(
   path: string,
   io?: TransactionIo,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<JournalEntry[]> {
   try {
     return parseJournalEntries(
-      (await readJournalFile(path, io?.afterJournalPathValidated)).toString("utf8"),
+      (
+        await readJournalFile(
+          path,
+          io?.afterJournalPathValidated,
+          fileIdentityOptions,
+        )
+      ).toString("utf8"),
       path,
     );
   } catch (error: unknown) {
@@ -2737,12 +3016,14 @@ async function readJournal(
 async function readJournalFile(
   path: string,
   afterPathValidated?: (path: string) => void | Promise<void>,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<Buffer> {
   return readVerifiedMetadataFile(
     path,
     "journal-invalid",
     "The transaction journal is not a regular file.",
     afterPathValidated,
+    fileIdentityOptions,
   );
 }
 
@@ -2751,24 +3032,31 @@ async function readVerifiedMetadataFile(
   code: "journal-invalid" | "rollback-failed",
   unsafeMessage: string,
   afterPathValidated?: (path: string) => void | Promise<void>,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<Buffer> {
   let handle: FileHandle | undefined;
   let contents: Buffer | undefined;
   let primaryError: unknown;
   try {
-    const pathStats = await lstat(path, { bigint: true });
-    if (!isSafeMetadataStats(pathStats)) {
+    const pathStats = await lstatWithTransactionIdentity(path, fileIdentityOptions);
+    if (!isSafeMetadataStats(pathStats, fileIdentityOptions?.platform)) {
       throw new TransactionError(code, unsafeMessage);
     }
     await afterPathValidated?.(path);
     handle = await open(path, "r");
-    const openedStats = await handle.stat({ bigint: true });
-    if (!isSafeMetadataStats(openedStats) || !hasSameBigIntFileIdentity(pathStats, openedStats)) {
+    const openedStats = await statWithTransactionIdentity(handle, path, fileIdentityOptions);
+    if (
+      !isSafeMetadataStats(openedStats, fileIdentityOptions?.platform) ||
+      !hasSameBigIntFileIdentity(pathStats, openedStats, fileIdentityOptions?.platform)
+    ) {
       throw new TransactionError(code, unsafeMessage);
     }
     contents = await handle.readFile();
-    const finalStats = await handle.stat({ bigint: true });
-    if (!isSafeMetadataStats(finalStats) || !hasSameBigIntFileIdentity(openedStats, finalStats)) {
+    const finalStats = await statWithTransactionIdentity(handle, path, fileIdentityOptions);
+    if (
+      !isSafeMetadataStats(finalStats, fileIdentityOptions?.platform) ||
+      !hasSameBigIntFileIdentity(openedStats, finalStats, fileIdentityOptions?.platform)
+    ) {
       throw new TransactionError(code, unsafeMessage);
     }
   } catch (error: unknown) {
@@ -2795,8 +3083,12 @@ async function readVerifiedMetadataFile(
   return contents!;
 }
 
-function isSafeMetadataStats(stats: BigIntStats): boolean {
-  return stats.isFile() && !stats.isSymbolicLink() && stats.nlink === 1n && stats.ino !== 0n;
+function isSafeMetadataStats(
+  stats: BigIntStats,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return stats.isFile() && !stats.isSymbolicLink() && stats.nlink === 1n &&
+    hasComparableFileIdentity(stats as FileIdentity, platform);
 }
 
 function parseJournalEntries(contents: string, path: string): JournalEntry[] {
@@ -3010,6 +3302,8 @@ function isValidByteTargetVersion(value: unknown): value is ByteTargetVersion {
     "device",
     "inode",
     "links",
+    "volumeSerial",
+    "fileId",
     "size",
     "modifiedAtNs",
     "changedAtNs",
@@ -3025,7 +3319,9 @@ function isValidByteTargetVersion(value: unknown): value is ByteTargetVersion {
       version.links === undefined &&
       version.size === undefined &&
       version.modifiedAtNs === undefined &&
-      version.changedAtNs === undefined
+      version.changedAtNs === undefined &&
+      version.volumeSerial === undefined &&
+      version.fileId === undefined
     );
   }
   return (
@@ -3034,7 +3330,15 @@ function isValidByteTargetVersion(value: unknown): value is ByteTargetVersion {
     typeof version.device === "string" &&
     /^[0-9]+$/.test(version.device) &&
     typeof version.inode === "string" &&
-    /^[1-9][0-9]*$/.test(version.inode) &&
+    ((/^[1-9][0-9]*$/.test(version.inode) &&
+      version.volumeSerial === undefined &&
+      version.fileId === undefined) ||
+      (version.inode === "0" &&
+        version.links === "1" &&
+        typeof version.volumeSerial === "string" &&
+        /^[0-9a-f]{16}$/u.test(version.volumeSerial) &&
+        typeof version.fileId === "string" &&
+        /^[0-9a-f]{32}$/u.test(version.fileId))) &&
     typeof version.links === "string" &&
     /^[1-9][0-9]*$/.test(version.links) &&
     typeof version.size === "string" &&
@@ -3253,9 +3557,54 @@ async function lstatIfPresent(path: string): Promise<Stats | undefined> {
   }
 }
 
-async function lstatBigIntIfPresent(path: string): Promise<BigIntStats | undefined> {
+async function lstatWithTransactionIdentity(
+  path: string,
+  options?: HydrateWindowsFileIdentityOptions,
+): Promise<BigIntStats> {
+  return hydrateTransactionFileIdentity(
+    path,
+    await lstat(path, { bigint: true }),
+    options,
+  );
+}
+
+async function statWithTransactionIdentity(
+  handle: FileHandle,
+  logicalPath: string,
+  options?: HydrateWindowsFileIdentityOptions,
+): Promise<BigIntStats> {
+  return hydrateTransactionFileIdentity(
+    logicalPath,
+    await handle.stat({ bigint: true }),
+    options,
+  );
+}
+
+async function hydrateTransactionFileIdentity(
+  logicalPath: string,
+  stats: BigIntStats,
+  options?: HydrateWindowsFileIdentityOptions,
+): Promise<BigIntStats> {
+  const identity = await hydrateWindowsFileIdentity(logicalPath, stats, options);
+  if (identity.windowsFileIdentity === undefined) {
+    return stats;
+  }
+
+  Object.defineProperty(stats, "windowsFileIdentity", {
+    configurable: false,
+    enumerable: true,
+    value: identity.windowsFileIdentity,
+    writable: false,
+  });
+  return stats;
+}
+
+async function lstatBigIntIfPresent(
+  path: string,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
+): Promise<BigIntStats | undefined> {
   try {
-    return await lstat(path, { bigint: true });
+    return await lstatWithTransactionIdentity(path, fileIdentityOptions);
   } catch (error: unknown) {
     if (isMissingFileError(error)) {
       return undefined;
@@ -3268,19 +3617,23 @@ async function assertSafeByteBackupSource(
   layout: CodexLayout,
   path: string,
   sourceStats: BigIntStats,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<void> {
   const authPath = resolve(layout.authPath);
-  if (!isSafeOpenedBackupStats(sourceStats) || sameResolvedPath(path, authPath)) {
+  if (
+    !isSafeOpenedBackupStats(sourceStats, fileIdentityOptions?.platform) ||
+    sameResolvedPath(path, authPath)
+  ) {
     throw new TransactionError(
       "invalid-backup-target",
       "The backup target must be a regular file distinct from auth.json.",
     );
   }
-  const authStats = await lstatBigIntIfPresent(authPath);
+  const authStats = await lstatBigIntIfPresent(authPath, fileIdentityOptions);
   if (
     (authStats &&
-      (!isSafeOpenedBackupStats(authStats) ||
-        hasSameBigIntFileIdentity(sourceStats, authStats)))
+      (!isSafeOpenedBackupStats(authStats, fileIdentityOptions?.platform) ||
+        hasSameBigIntFileIdentity(sourceStats, authStats, fileIdentityOptions?.platform)))
   ) {
     throw new TransactionError(
       "invalid-backup-target",
@@ -3295,6 +3648,7 @@ async function copyBackupSourceSafely(
   expectedSourceStats: BigIntStats,
   backupPath: string,
   io?: TransactionIo,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<ByteTargetVersion> {
   const temporaryPath = join(
     dirname(backupPath),
@@ -3304,8 +3658,14 @@ async function copyBackupSourceSafely(
   let backupHandle: FileHandle | undefined;
   try {
     sourceHandle = await open(sourcePath, "r");
-    const openedStats = await sourceHandle.stat({ bigint: true });
-    await assertOpenedBackupSource(layout, sourcePath, expectedSourceStats, openedStats);
+    const openedStats = await statWithTransactionIdentity(sourceHandle, sourcePath, fileIdentityOptions);
+    await assertOpenedBackupSource(
+      layout,
+      sourcePath,
+      expectedSourceStats,
+      openedStats,
+      fileIdentityOptions,
+    );
 
     backupHandle = await open(temporaryPath, "wx", 0o600);
     const sourceHash = createHash("sha256");
@@ -3339,9 +3699,9 @@ async function copyBackupSourceSafely(
     }
     await io?.afterBackupSourceRead?.(sourcePath);
 
-    const afterReadStats = await sourceHandle.stat({ bigint: true });
+    const afterReadStats = await statWithTransactionIdentity(sourceHandle, sourcePath, fileIdentityOptions);
     if (
-      !hasSameBigIntFileIdentity(openedStats, afterReadStats) ||
+      !hasSameBigIntFileIdentity(openedStats, afterReadStats, fileIdentityOptions?.platform) ||
       openedStats.nlink !== afterReadStats.nlink ||
       openedStats.mode !== afterReadStats.mode ||
       openedStats.size !== afterReadStats.size ||
@@ -3350,7 +3710,13 @@ async function copyBackupSourceSafely(
     ) {
       throw new Error("The backup source changed while being read.");
     }
-    await assertOpenedBackupSource(layout, sourcePath, openedStats, afterReadStats);
+    await assertOpenedBackupSource(
+      layout,
+      sourcePath,
+      openedStats,
+      afterReadStats,
+      fileIdentityOptions,
+    );
     await backupHandle.sync();
     await backupHandle.close();
     backupHandle = undefined;
@@ -3374,18 +3740,19 @@ async function assertOpenedBackupSource(
   sourcePath: string,
   expectedStats: BigIntStats,
   openedStats: BigIntStats,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
 ): Promise<void> {
   if (
-    !isSafeOpenedBackupStats(openedStats) ||
-    !hasSameBigIntFileIdentity(expectedStats, openedStats) ||
+    !isSafeOpenedBackupStats(openedStats, fileIdentityOptions?.platform) ||
+    !hasSameBigIntFileIdentity(expectedStats, openedStats, fileIdentityOptions?.platform) ||
     expectedStats.mode !== openedStats.mode
   ) {
     throw new Error("The backup source identity changed.");
   }
-  const pathStats = await lstat(sourcePath, { bigint: true });
+  const pathStats = await lstatWithTransactionIdentity(sourcePath, fileIdentityOptions);
   if (
-    !isSafeOpenedBackupStats(pathStats) ||
-    !hasSameBigIntFileIdentity(openedStats, pathStats) ||
+    !isSafeOpenedBackupStats(pathStats, fileIdentityOptions?.platform) ||
+    !hasSameBigIntFileIdentity(openedStats, pathStats, fileIdentityOptions?.platform) ||
     openedStats.mode !== pathStats.mode
   ) {
     throw new Error("The backup source path changed.");
@@ -3394,21 +3761,30 @@ async function assertOpenedBackupSource(
   if (!sameResolvedPath(sourceRealPath, sourcePath)) {
     throw new Error("The backup source path is indirect.");
   }
-  const authStats = await lstatBigIntIfPresent(resolve(layout.authPath));
+  const authStats = await lstatBigIntIfPresent(resolve(layout.authPath), fileIdentityOptions);
   if (
     authStats &&
-    (!isSafeOpenedBackupStats(authStats) || hasSameBigIntFileIdentity(openedStats, authStats))
+    (!isSafeOpenedBackupStats(authStats, fileIdentityOptions?.platform) ||
+      hasSameBigIntFileIdentity(openedStats, authStats, fileIdentityOptions?.platform))
   ) {
     throw new Error("The backup source aliases auth data.");
   }
 }
 
-function isSafeOpenedBackupStats(stats: BigIntStats): boolean {
-  return stats.isFile() && !stats.isSymbolicLink() && stats.nlink === 1n && stats.ino !== 0n;
+function isSafeOpenedBackupStats(
+  stats: BigIntStats,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return stats.isFile() && !stats.isSymbolicLink() && stats.nlink === 1n &&
+    hasComparableFileIdentity(stats as FileIdentity, platform);
 }
 
-function hasSameBigIntFileIdentity(left: BigIntStats, right: BigIntStats): boolean {
-  return left.ino !== 0n && right.ino !== 0n && left.dev === right.dev && left.ino === right.ino;
+function hasSameBigIntFileIdentity(
+  left: BigIntStats,
+  right: BigIntStats,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return hasSameComparableFileIdentity(left, right, platform);
 }
 
 function sameResolvedPath(left: string, right: string): boolean {
@@ -3437,9 +3813,10 @@ function isRegularNonLinkFile(stats: Stats): boolean {
 function hasSameComparableFileIdentity(
   left: FileIdentity,
   right: FileIdentity,
+  platform: NodeJS.Platform = process.platform,
 ): boolean {
-  const leftSnapshot = snapshotComparableFileIdentity(left);
-  const rightSnapshot = snapshotComparableFileIdentity(right);
+  const leftSnapshot = snapshotComparableFileIdentity(left, platform);
+  const rightSnapshot = snapshotComparableFileIdentity(right, platform);
   if (!leftSnapshot || !rightSnapshot) {
     return false;
   }
@@ -3455,8 +3832,11 @@ function hasSameComparableFileIdentity(
     leftSnapshot.windowsFileIdentity.linkCount === rightSnapshot.windowsFileIdentity.linkCount;
 }
 
-function hasComparableFileIdentity(stats: FileIdentity): boolean {
-  return snapshotComparableFileIdentity(stats) !== undefined;
+function hasComparableFileIdentity(
+  stats: FileIdentity,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return snapshotComparableFileIdentity(stats, platform) !== undefined;
 }
 
 interface ComparableTransactionFileIdentity {
@@ -3468,6 +3848,7 @@ interface ComparableTransactionFileIdentity {
 
 function snapshotComparableFileIdentity(
   stats: FileIdentity,
+  platform: NodeJS.Platform = process.platform,
 ): ComparableTransactionFileIdentity | undefined {
   try {
     const dev = readOwnDataProperty(stats, "dev");
@@ -3481,9 +3862,10 @@ function snapshotComparableFileIdentity(
     if (ino !== 0n && ino !== 0) {
       return Object.freeze({ dev, ino, nlink });
     }
-    const native = snapshotTransactionWindowsIdentity(
-      readOwnDataProperty(stats, "windowsFileIdentity"),
-    );
+    if (platform !== "win32") {
+      return undefined;
+    }
+    const native = snapshotTransactionWindowsIdentity(readOwnDataProperty(stats, "windowsFileIdentity"));
     if (!native || !sameTransactionIdentityValue(nlink, native.linkCount)) {
       return undefined;
     }
@@ -3544,6 +3926,132 @@ async function unlinkIfPresent(path: string): Promise<void> {
     if (!isMissingFileError(error)) {
       throw error;
     }
+  }
+}
+
+async function removeIncompleteLock(
+  path: string,
+  options: TransactionOptions,
+): Promise<void> {
+  const stats = await lstatBigIntIfPresent(path, options.fileIdentityOptions);
+  if (!stats) {
+    return;
+  }
+  const deletion = await removeLockPathByIdentity(path, stats, options);
+  if (deletion === "missing") {
+    return;
+  }
+}
+
+async function removeLockPathByIdentity(
+  path: string,
+  expectedStats: BigIntStats,
+  options: TransactionOptions,
+): Promise<"deleted" | "missing"> {
+  if (options.io?.releaseLock) {
+    await options.io.releaseLock(path);
+    return "deleted";
+  }
+
+  const fileIdentityOptions = options.fileIdentityOptions;
+  const platform = fileIdentityOptions?.platform ?? process.platform;
+  if (platform !== "win32" || expectedStats.ino !== 0n) {
+    try {
+      await (options.io?.unlink ?? unlink)(path);
+      return "deleted";
+    } catch (error: unknown) {
+      if (isMissingFileError(error)) {
+        return "missing";
+      }
+      throw error;
+    }
+  }
+
+  const expectedIdentity = snapshotTransactionWindowsIdentity(
+    readOwnDataProperty(expectedStats, "windowsFileIdentity"),
+  );
+  if (!expectedIdentity) {
+    throw lockUnverifiable("The Codex Home operation lock has no verifiable Windows identity.");
+  }
+  const operations = fileIdentityOptions?.windowsFileOperations ?? createWindowsFileOperations();
+  let result: "deleted" | "identity-mismatch";
+  try {
+    result = operations.deleteFileIfMatches(path, expectedIdentity);
+  } catch (error: unknown) {
+    const current = await lstatBigIntIfPresent(path, fileIdentityOptions).catch(() => undefined);
+    if (!current) {
+      return "missing";
+    }
+    throw lockUnverifiable(
+      "The Codex Home operation lock could not be safely removed.",
+      error,
+    );
+  }
+  if (result === "identity-mismatch") {
+    throw lockUnverifiable("The Codex Home operation lock ownership changed before removal.");
+  }
+  return "deleted";
+}
+
+async function removeRestoreTargetFile(
+  path: string,
+  fileIdentityOptions?: HydrateWindowsFileIdentityOptions,
+): Promise<void> {
+  const platform = fileIdentityOptions?.platform ?? process.platform;
+  const stats = await lstatWithTransactionIdentity(path, fileIdentityOptions).catch(
+    (error: unknown) => {
+      if (isMissingFileError(error)) {
+        return undefined;
+      }
+      throw error;
+    },
+  );
+  if (!stats) {
+    return;
+  }
+
+  if (
+    !stats.isFile() ||
+    stats.isSymbolicLink() ||
+    stats.nlink !== 1n ||
+    !hasComparableFileIdentity(stats as FileIdentity, platform)
+  ) {
+    throw new TransactionError(
+      "rollback-failed",
+      "The restore target is not a safely identifiable regular file.",
+    );
+  }
+
+  if (platform !== "win32" || stats.ino !== 0n) {
+    await unlink(path);
+    return;
+  }
+
+  const nativeIdentity = snapshotTransactionWindowsIdentity(
+    readOwnDataProperty(stats, "windowsFileIdentity"),
+  );
+  if (!nativeIdentity) {
+    throw new TransactionError(
+      "rollback-failed",
+      "The restore target has no verifiable Windows file identity.",
+    );
+  }
+  const operations = fileIdentityOptions?.windowsFileOperations ?? createWindowsFileOperations();
+  let result: "deleted" | "identity-mismatch";
+  try {
+    result = operations.deleteFileIfMatches(path, nativeIdentity);
+  } catch (error: unknown) {
+    throw new TransactionError(
+      "rollback-failed",
+      "The restore target could not be safely deleted.",
+      { cause: error },
+    );
+  }
+  if (result === "identity-mismatch") {
+    throw new TransactionError(
+      "rollback-failed",
+      "The restore target changed before it could be safely deleted.",
+    );
   }
 }
 

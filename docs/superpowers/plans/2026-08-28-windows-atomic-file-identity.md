@@ -71,6 +71,7 @@ export interface WindowsFileIdentity {
 export interface WindowsFileOperations {
   captureFileIdentity(path: string): WindowsFileIdentity;
   deleteFileIfMatches(path: string, expected: WindowsFileIdentity): "deleted" | "identity-mismatch";
+  deleteHardLinkIfMatches?(path: string, expected: WindowsFileIdentity): "deleted" | "identity-mismatch";
   holdFileIfMatches(path: string, expected: WindowsFileIdentity): WindowsFileHold;
 }
 
@@ -154,13 +155,16 @@ GetFileInformationByHandleEx(handle, FileStandardInfo, &standard, sizeof(standar
 
 Format `id.VolumeSerialNumber` as 16 lowercase hexadecimal characters and the
 16 FileId bytes as 32 lowercase hexadecimal characters. Reject any link count
-other than one. `deleteFileIfMatches` compares this handle-derived value to
-the JavaScript expected value and only then calls
-`SetFileInformationByHandle(handle, FileDispositionInfo, ...)`. A mismatch
-returns the literal string `"identity-mismatch"`; a successful disposition
-returns `"deleted"`. The hold exports a N-API external whose finalizer closes
-both its verified config-file handle and its verified immediate-parent
-directory handle. The parent uses `FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES`,
+other than one for ordinary identity capture. `deleteFileIfMatches` compares
+this handle-derived value to the JavaScript expected value and only then calls
+`SetFileInformationByHandle(handle, FileDispositionInfo, ...)`. The dedicated
+`deleteHardLinkIfMatches` variant performs the same comparison after requiring
+exactly two current hard links, for safe deletion of a lock-handoff source.
+A mismatch returns the literal string `"identity-mismatch"`; a successful
+disposition returns `"deleted"`. The hold exports a N-API external whose
+finalizer closes both its verified config-file handle and its verified
+immediate-parent directory handle. The parent uses
+`FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES`,
 `FILE_SHARE_READ`, `FILE_FLAG_BACKUP_SEMANTICS`, and
 `FILE_FLAG_OPEN_REPARSE_POINT`; it must be a non-reparse directory. After the
 parent is held, reopen the final config path and recheck the expected native

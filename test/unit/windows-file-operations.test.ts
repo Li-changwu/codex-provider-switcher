@@ -121,6 +121,39 @@ test("uses owned immutable identity snapshots at the native binding boundary", (
   hold.close();
 });
 
+test("deletes a hard-link handoff through the dedicated native operation", () => {
+  const callerIdentity = { ...IDENTITY };
+  let receivedPath: string | undefined;
+  let receivedIdentity: WindowsFileIdentity | undefined;
+  const operations = createWindowsFileOperations({
+    platform: "win32",
+    arch: "x64",
+    extensionRoot: EXTENSION_ROOT,
+    loadBinding: () => ({
+      ...validBinding(),
+      deleteHardLinkIfMatches: (path: string, expected: WindowsFileIdentity) => {
+        receivedPath = path;
+        receivedIdentity = expected;
+        return "deleted";
+      },
+    }),
+  });
+
+  const deleteHardLinkIfMatches = (
+    operations as unknown as {
+      deleteHardLinkIfMatches(
+        path: string,
+        expected: WindowsFileIdentity,
+      ): "deleted" | "identity-mismatch";
+    }
+  ).deleteHardLinkIfMatches;
+  assert.equal(deleteHardLinkIfMatches(CONFIG_PATH, callerIdentity), "deleted");
+  assert.equal(receivedPath, CONFIG_PATH);
+  assert.notStrictEqual(receivedIdentity, callerIdentity);
+  assert.deepEqual(receivedIdentity, IDENTITY);
+  assert.ok(receivedIdentity && Object.isFrozen(receivedIdentity));
+});
+
 test("retries a failed hold release and releases no more than once after success", () => {
   const holdToken = {};
   let releases = 0;
