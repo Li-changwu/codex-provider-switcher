@@ -127,6 +127,22 @@ test("builds the Windows native addon before running Windows CI tests", async ()
   assert.ok(workflow.indexOf(windowsBuildStep) < workflow.indexOf("- run: npm test"));
 });
 
+test("runs target-specific packaging commands on both CI platforms", async () => {
+  const workflowPath = resolve(dirname(packagePath), ".github/workflows/package.yml");
+  const workflow = await readFile(workflowPath, "utf8");
+
+  assert.match(workflow, /if: matrix\.os == 'windows-latest'[\s\S]*?npm run package:win32-x64/);
+  assert.match(workflow, /if: matrix\.os == 'ubuntu-latest'[\s\S]*?npm run package:linux-x64/);
+});
+
+test("runs target-specific packaging in the CI test matrix", async () => {
+  const workflowPath = resolve(dirname(packagePath), ".github/workflows/ci.yml");
+  const workflow = await readFile(workflowPath, "utf8");
+
+  assert.match(workflow, /if: matrix\.os == 'windows-latest'[\s\S]*?npm run package:win32-x64/);
+  assert.match(workflow, /if: matrix\.os == 'ubuntu-latest'[\s\S]*?npm run package:linux-x64/);
+});
+
 test("formats the complete 64-bit Windows volume serial in native file identities", async () => {
   // Real test volumes may have a zero high half, so this source contract prevents
   // a future narrowing conversion from silently discarding it.

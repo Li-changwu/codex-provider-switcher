@@ -26,4 +26,12 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm run package
+      - if: matrix.os == 'windows-latest'
+        run: npm run package:win32-x64
+      - if: matrix.os == 'ubuntu-latest'
+        run: npm run package:linux-x64
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: codex-provider-switcher-${{ matrix.os }}
+          path: codex-provider-switcher-0.1.0@*.vsix
+          if-no-files-found: error
