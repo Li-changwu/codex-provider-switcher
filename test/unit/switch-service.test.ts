@@ -204,6 +204,81 @@ test("requires recovery when an auth mutation throws after changing auth mode be
   });
 });
 
+test("records auth application before login and refreshes evidence when auth apply fails", async () => {
+  await withLayout(async (layout) => {
+    let authMode = "official";
+    let journalPath: string | undefined;
+    const mutation: PreparedSwitchMutation = {
+      name: "auth with pre-apply evidence",
+      target: { kind: "auth", path: layout.authPath, previousMode: "official" },
+      markTargetAppliedBeforeApply: true,
+      apply: async () => {
+        authMode = "custom";
+        await rm(layout.authPath);
+        throw new Error("injected auth failure");
+      },
+      rollback: async () => undefined,
+    };
+
+    const result = await switchProfile(
+      { targetProfileId: "target" },
+      dependencies(layout, {
+        preflight: async (context) => {
+          journalPath = context.transaction.journalPath;
+        },
+        restoreAuthMode: async (target) => {
+          authMode = target.previousMode;
+        },
+        mutationPlan: {
+          rollouts: [],
+          sqlite: [],
+          commit: [mutation],
+        },
+      }),
+    );
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.journalState, "rolledBack");
+    assert.equal(authMode, "official");
+    assert.ok(journalPath);
+    const journal = await readTransactionJournal(journalPath);
+    assert.ok(journal.some((entry) => entry.appliedTargets?.some((target) => target.kind === "auth")));
+  });
+});
+
+test("rejects pre-apply target marking for non-auth mutation plans", async () => {
+  await withLayout(async (layout) => {
+    let preflightCalls = 0;
+    let applyCalls = 0;
+    const result = await switchProfile(
+      { targetProfileId: "target" },
+      dependencies(layout, {
+        preflight: async () => {
+          preflightCalls += 1;
+        },
+        mutationPlan: {
+          rollouts: [],
+          sqlite: [],
+          commit: [{
+            name: "invalid pre-apply config",
+            target: { kind: "config", path: layout.configPath },
+            markTargetAppliedBeforeApply: true,
+            apply: async () => {
+              applyCalls += 1;
+            },
+            rollback: async () => undefined,
+          }],
+        },
+      }),
+    );
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.operationId, "unstarted");
+    assert.equal(preflightCalls, 0);
+    assert.equal(applyCalls, 0);
+  });
+});
+
 test("uses the durable transaction rollback when callbacks leave config and SQLite changed", async () => {
   await withLayout(async (layout) => {
     const configMutation: PreparedSwitchMutation = {

@@ -34,6 +34,10 @@ import type { AuthJournalTarget } from "./transaction";
 import type { ProgressEvent } from "../ui/progress";
 import { throwIfProgressCancelled } from "../ui/progress";
 import type { CodexLayout, ProfileRecord } from "./types";
+import {
+  assertSuccessfulOfficialLogin,
+  type OfficialLoginExecutor,
+} from "./official-login";
 
 export interface ProfileLookup {
   get(id: string): Promise<ProfileRecord | undefined>;
@@ -55,6 +59,7 @@ export interface StoredProfileSwitchDependencies {
   profiles: ProfileLookup;
   secrets: ProfileSecretReader;
   activeProfiles: ActiveProfileState;
+  officialLogin?: OfficialLoginExecutor;
   onProgress?: (event: ProgressEvent) => void;
   mutationHooks?: {
     afterSqliteUpdate?(): void | Promise<void>;
@@ -143,6 +148,12 @@ function createStoredProfileSwitchDependencies(
         dependencies.profiles,
         request.targetProfileId,
       );
+      if (
+        target.kind === "official" &&
+        typeof dependencies.officialLogin?.run !== "function"
+      ) {
+        throw preparationError();
+      }
       const configSnapshot = await readStoredConfigSnapshot(target, dependencies.layout);
       const validated = validateStoredConfig(configSnapshot.text, target);
       const providerId = validated.providerId ?? target.providerId;
@@ -226,6 +237,9 @@ function createStoredProfileSwitchDependencies(
           {
             name: "materialize active authentication mode",
             target: materialization.priorAuthTarget,
+            ...(materialization.target.kind === "official"
+              ? { markTargetAppliedBeforeApply: true }
+              : {}),
             apply: async () => {
               if (materialization.target.kind === "custom") {
                 await writeActiveCustomAuth(
@@ -235,6 +249,12 @@ function createStoredProfileSwitchDependencies(
               } else {
                 // Native login remains wholly under codex login; no OAuth data is read or stored.
                 await removeActiveCustomAuth(dependencies.layout);
+                const executor = dependencies.officialLogin;
+                if (!executor) {
+                  throw preparationError();
+                }
+                const result = await executor.run(dependencies.layout, request.signal);
+                assertSuccessfulOfficialLogin(result);
               }
             },
             rollback: async () => undefined,

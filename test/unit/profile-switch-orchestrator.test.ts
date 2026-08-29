@@ -109,7 +109,19 @@ test("switches official and custom Profiles through config, auth, rollout, SQLit
 
     const officialResult = await switchStoredProfile(
       { targetProfileId: official.id },
-      { layout, profiles, secrets, activeProfiles: active },
+      {
+        layout,
+        profiles,
+        secrets,
+        activeProfiles: active,
+        officialLogin: {
+          run: async (officialLayout) => {
+            assert.equal(officialLayout.codexHome, layout.codexHome);
+            assert.equal((await active.get())?.profileId, custom.id);
+            return { loginExitCode: 0, statusExitCode: 0 };
+          },
+        },
+      },
     );
 
     assert.equal(officialResult.status, "committed");
@@ -118,6 +130,95 @@ test("switches official and custom Profiles through config, auth, rollout, SQLit
     assert.match(await readFile(rolloutPath, "utf8"), /"openai"/);
     assert.equal(await readProvider(layout.sqlitePath), "openai");
     assert.equal((await active.get())?.profileId, official.id);
+  });
+});
+
+test("rolls back an official switch when native login is not verified", async () => {
+  await withFixture(async ({ layout, profiles, secrets, active, official, custom }) => {
+    const customResult = await switchStoredProfile(
+      { targetProfileId: custom.id },
+      { layout, profiles, secrets, activeProfiles: active },
+    );
+    assert.equal(customResult.status, "committed");
+    const configBefore = await readFile(layout.configPath, "utf8");
+    const authBefore = await readFile(layout.authPath, "utf8");
+
+    const result = await switchStoredProfile(
+      { targetProfileId: official.id },
+      {
+        layout,
+        profiles,
+        secrets,
+        activeProfiles: active,
+        officialLogin: {
+          run: async () => ({
+            loginExitCode: 1,
+            statusExitCode: undefined,
+          }),
+        },
+      },
+    );
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.journalState, "rolledBack");
+    assert.equal(await readFile(layout.configPath, "utf8"), configBefore);
+    assert.equal(await readFile(layout.authPath, "utf8"), authBefore);
+    assert.equal((await active.get())?.profileId, custom.id);
+    assert.doesNotMatch(JSON.stringify(result), /fixture-custom-api-key/);
+  });
+});
+
+test("rolls back an official switch after native login cancellation", async () => {
+  await withFixture(async ({ layout, profiles, secrets, active, official, custom }) => {
+    const customResult = await switchStoredProfile(
+      { targetProfileId: custom.id },
+      { layout, profiles, secrets, activeProfiles: active },
+    );
+    assert.equal(customResult.status, "committed");
+    const controller = new AbortController();
+    const result = await switchStoredProfile(
+      { targetProfileId: official.id, signal: controller.signal },
+      {
+        layout,
+        profiles,
+        secrets,
+        activeProfiles: active,
+        officialLogin: {
+          run: async () => {
+            controller.abort();
+            return {
+              loginExitCode: 130,
+              statusExitCode: undefined,
+              cancelled: true,
+            };
+          },
+        },
+      },
+    );
+
+    assert.equal(result.status, "cancelled");
+    assert.equal(result.journalState, "rolledBack");
+    assert.equal((await active.get())?.profileId, custom.id);
+    assert.doesNotMatch(JSON.stringify(result), /fixture-custom-api-key/);
+  });
+});
+
+test("fails closed before an official switch when no login executor is provided", async () => {
+  await withFixture(async ({ layout, profiles, secrets, active, official, custom }) => {
+    const customResult = await switchStoredProfile(
+      { targetProfileId: custom.id },
+      { layout, profiles, secrets, activeProfiles: active },
+    );
+    assert.equal(customResult.status, "committed");
+
+    const result = await switchStoredProfile(
+      { targetProfileId: official.id },
+      { layout, profiles, secrets, activeProfiles: active },
+    );
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.journalState, "rolledBack");
+    assert.equal((await active.get())?.profileId, custom.id);
   });
 });
 
@@ -359,6 +460,9 @@ test("reconciles a failed active marker acknowledgement before a later rollback 
         profiles,
         secrets,
         activeProfiles: flakyActive,
+        officialLogin: {
+          run: async () => ({ loginExitCode: 0, statusExitCode: 0 }),
+        },
         mutationHooks: {
           afterSqliteUpdate: () => {
             throw new Error("injected ordinary mutation failure");
