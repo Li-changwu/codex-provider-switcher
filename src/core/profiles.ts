@@ -22,6 +22,7 @@ import {
 import {
   createWindowsFileOperations,
   type WindowsFileIdentity,
+  type WindowsFileHold,
 } from "./windows-file-operations";
 import {
   parseAndValidateProfileConfig,
@@ -151,6 +152,11 @@ interface TrustedProfileConfig {
   readonly path: string;
 }
 
+interface ProfilePublicationHoldTarget {
+  readonly path: string;
+  readonly expectedStats: ProfileFileIdentityStats;
+}
+
 type ProfileFileIdentityStats = BigIntStats & FileIdentity;
 
 export class ProfileStore {
@@ -212,6 +218,10 @@ export class ProfileStore {
             config,
             reservation.directory,
           ),
+          {
+            path: profile.configFile,
+            expectedStats: config,
+          },
         );
       } catch {
         throw profileRollbackError(
@@ -303,6 +313,10 @@ export class ProfileStore {
             2,
           )}\n`,
           () => this.assertTrustedProfileConfigIdentity(current.id, config),
+          {
+            path: updated.configFile,
+            expectedStats: config,
+          },
         );
       } catch {
         throw profileRollbackError(
@@ -358,6 +372,7 @@ export class ProfileStore {
     path: string,
     contents: string,
     beforePublish?: () => Promise<void>,
+    publicationHoldTarget?: ProfilePublicationHoldTarget,
   ): Promise<ProfileFileIdentityStats> {
     await this.ensureTrustedProfileWriteTarget(path);
     const temporaryPath = join(
@@ -365,6 +380,7 @@ export class ProfileStore {
       `.${basename(path)}.tmp-${randomUUID()}`,
     );
     let temporaryStats: ProfileFileIdentityStats | undefined;
+    let publicationHoldCloseError: unknown;
     try {
       await this.fileSystem.mkdir(dirname(path));
       await this.fileSystem.writeFile(temporaryPath, contents);
@@ -390,10 +406,24 @@ export class ProfileStore {
         throw profilePersistenceError();
       }
       await beforePublish?.();
-      await this.fileSystem.rename(temporaryPath, path);
+      const publicationHold = this.acquirePublicationHold(publicationHoldTarget);
+      try {
+        await this.fileSystem.rename(temporaryPath, path);
+      } finally {
+        if (publicationHold !== undefined) {
+          try {
+            publicationHold.close();
+          } catch (error: unknown) {
+            publicationHoldCloseError = error;
+          }
+        }
+      }
       const published = await lstatBigIntWithFileIdentity(path, this.fileIdentityOptions);
       if (!isSafeProfileFile(published) || !sameProfileFileIdentity(temporaryStats, published)) {
         throw profilePersistenceError();
+      }
+      if (publicationHoldCloseError !== undefined) {
+        throw publicationHoldCloseError;
       }
       return published;
     } catch (error: unknown) {
@@ -403,7 +433,24 @@ export class ProfileStore {
       } catch (error: unknown) {
         cleanupError = error;
       }
+      if (publicationHoldCloseError !== undefined) {
+        if (cleanupError === undefined) {
+          cleanupError = publicationHoldCloseError;
+        } else {
+          cleanupError = new AggregateError(
+            [publicationHoldCloseError, cleanupError],
+            "Profile publication hold and temporary cleanup both failed.",
+          );
+        }
+      }
       if (cleanupError !== undefined) {
+        if (error === publicationHoldCloseError && cleanupError === publicationHoldCloseError) {
+          throw new ProfileStoreError(
+            "rollback-failed",
+            "Could not release a Profile publication hold.",
+            { cause: error },
+          );
+        }
         throw new ProfileStoreError(
           "rollback-failed",
           "Could not clean up temporary profile data.",
@@ -424,6 +471,29 @@ export class ProfileStore {
         { cause: error },
       );
     }
+  }
+
+  private acquirePublicationHold(
+    target: ProfilePublicationHoldTarget | undefined,
+  ): WindowsFileHold | undefined {
+    if (
+      target === undefined ||
+      this.platform !== "win32" ||
+      !isZeroProfileInode(target.expectedStats.ino)
+    ) {
+      return undefined;
+    }
+
+    let expectedWindowsIdentity: WindowsFileIdentity;
+    try {
+      expectedWindowsIdentity = requireProfileWindowsFileIdentity(target.expectedStats);
+    } catch {
+      throw profilePersistenceError();
+    }
+    return resolveProfileWindowsFileOperations(this.fileIdentityOptions).holdFileIfMatches(
+      target.path,
+      expectedWindowsIdentity,
+    );
   }
 
   private async writeNewConfigExclusively(

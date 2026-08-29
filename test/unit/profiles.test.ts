@@ -2012,6 +2012,117 @@ test("uses exclusive config creation, atomic index renames, and Linux 0600 file 
   });
 });
 
+test("holds a zero-inode Windows config while creating and updating its index", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows config publication holds require Windows.");
+    return;
+  }
+  await withZeroInodeProfileStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const fileSystem = new RecordingProfileFileSystem();
+      const windowsFileOperations = new RecordingWindowsFileOperations();
+      const store = new ProfileStore(layout, {
+        fileSystem,
+        fileIdentityOptions: zeroInodeProfileIdentityOptions(windowsFileOperations),
+      });
+      const indexPath = join(layout.switcherDir, "profiles", "index.json");
+      const publicationStates: number[] = [];
+      fileSystem.renameHook = async (_from, to) => {
+        if (to === indexPath) {
+          publicationStates.push(windowsFileOperations.activeHolds);
+        }
+      };
+
+      const created = await store.create({
+        name: "Held Config",
+        kind: "official",
+        configText: 'model_provider = "openai"\n',
+      });
+      await store.update(created.id, {
+        name: "Held Config Updated",
+        kind: "official",
+        configText: 'model_provider = "updated"\n',
+      });
+
+      assert.deepEqual(publicationStates, [1, 1]);
+      assert.equal(windowsFileOperations.activeHolds, 0);
+      assert.equal(windowsFileOperations.holdRequests.length, 2);
+      assert.equal(await readFile(indexPath, "utf8").then((value) => value.includes("Held Config Updated")), true);
+    });
+  });
+});
+
+test("closes a zero-inode Windows config hold when index rename fails", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows config publication holds require Windows.");
+    return;
+  }
+  await withZeroInodeProfileStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const fileSystem = new FailingIndexProfileFileSystem();
+      const windowsFileOperations = new RecordingWindowsFileOperations();
+      const store = new ProfileStore(layout, {
+        fileSystem,
+        fileIdentityOptions: zeroInodeProfileIdentityOptions(windowsFileOperations),
+      });
+
+      await assert.rejects(
+        () => store.create({
+          name: "Held Rename Failure",
+          kind: "official",
+          configText: 'model_provider = "openai"\n',
+        }),
+        (error: unknown) => error instanceof ProfileStoreError && error.code === "rollback-failed",
+      );
+      assert.equal(windowsFileOperations.holdRequests.length, 1);
+      assert.equal(windowsFileOperations.activeHolds, 0);
+    });
+  });
+});
+
+test("rejects a zero-inode Windows config replacement before publication hold", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows config publication holds require Windows.");
+    return;
+  }
+  await withZeroInodeProfileStats(async () => {
+    await withTemporaryLayout(async (layout) => {
+      const configPath = join(
+        layout.switcherDir,
+        "profiles",
+        "held-replacement",
+        "config.toml",
+      );
+      const externalPath = join(layout.codexHome, "held-external-config.toml");
+      const externalContents = 'model_provider = "external"\n';
+      await writeFile(externalPath, externalContents, "utf8");
+      const fileSystem = new RecordingProfileFileSystem();
+      const windowsFileOperations = new RecordingWindowsFileOperations([], (path) => {
+        if (path === configPath) {
+          writeFileSync(configPath, externalContents, "utf8");
+          throw new Error("config replaced before publication hold");
+        }
+      });
+      const store = new ProfileStore(layout, {
+        fileSystem,
+        fileIdentityOptions: zeroInodeProfileIdentityOptions(windowsFileOperations),
+      });
+
+      await assert.rejects(
+        () => store.create({
+          name: "Held Replacement",
+          kind: "official",
+          configText: 'model_provider = "openai"\n',
+        }),
+        (error: unknown) => error instanceof ProfileStoreError && error.code === "rollback-failed",
+      );
+      assert.equal(await readFile(configPath, "utf8"), externalContents);
+      assert.equal(fileSystem.renames.some(({ to }) => to.endsWith("index.json")), false);
+      assert.equal(windowsFileOperations.activeHolds, 0);
+    });
+  });
+});
+
 test("wraps profile directory access errors without writing profile files", async () => {
   await withTemporaryLayout(async (layout) => {
     const fileSystem = new FailingMkdirProfileFileSystem();
@@ -2487,8 +2598,20 @@ function nativeProfileWindowsFileOperations(): WindowsFileOperations {
       unlinkSync(path);
       return "deleted";
     },
-    holdFileIfMatches() {
-      throw new Error("unused");
+    holdFileIfMatches(path, expected) {
+      const current = captureProfileWindowsFileIdentity(path);
+      if (!sameProfileWindowsFileIdentity(current, expected)) {
+        throw new Error("identity mismatch");
+      }
+      let closed = false;
+      return {
+        close() {
+          if (closed) {
+            return;
+          }
+          closed = true;
+        },
+      };
     },
   };
 }
@@ -2508,15 +2631,23 @@ type WindowsDeleteRule = WindowsReplacementRule | WindowsDeleteFailureRule;
 class RecordingWindowsFileOperations implements WindowsFileOperations {
   readonly capturedPaths: string[] = [];
   readonly capturesAfterDeleteFailure: string[] = [];
+  readonly holdRequests: Array<{
+    path: string;
+    expected: WindowsFileIdentity;
+  }> = [];
   readonly deleteRequests: Array<{
     path: string;
     expected: WindowsFileIdentity;
   }> = [];
   readonly replacements: Array<{ path: string; contents: string }> = [];
+  activeHolds = 0;
   private readonly processedRules = new Set<WindowsDeleteRule>();
   private deleteFailureObserved = false;
 
-  constructor(private readonly deletionRules: readonly WindowsDeleteRule[] = []) {}
+  constructor(
+    private readonly deletionRules: readonly WindowsDeleteRule[] = [],
+    private readonly holdHook?: (path: string) => void,
+  ) {}
 
   captureFileIdentity(path: string): WindowsFileIdentity {
     this.capturedPaths.push(path);
@@ -2567,8 +2698,28 @@ class RecordingWindowsFileOperations implements WindowsFileOperations {
     return "deleted";
   }
 
-  holdFileIfMatches(): never {
-    throw new Error("unused");
+  holdFileIfMatches(
+    path: string,
+    expected: WindowsFileIdentity,
+  ): { close: () => void } {
+    this.holdHook?.(path);
+    const expectedSnapshot = snapshotProfileWindowsFileIdentity(expected);
+    const current = captureProfileWindowsFileIdentity(path);
+    if (!sameProfileWindowsFileIdentity(current, expectedSnapshot)) {
+      throw new Error("identity mismatch");
+    }
+    this.holdRequests.push({ path, expected: expectedSnapshot });
+    this.activeHolds += 1;
+    let closed = false;
+    return {
+      close: () => {
+        if (closed) {
+          return;
+        }
+        closed = true;
+        this.activeHolds -= 1;
+      },
+    };
   }
 }
 
@@ -2632,6 +2783,7 @@ class RecordingProfileFileSystem implements ProfileFileSystem {
   readonly renames: Array<{ from: string; to: string }> = [];
   readonly chmods: Array<{ path: string; mode: number }> = [];
   readonly unlinked: string[] = [];
+  renameHook?: (from: string, to: string) => void | Promise<void>;
 
   async mkdir(path: string): Promise<void> {
     await mkdir(path, { recursive: true });
@@ -2666,6 +2818,7 @@ class RecordingProfileFileSystem implements ProfileFileSystem {
 
   async rename(from: string, to: string): Promise<void> {
     this.renames.push({ from, to });
+    await this.renameHook?.(from, to);
     await rename(from, to);
   }
 
