@@ -26,7 +26,32 @@ test("resume creates one visible terminal scoped to the active Codex Home", asyn
   assert.deepEqual(harness.commands, []);
   assert.equal(harness.shellIntegrationListenerCount, 0);
   assert.equal(harness.endListenerCount, 0);
+  assert.equal(harness.disposeCalls, 0);
   assert.deepEqual(harness.forkCalls, []);
+});
+
+test("disposes a resume terminal when showing it throws", async () => {
+  const failure = new Error("show failed");
+  const harness = createHarness({ showError: failure });
+  const adapter = createNativeContinuationTerminal(harness.api, layout(), {
+    forkNativeCodexThread: harness.fork,
+  });
+
+  await assert.rejects(adapter.launch(invocation("resume", "source-1")), failure);
+  assert.equal(harness.disposeCalls, 1);
+  assert.deepEqual(harness.sent, []);
+});
+
+test("disposes a resume terminal when sending its command throws", async () => {
+  const failure = new Error("send failed");
+  const harness = createHarness({ sendError: failure });
+  const adapter = createNativeContinuationTerminal(harness.api, layout(), {
+    forkNativeCodexThread: harness.fork,
+  });
+
+  await assert.rejects(adapter.launch(invocation("resume", "source-1")), failure);
+  assert.equal(harness.disposeCalls, 1);
+  assert.deepEqual(harness.sent, []);
 });
 
 test("archive waits for its matching Shell Integration execution end before reporting success", async () => {
@@ -329,6 +354,8 @@ interface HarnessOptions {
   readonly exitCodes?: readonly number[];
   readonly forkError?: Error;
   readonly shellIntegration?: boolean;
+  readonly sendError?: Error;
+  readonly showError?: Error;
 }
 
 function createHarness(options: HarnessOptions = {}) {
@@ -369,9 +396,15 @@ function createHarness(options: HarnessOptions = {}) {
   const terminal: FakeTerminal = {
     shellIntegration: options.shellIntegration === false ? undefined : shell,
     show() {
+      if (options.showError) {
+        throw options.showError;
+      }
       showCalls += 1;
     },
     sendText(text, shouldExecute) {
+      if (options.sendError) {
+        throw options.sendError;
+      }
       sent.push({ text, shouldExecute });
     },
     dispose() {

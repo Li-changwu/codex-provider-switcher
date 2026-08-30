@@ -101,11 +101,17 @@ export function createNativeContinuationTerminal(
         cwd: layout.codexHome,
         env: { CODEX_HOME: layout.codexHome },
       });
-      terminal.show(true);
       if (invocation.args[0] === "resume") {
-        terminal.sendText([invocation.command, ...invocation.args].join(" "), true);
-        return {};
+        try {
+          terminal.show(true);
+          terminal.sendText([invocation.command, ...invocation.args].join(" "), true);
+          return {};
+        } catch (error: unknown) {
+          terminal.dispose();
+          throw error;
+        }
       }
+      terminal.show(true);
       const archiveAction: "archive" | "unarchive" = invocation.args[0] === "archive"
         ? "archive"
         : "unarchive";

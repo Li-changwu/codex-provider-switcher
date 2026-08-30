@@ -120,6 +120,31 @@ test("fails closed when continuation source metadata is missing or malformed", a
   }
 });
 
+test("rejects unsafe continuation session IDs with a redacted validation error", async () => {
+  const unsafeSessionIds = ["../escape", "nested/session", "-help", "session id", ""];
+
+  for (const [index, sessionId] of unsafeSessionIds.entries()) {
+    await withLayout(async (layout) => {
+      const path = join(layout.sessionsDir, `unsafe-${index}.jsonl`);
+      const transcript = `unsafe-session-transcript-${index}`;
+      const content = `${sessionMetaLine(sessionId, "openai")}\n${messageLineWithText(transcript)}\n`;
+      await writeFile(path, content, "utf8");
+
+      await assert.rejects(
+        () => listContinuationSourceAnchors(layout),
+        (error: unknown) => {
+          if (!(error instanceof RolloutValidationError)) {
+            return false;
+          }
+          assert.equal(error.message.includes(path), false);
+          assert.equal(error.message.includes(transcript), false);
+          return error.code === "missing-session-id";
+        },
+      );
+    });
+  }
+});
+
 test("redacts missing continuation anchor metadata failures", async () => {
   await withLayout(async (layout) => {
     const path = join(layout.sessionsDir, "missing-anchor-fixture.jsonl");

@@ -14,6 +14,7 @@ import type { CodexLayout } from "./types";
 const rolloutChangeProvenance = new WeakSet<object>();
 const rolloutChangeSnapshots = new WeakMap<object, RolloutChangeSnapshot>();
 const rolloutChangeMutationAttempts = new WeakSet<object>();
+const trustedSessionIdentifierPattern = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 type ProvenancedRolloutChange = RolloutChange;
 
 /** Maximum encoded bytes in one JSONL record, excluding its LF or CRLF separator. */
@@ -403,7 +404,10 @@ async function scanContinuationSourceAnchor(
             payloadProperty.valueStart,
           );
           assertUniqueRootKeys(path, lineNumber, payloadProperties);
-          if (typeof payload.id !== "string" || payload.id.length === 0) {
+          if (
+            typeof payload.id !== "string" ||
+            !trustedSessionIdentifierPattern.test(payload.id)
+          ) {
             throw new RolloutValidationError(
               "missing-session-id",
               `Rollout session_meta has no valid payload.id: ${path}`,
