@@ -623,6 +623,7 @@ test("does not record rollout evidence when inverse validation fails", async () 
 
 test("does not invoke a failing mutation rollback callback after durable data changed", async () => {
   await withLayout(async (layout) => {
+    let recoveryRequiredPublications = 0;
     const configMutation: PreparedSwitchMutation = {
       name: "change config",
       target: { kind: "config", path: layout.configPath },
@@ -643,6 +644,15 @@ test("does not invoke a failing mutation rollback callback after durable data ch
     const result = await switchProfile(
       { targetProfileId: "target" },
       dependencies(layout, {
+        transactionIo: {
+          async renameJournal(source: string, destination: string) {
+            const records = (await readFile(source, "utf8")).trim().split("\n");
+            if (JSON.parse(records.at(-1)!).state === "recoveryRequired") {
+              recoveryRequiredPublications += 1;
+            }
+            await rename(source, destination);
+          },
+        },
         mutationPlan: {
           rollouts: [],
           sqlite: [],
@@ -653,6 +663,7 @@ test("does not invoke a failing mutation rollback callback after durable data ch
 
     assert.equal(result.status, "failed");
     assert.equal(result.journalState, "rolledBack");
+    assert.equal(recoveryRequiredPublications, 0);
     assert.equal(await readFile(layout.configPath, "utf8"), "before");
     const transactions = await readdir(join(layout.switcherDir, "transactions"), {
       withFileTypes: true,
@@ -663,6 +674,117 @@ test("does not invoke a failing mutation rollback callback after durable data ch
       join(layout.switcherDir, "transactions", operation.name, "journal.jsonl"),
     );
     assert.equal(journal.at(-1)?.state, "rolledBack");
+  });
+});
+
+test("retries recoveryRequired journalling after rollback fails", async () => {
+  await withLayout(async (layout) => {
+    let authMode = "official";
+    let recoveryRequiredPublications = 0;
+    const mutation: PreparedSwitchMutation = {
+      name: "remove auth then fail",
+      target: { kind: "auth", path: layout.authPath, previousMode: "official" },
+      markTargetAppliedBeforeApply: true,
+      apply: async () => {
+        authMode = "custom";
+        await rm(layout.authPath);
+        throw new Error("injected mutation failure");
+      },
+      rollback: async () => undefined,
+    };
+
+    const result = await switchProfile(
+      { targetProfileId: "target" },
+      dependencies(layout, {
+        restoreAuthMode: async () => {
+          throw new Error("restore failed");
+        },
+        transactionIo: {
+          async renameJournal(source: string, destination: string) {
+            const records = (await readFile(source, "utf8")).trim().split("\n");
+            const state = JSON.parse(records.at(-1)!).state;
+            if (state === "recoveryRequired") {
+              recoveryRequiredPublications += 1;
+              if (recoveryRequiredPublications === 1) {
+                throw new Error("injected recovery marker publication failure");
+              }
+            }
+            await rename(source, destination);
+          },
+        },
+        mutationPlan: {
+          rollouts: [],
+          sqlite: [],
+          commit: [mutation],
+        },
+      }),
+    );
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.journalState, "recoveryRequired");
+    assert.equal(recoveryRequiredPublications, 2);
+    const journal = await readTransactionJournal(join(
+      layout.switcherDir,
+      "transactions",
+      result.operationId,
+      "journal.jsonl",
+    ));
+    assert.equal(journal.at(-1)?.state, "recoveryRequired");
+    assert.equal(authMode, "custom");
+    await assert.rejects(() => access(layout.authPath), { code: "ENOENT" });
+  });
+});
+
+test("keeps recovery marker failure diagnostics bounded", async () => {
+  await withLayout(async (layout) => {
+    const sentinel = "journal-secret-detail";
+    let authMode = "official";
+    let recoveryRequiredPublications = 0;
+    const mutation: PreparedSwitchMutation = {
+      name: "remove auth then fail",
+      target: { kind: "auth", path: layout.authPath, previousMode: "official" },
+      markTargetAppliedBeforeApply: true,
+      apply: async () => {
+        authMode = "custom";
+        await rm(layout.authPath);
+        throw new Error("injected mutation failure");
+      },
+      rollback: async () => undefined,
+    };
+
+    const result = await switchProfile(
+      { targetProfileId: "target" },
+      dependencies(layout, {
+        restoreAuthMode: async () => {
+          throw new Error("restore failed");
+        },
+        transactionIo: {
+          async renameJournal(source: string, destination: string) {
+            const records = (await readFile(source, "utf8")).trim().split("\n");
+            if (JSON.parse(records.at(-1)!).state === "recoveryRequired") {
+              recoveryRequiredPublications += 1;
+              throw new Error(sentinel);
+            }
+            await rename(source, destination);
+          },
+        },
+        mutationPlan: {
+          rollouts: [],
+          sqlite: [],
+          commit: [mutation],
+        },
+      }),
+    );
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.journalState, "recoveryRequired");
+    assert.doesNotMatch(JSON.stringify(result), new RegExp(sentinel));
+    assert.equal(authMode, "custom");
+    await assert.rejects(() => access(layout.authPath), { code: "ENOENT" });
+
+    const followup = await beginTransaction(layout, { operationId: "after-marker-retry" });
+    await followup.release();
+    assert.equal(recoveryRequiredPublications, 2);
   });
 });
 

@@ -502,10 +502,11 @@ async function rollbackAfterFailure(
     return { state: "rolledBack", errors };
   }
 
-  if (!durableRollbackFailed) {
+  if (durableRollbackFailed) {
     try {
       await transaction.markRecoveryRequired();
-    } catch {
+    } catch (error: unknown) {
+      errors.push(error);
       // The result must remain bounded even if the journal cannot record it.
     }
   }
