@@ -15,7 +15,7 @@ test("resume creates one visible terminal scoped to the active Codex Home", asyn
 
   const result = await adapter.launch(invocation("resume", "source-1"));
 
-  assert.deepEqual(result, { exitCode: 0 });
+  assert.deepEqual(result, {});
   assert.deepEqual(harness.options, [{
     name: "Codex: Resume source-1",
     cwd: "/home/ada/.codex",
@@ -23,7 +23,75 @@ test("resume creates one visible terminal scoped to the active Codex Home", asyn
   }]);
   assert.equal(harness.showCalls, 1);
   assert.deepEqual(harness.sent, [{ text: "codex resume source-1", shouldExecute: true }]);
+  assert.deepEqual(harness.commands, []);
+  assert.equal(harness.shellIntegrationListenerCount, 0);
+  assert.equal(harness.endListenerCount, 0);
   assert.deepEqual(harness.forkCalls, []);
+});
+
+test("archive waits for its matching Shell Integration execution end before reporting success", async () => {
+  const harness = createHarness({ deferCommandEnd: true });
+  const adapter = createNativeContinuationTerminal(harness.api, layout(), {
+    forkNativeCodexThread: harness.fork,
+    shellIntegrationTimeoutMs: 20,
+  });
+
+  const resultPromise = adapter.launch(invocation("archive", "source-1"));
+  assert.equal(await isSettled(resultPromise), false);
+  await harness.commandStarted;
+  assert.deepEqual(harness.commands, [["codex", ["archive", "source-1"]]]);
+  assert.deepEqual(harness.sent, []);
+  assert.deepEqual(harness.options, [{
+    name: "Codex: Archive source-1",
+    cwd: "/home/ada/.codex",
+    env: { CODEX_HOME: "/home/ada/.codex" },
+  }]);
+  assert.equal(harness.showCalls, 1);
+  harness.finishLatestCommand(0);
+
+  assert.deepEqual(await resultPromise, { exitCode: 0 });
+  assert.equal(harness.shellIntegrationListenerCount, 0);
+  assert.equal(harness.endListenerCount, 0);
+});
+
+test("unarchive returns the exit code from its matching Shell Integration execution", async () => {
+  const harness = createHarness({ exitCodes: [23] });
+  const adapter = createNativeContinuationTerminal(harness.api, layout(), {
+    forkNativeCodexThread: harness.fork,
+  });
+
+  const result = await adapter.launch(invocation("unarchive", "source-1"));
+
+  assert.deepEqual(result, { exitCode: 23 });
+  assert.deepEqual(harness.commands, [["codex", ["unarchive", "source-1"]]]);
+  assert.deepEqual(harness.sent, []);
+  assert.equal(harness.endListenerCount, 0);
+});
+
+test("returns a nonzero archive execution exit code instead of reporting success", async () => {
+  const harness = createHarness({ exitCodes: [7] });
+  const adapter = createNativeContinuationTerminal(harness.api, layout(), {
+    forkNativeCodexThread: harness.fork,
+  });
+
+  const result = await adapter.launch(invocation("archive", "source-1"));
+
+  assert.deepEqual(result, { exitCode: 7 });
+  assert.deepEqual(harness.commands, [["codex", ["archive", "source-1"]]]);
+});
+
+test("fails closed and removes listeners when Shell Integration is unavailable", async () => {
+  const harness = createHarness({ shellIntegration: false });
+  const adapter = createNativeContinuationTerminal(harness.api, layout(), {
+    forkNativeCodexThread: harness.fork,
+    shellIntegrationTimeoutMs: 5,
+  });
+
+  await assert.rejects(adapter.launch(invocation("archive", "source-1")), /shell integration/i);
+
+  assert.deepEqual(harness.commands, []);
+  assert.equal(harness.shellIntegrationListenerCount, 0);
+  assert.equal(harness.endListenerCount, 0);
 });
 
 test("fork delegates to the native fork client without creating a terminal", async () => {
@@ -101,6 +169,20 @@ test("rejects token-safe non-Codex terminal commands without creating a terminal
   assert.deepEqual(harness.forkCalls, []);
 });
 
+test("rejects option-like session IDs for terminal and fork actions without side effects", async () => {
+  for (const operation of ["resume", "fork"] as const) {
+    const harness = createHarness();
+    const adapter = createNativeContinuationTerminal(harness.api, layout(), {
+      forkNativeCodexThread: harness.fork,
+    });
+
+    await assert.rejects(adapter.launch(invocation(operation, "--help")));
+    assert.deepEqual(harness.options, []);
+    assert.deepEqual(harness.commands, []);
+    assert.deepEqual(harness.forkCalls, []);
+  }
+});
+
 test("propagates a native fork-client failure without inventing a branch ID", async () => {
   const harness = createHarness({ forkError: new Error("client unavailable") });
   const adapter = createNativeContinuationTerminal(harness.api, layout(), {
@@ -121,11 +203,11 @@ test("reports a trustworthy fork outcome to the continuation core", () => {
   assert.equal(createNativeContinuationTerminal(harness.api, layout()).reportsForkOutcome, true);
 });
 
-function invocation(operation: "resume" | "fork", sessionId: string): TerminalInvocation {
+function invocation(operation: "resume" | "fork" | "archive" | "unarchive", sessionId: string): TerminalInvocation {
   return {
     command: "codex",
     args: [operation, sessionId],
-    title: `Codex: ${operation === "resume" ? "Resume" : "Fork"} ${sessionId}`,
+    title: `Codex: ${operation[0].toUpperCase()}${operation.slice(1)} ${sessionId}`,
     shell: false,
   };
 }
@@ -142,7 +224,15 @@ function layout(): CodexLayout {
   };
 }
 
-function createHarness(options: { branchSessionId?: string; forkError?: Error } = {}) {
+interface HarnessOptions {
+  readonly branchSessionId?: string;
+  readonly deferCommandEnd?: boolean;
+  readonly exitCodes?: readonly number[];
+  readonly forkError?: Error;
+  readonly shellIntegration?: boolean;
+}
+
+function createHarness(options: HarnessOptions = {}) {
   const terminalOptions: Array<{
     name: string;
     cwd: string;
@@ -150,19 +240,45 @@ function createHarness(options: { branchSessionId?: string; forkError?: Error } 
   }> = [];
   const sent: Array<{ text: string; shouldExecute: boolean | undefined }> = [];
   const forkCalls: Array<{ sourceSessionId: string; codexHome: string }> = [];
+  const shellIntegrationEvent = new TestEvent<{ terminal: FakeTerminal; shellIntegration: FakeShell }>();
+  const executionEndEvent = new TestEvent<{ execution: FakeExecution; exitCode: number | undefined }>();
+  const commands: Array<[string, string[]]> = [];
+  const exitCodes = [...(options.exitCodes ?? [0])];
+  let executionId = 0;
+  let latestExecution: FakeExecution | undefined;
+  let commandStartedResolve!: () => void;
+  const commandStarted = new Promise<void>((resolve) => {
+    commandStartedResolve = resolve;
+  });
   let showCalls = 0;
-  const api: NativeContinuationTerminalApi = {
-    createTerminal(terminal) {
-      terminalOptions.push(terminal);
-      return {
-        show() {
-          showCalls += 1;
-        },
-        sendText(text, shouldExecute) {
-          sent.push({ text, shouldExecute });
-        },
-      };
+  const shell: FakeShell = {
+    executeCommand(executable, args) {
+      const execution = { id: ++executionId };
+      latestExecution = execution;
+      commands.push([executable, [...args]]);
+      commandStartedResolve();
+      if (!options.deferCommandEnd) {
+        queueMicrotask(() => executionEndEvent.fire({ execution, exitCode: exitCodes.shift() }));
+      }
+      return execution;
     },
+  };
+  const terminal: FakeTerminal = {
+    shellIntegration: options.shellIntegration === false ? undefined : shell,
+    show() {
+      showCalls += 1;
+    },
+    sendText(text, shouldExecute) {
+      sent.push({ text, shouldExecute });
+    },
+  };
+  const api: NativeContinuationTerminalApi = {
+    createTerminal(createdTerminalOptions) {
+      terminalOptions.push(createdTerminalOptions);
+      return terminal;
+    },
+    onDidChangeTerminalShellIntegration: (listener) => shellIntegrationEvent.subscribe(listener),
+    onDidEndTerminalShellExecution: (listener) => executionEndEvent.subscribe(listener),
   };
   const fork = async (input: { sourceSessionId: string; codexHome: string }): Promise<string> => {
     forkCalls.push(input);
@@ -174,6 +290,19 @@ function createHarness(options: { branchSessionId?: string; forkError?: Error } 
 
   return {
     api,
+    commandStarted,
+    get commands() {
+      return commands;
+    },
+    get endListenerCount() {
+      return executionEndEvent.listenerCount;
+    },
+    finishLatestCommand(exitCode: number | undefined) {
+      if (!latestExecution) {
+        throw new Error("No Shell Integration command was started.");
+      }
+      executionEndEvent.fire({ execution: latestExecution, exitCode });
+    },
     get forkCalls() {
       return forkCalls;
     },
@@ -187,5 +316,48 @@ function createHarness(options: { branchSessionId?: string; forkError?: Error } 
     get showCalls() {
       return showCalls;
     },
+    get shellIntegrationListenerCount() {
+      return shellIntegrationEvent.listenerCount;
+    },
   };
+}
+
+interface FakeExecution {
+  readonly id: number;
+}
+
+interface FakeShell {
+  executeCommand(executable: string, args: string[]): FakeExecution;
+}
+
+interface FakeTerminal {
+  readonly shellIntegration: FakeShell | undefined;
+  show(preserveFocus?: boolean): void;
+  sendText(text: string, shouldExecute?: boolean): void;
+}
+
+class TestEvent<Event> {
+  private readonly listeners = new Set<(event: Event) => void>();
+
+  get listenerCount() {
+    return this.listeners.size;
+  }
+
+  subscribe(listener: (event: Event) => void): { dispose(): void } {
+    this.listeners.add(listener);
+    return { dispose: () => this.listeners.delete(listener) };
+  }
+
+  fire(event: Event): void {
+    for (const listener of [...this.listeners]) {
+      listener(event);
+    }
+  }
+}
+
+async function isSettled(promise: Promise<unknown>): Promise<boolean> {
+  return await Promise.race([
+    promise.then(() => true, () => true),
+    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5)),
+  ]);
 }

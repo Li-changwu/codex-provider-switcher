@@ -6,13 +6,29 @@ import {
 } from "./app-server-fork";
 
 const terminalArgumentPattern = /^[A-Za-z0-9._/-]+$/;
-const sessionIdentifierPattern = /^[A-Za-z0-9._-]+$/;
+const defaultShellIntegrationTimeoutMs = 30_000;
+const sessionIdentifierPattern = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const nativeCodexCommand = "codex";
 const terminalOperations = new Set(["resume", "archive", "unarchive"]);
 
 export interface NativeContinuationTerminal {
+  readonly shellIntegration: NativeContinuationShellIntegration | undefined;
   show(preserveFocus?: boolean): void;
   sendText(text: string, shouldExecute?: boolean): void;
+}
+
+export interface NativeContinuationDisposable {
+  dispose(): void;
+}
+
+export type NativeContinuationEvent<Event> = (
+  listener: (event: Event) => void,
+) => NativeContinuationDisposable;
+
+export interface NativeContinuationShellExecution {}
+
+export interface NativeContinuationShellIntegration {
+  executeCommand(executable: string, args: string[]): NativeContinuationShellExecution;
 }
 
 export interface NativeContinuationTerminalOptions {
@@ -23,6 +39,18 @@ export interface NativeContinuationTerminalOptions {
 
 export interface NativeContinuationTerminalApi {
   createTerminal(options: NativeContinuationTerminalOptions): NativeContinuationTerminal;
+  onDidChangeTerminalShellIntegration: NativeContinuationEvent<NativeContinuationShellIntegrationChangeEvent>;
+  onDidEndTerminalShellExecution: NativeContinuationEvent<NativeContinuationShellExecutionEndEvent>;
+}
+
+export interface NativeContinuationShellIntegrationChangeEvent {
+  readonly terminal: NativeContinuationTerminal;
+  readonly shellIntegration: NativeContinuationShellIntegration;
+}
+
+export interface NativeContinuationShellExecutionEndEvent {
+  readonly execution: NativeContinuationShellExecution;
+  readonly exitCode: number | undefined;
 }
 
 export type NativeForkClient = (
@@ -31,6 +59,7 @@ export type NativeForkClient = (
 
 export interface NativeContinuationTerminalDependencies {
   readonly forkNativeCodexThread?: NativeForkClient;
+  readonly shellIntegrationTimeoutMs?: number;
 }
 
 export function createNativeContinuationTerminal(
@@ -39,6 +68,8 @@ export function createNativeContinuationTerminal(
   dependencies: NativeContinuationTerminalDependencies = {},
 ): InteractiveCodexTerminal {
   const forkNativeCodexThread = dependencies.forkNativeCodexThread ?? defaultForkNativeCodexThread;
+  const shellIntegrationTimeoutMs = dependencies.shellIntegrationTimeoutMs
+    ?? defaultShellIntegrationTimeoutMs;
 
   return {
     reportsForkOutcome: true,
@@ -59,10 +90,125 @@ export function createNativeContinuationTerminal(
         env: { CODEX_HOME: layout.codexHome },
       });
       terminal.show(true);
-      terminal.sendText([invocation.command, ...invocation.args].join(" "), true);
-      return { exitCode: 0 };
+      if (invocation.args[0] === "resume") {
+        terminal.sendText([invocation.command, ...invocation.args].join(" "), true);
+        return {};
+      }
+      const archiveAction: "archive" | "unarchive" = invocation.args[0] === "archive"
+        ? "archive"
+        : "unarchive";
+      const shellIntegration = await waitForShellIntegration(
+        api,
+        terminal,
+        shellIntegrationTimeoutMs,
+      );
+      return await executeTerminalCommand(
+        api,
+        shellIntegration,
+        [archiveAction, invocation.args[1]],
+      );
     },
   };
+}
+
+async function waitForShellIntegration(
+  api: NativeContinuationTerminalApi,
+  terminal: NativeContinuationTerminal,
+  timeoutMs: number,
+): Promise<NativeContinuationShellIntegration> {
+  if (terminal.shellIntegration) {
+    return terminal.shellIntegration;
+  }
+
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const integrationSubscription = api.onDidChangeTerminalShellIntegration((event) => {
+      if (event.terminal !== terminal || settled) {
+        return;
+      }
+      settle(() => resolve(event.shellIntegration));
+    });
+    const currentShellIntegration = terminal.shellIntegration;
+    if (currentShellIntegration) {
+      settle(() => resolve(currentShellIntegration));
+      return;
+    }
+    timer = setTimeout(() => {
+      settle(() => reject(new Error(
+        "Native Codex archive commands require terminal shell integration.",
+      )));
+    }, timeoutMs);
+
+    function settle(action: () => void): void {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+      integrationSubscription.dispose();
+      action();
+    }
+  });
+}
+
+async function executeTerminalCommand(
+  api: NativeContinuationTerminalApi,
+  shellIntegration: NativeContinuationShellIntegration,
+  args: ["archive" | "unarchive", string],
+): Promise<{ readonly exitCode: number }> {
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    let execution: NativeContinuationShellExecution | undefined;
+    const earlyEndEvents: NativeContinuationShellExecutionEndEvent[] = [];
+    const endSubscription = api.onDidEndTerminalShellExecution((event) => {
+      if (settled) {
+        return;
+      }
+      if (!execution) {
+        earlyEndEvents.push(event);
+        return;
+      }
+      if (event.execution === execution) {
+        settle(event.exitCode);
+      }
+    });
+    try {
+      execution = shellIntegration.executeCommand(nativeCodexCommand, args);
+      for (const event of earlyEndEvents) {
+        if (event.execution === execution) {
+          settle(event.exitCode);
+          break;
+        }
+      }
+    } catch (error: unknown) {
+      settleError(error);
+    }
+
+    function settle(exitCode: number | undefined): void {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      endSubscription.dispose();
+      if (exitCode === undefined) {
+        reject(new Error("The native Codex archive command did not report an exit code."));
+        return;
+      }
+      resolve({ exitCode });
+    }
+
+    function settleError(error: unknown): void {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      endSubscription.dispose();
+      reject(error);
+    }
+  });
 }
 
 function assertSafeInvocation(invocation: TerminalInvocation): void {
