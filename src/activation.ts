@@ -23,6 +23,7 @@ import {
 } from "./ui/commands";
 import type { ActiveProfileState, ProfileLookup } from "./core/profile-switch-orchestrator";
 import { createVscodeOfficialLoginExecutor } from "./ui/official-login-terminal";
+import { createNativeContinuationTerminal } from "./ui/native-continuation-terminal";
 
 export const commandIds = [
   "codexProvider.createProfile",
@@ -132,6 +133,13 @@ export async function activateExtensionWithStartupPrerequisites(
           onDidEndTerminalShellExecution:
             api.window.onDidEndTerminalShellExecution,
         }),
+        nativeContinuationTerminal: createNativeContinuationTerminal({
+          createTerminal: (options) => api.window.createTerminal(options),
+          onDidChangeTerminalShellIntegration:
+            api.window.onDidChangeTerminalShellIntegration,
+          onDidEndTerminalShellExecution:
+            api.window.onDidEndTerminalShellExecution,
+        }, prerequisites.layout),
         restoreAuthMode: createStartupAuthModeRestorer(prerequisites),
         refreshStatus: refresh,
       }),

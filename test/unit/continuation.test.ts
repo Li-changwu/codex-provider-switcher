@@ -169,6 +169,22 @@ test("launches native resume with an argument array after one capability check",
   });
 });
 
+test("rejects a continuation request whose session ID begins with an option marker", async () => {
+  await withLayout(async (layout) => {
+    await assert.rejects(
+      () => continueSession({
+        layout,
+        sessionId: "-help",
+        mode: "resume",
+        targetProfileId: "custom",
+        terminal: new FakeTerminal(),
+        commandRunner: successfulHelp,
+      }),
+      /session ID is invalid/i,
+    );
+  });
+});
+
 test("reuses an active fork only while the source event hash is unchanged", async () => {
   await withLayout(async (layout) => {
     clearCodexCapabilityCacheForTests();
@@ -216,6 +232,52 @@ test("reuses an active fork only while the source event hash is unchanged", asyn
     );
     const state = await readFile(join(layout.switcherDir, "state.sqlite"));
     assert.doesNotMatch(state.toString("utf8"), /source revision|readable context/i);
+  });
+});
+
+test("rejects a stale reusable mapping before resuming its branch", async () => {
+  await withLayout(async (layout) => {
+    clearCodexCapabilityCacheForTests();
+    const oldSourceEventHash = hash("source revision one");
+    const createTerminal = new FakeTerminal([{ branchSessionId: "branch-1" }]);
+
+    await continueSession({
+      layout,
+      sessionId: "source-1",
+      mode: "fork",
+      targetProfileId: "custom",
+      sourceEventHash: oldSourceEventHash,
+      terminal: createTerminal,
+      commandRunner: successfulHelp,
+    });
+
+    const before = await listBranchMappings(layout);
+    const terminal = new FakeTerminal();
+    const newSourceEventHash = hash("source revision changed");
+
+    await assert.rejects(
+      () => continueSession({
+        layout,
+        sessionId: "source-1",
+        mode: "fork",
+        targetProfileId: "custom",
+        sourceEventHash: oldSourceEventHash,
+        sourceAnchorCatalog: async () => [{
+          sessionId: "source-1",
+          sourceEventHash: newSourceEventHash,
+        }],
+        terminal,
+        commandRunner: successfulHelp,
+      }),
+      (error: unknown) => (
+        error instanceof ContinuationError &&
+        error.code === "invalid-event-hash" &&
+        !/source revision|source-1|[a-f0-9]{64}/i.test(error.message)
+      ),
+    );
+
+    assert.deepEqual(terminal.invocations, []);
+    assert.deepEqual(await listBranchMappings(layout), before);
   });
 });
 
@@ -631,6 +693,74 @@ test("fails closed when a trusted terminal does not report a fork session ID", a
       /did not report a trusted session ID/i,
     );
     assert.deepEqual(terminal.invocations.map((invocation) => invocation.args[0]), ["fork"]);
+    assert.deepEqual(await listBranchMappings(layout), []);
+  });
+});
+
+test("fails closed when the source anchor changes after capacity reservation", async () => {
+  await withLayout(async (layout) => {
+    clearCodexCapabilityCacheForTests();
+    await createActiveMappings(layout, 3);
+    const terminal = new FakeTerminal([{}, {}]);
+    const sourceEventHash = "a".repeat(64);
+    let catalogReads = 0;
+
+    await assert.rejects(
+      () => continueSession({
+        layout,
+        sessionId: "source-1",
+        mode: "fork",
+        targetProfileId: "custom",
+        sourceEventHash,
+        sourceAnchorCatalog: async () => [{
+          sessionId: "source-1",
+          sourceEventHash: catalogReads++ === 0 ? sourceEventHash : "b".repeat(64),
+        }],
+        terminal,
+        commandRunner: archiveCapableHelp,
+      }),
+      (error: unknown) => (
+        error instanceof ContinuationError &&
+        error.code === "invalid-event-hash" &&
+        !/source revision|source-1|[a-f0-9]{64}/i.test(error.message)
+      ),
+    );
+
+    assert.deepEqual(
+      terminal.invocations.map((invocation) => invocation.args[0]),
+      ["archive", "unarchive"],
+    );
+    assert.deepEqual(
+      (await listBranchMappings(layout))
+        .filter((mapping) => mapping.sourceSessionId === "source-1" && mapping.targetProfileId === "custom")
+        .map((mapping) => ({ branchSessionId: mapping.branchSessionId, status: mapping.status }))
+        .sort((left, right) => left.branchSessionId.localeCompare(right.branchSessionId)),
+      [
+        { branchSessionId: "branch-1", status: "active" },
+        { branchSessionId: "branch-2", status: "active" },
+        { branchSessionId: "branch-3", status: "active" },
+      ],
+    );
+  });
+});
+
+test("rejects a fork mapping whose branch session ID begins with an option marker", async () => {
+  await withLayout(async (layout) => {
+    clearCodexCapabilityCacheForTests();
+    const terminal = new FakeTerminal([{ branchSessionId: "-help" }]);
+
+    await assert.rejects(
+      () => continueSession({
+        layout,
+        sessionId: "source-1",
+        mode: "fork",
+        targetProfileId: "custom",
+        sourceEventHash: hash("source revision"),
+        terminal,
+        commandRunner: successfulHelp,
+      }),
+      /branch session ID is invalid/i,
+    );
     assert.deepEqual(await listBranchMappings(layout), []);
   });
 });

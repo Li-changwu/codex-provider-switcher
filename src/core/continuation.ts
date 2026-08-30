@@ -16,6 +16,7 @@ import {
   type HydrateWindowsFileIdentityOptions,
 } from "./file-identity";
 import type { CodexLayout } from "./types";
+import type { ContinuationSourceAnchor } from "./rollouts";
 
 const stateDatabaseName = "state.sqlite";
 const stateSchemaVersion = 1;
@@ -23,7 +24,7 @@ const maximumCapturedCommandOutputBytes = 64 * 1024;
 const maximumReadableFallbackBytes = 128 * 1024;
 const defaultCapabilityProbeTimeoutMs = 10_000;
 const continuationDatabaseBusyTimeoutMs = 10_000;
-const sessionIdentifierPattern = /^[A-Za-z0-9._-]+$/;
+const sessionIdentifierPattern = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const profileIdentifierPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const sha256Pattern = /^[a-f0-9]{64}$/i;
 
@@ -60,6 +61,10 @@ export type StateStoreStatementRunner = (
   params?: readonly unknown[],
 ) => Promise<void>;
 
+export type ContinuationSourceAnchorCatalog = (
+  layout: CodexLayout,
+) => Promise<readonly ContinuationSourceAnchor[]>;
+
 export interface TerminalInvocation {
   readonly command: string;
   readonly args: readonly string[];
@@ -83,6 +88,8 @@ export interface ContinueSessionRequest {
   readonly mode: ContinuationMode;
   readonly targetProfileId: string;
   readonly sourceEventHash?: string;
+  /** Revalidates the selected metadata-only anchor immediately before a native fork. */
+  readonly sourceAnchorCatalog?: ContinuationSourceAnchorCatalog;
   readonly readableFallbackPrompt?: string;
   readonly confirmReadableContent?: () => Promise<boolean>;
   readonly terminal: InteractiveCodexTerminal;
@@ -182,6 +189,7 @@ async function continueFork(
   commitCompensation: ForkCommitCompensation,
 ): Promise<ContinueSessionResult> {
   const sourceEventHash = request.sourceEventHash!;
+  await assertCurrentSourceAnchor(request);
   const existing = await store.findReusable(
     request.sessionId,
     request.targetProfileId,
@@ -217,6 +225,7 @@ async function continueFork(
   const reservation = await reserveForkCapacity(store, request, invocation, supported);
   let forkResult: Awaited<ReturnType<InteractiveCodexTerminal["launch"]>>;
   try {
+    await assertCurrentSourceAnchor(request);
     forkResult = await request.terminal.launch({
       command: invocation.command,
       args: [...invocation.prefixArgs, "fork", request.sessionId],
@@ -276,6 +285,27 @@ async function continueFork(
     sourceSessionId: request.sessionId,
     branchSessionId: forkResult.branchSessionId,
   });
+}
+
+async function assertCurrentSourceAnchor(request: ContinueSessionRequest): Promise<void> {
+  if (!request.sourceAnchorCatalog) {
+    return;
+  }
+
+  try {
+    const anchors = await request.sourceAnchorCatalog(request.layout);
+    const current = anchors.find((anchor) => anchor.sessionId === request.sessionId);
+    if (current?.sourceEventHash === request.sourceEventHash) {
+      return;
+    }
+  } catch {
+    // Normalize catalog failures to the same redacted public error as stale anchors.
+  }
+
+  throw new ContinuationError(
+    "invalid-event-hash",
+    "The selected Codex session changed before the native fork could start.",
+  );
 }
 
 async function launchReadableContentFallback(

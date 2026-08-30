@@ -24,6 +24,8 @@ On Windows volumes that report no inode data, protected file mutations use the n
 
 **Codex: Continue Session** starts native Codex resume only. Session content can be encrypted or otherwise unavailable, so there is no automatic transcript transfer or readable-content fallback without explicit caller confirmation.
 
+After a Profile switch commits, the extension may offer local source session IDs for native Codex continuation. It uses native Codex app-server fork or reuse only; it never displays, extracts, replays, or falls back to readable transcript content. The local mapping store retains at most three active branches for each source session and target Profile, using local native archive and unarchive operations as needed. Manual **Codex: Continue Session** remains native resume.
+
 ## Commands
 
 - **Codex: Create Profile**
@@ -45,6 +47,14 @@ npm run test:integration
 npm run package
 npm run package:win32-x64
 npm run package:linux-x64
+```
+
+Native continuation requires a native Codex installation with app-server support. Focused continuation checks are:
+
+```powershell
+npx tsx --test test/unit/app-server-fork.test.ts
+npx tsx --test test/unit/native-continuation-terminal.test.ts
+npx tsx --test test/integration/continuation.test.ts
 ```
 
 Keep secrets out of configuration, tests, documentation, commits, and logs. This README intentionally contains no API-key example or real credential.

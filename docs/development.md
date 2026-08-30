@@ -17,6 +17,26 @@ switching, and cloud Profile or session synchronization remain unsupported.
 Session synchronization remains local to the current Extension Host and Codex
 Home.
 
+## Native Continuation
+
+After a Profile switch has committed, the extension may offer a choice of local
+source session IDs. A new native branch obtains its ID from native Codex
+app-server `thread/fork`; an existing valid local mapping is reused with native
+`codex resume`. Continuation does not display, extract, replay, or use readable
+transcript content as a fallback. The local mapping store keeps at most three
+active branches for each source session and target Profile, applying native
+archive and unarchive retention locally when necessary. The manual
+**Codex: Continue Session** command remains native resume.
+
+Native continuation requires a native Codex installation with app-server
+support. Run these focused checks while developing it:
+
+```text
+npx tsx --test test/unit/app-server-fork.test.ts
+npx tsx --test test/unit/native-continuation-terminal.test.ts
+npx tsx --test test/integration/continuation.test.ts
+```
+
 `sqlite3` 6.0.1 requires Node 20.17 or later. The extension therefore requires
 VS Code `^1.98.0`, whose Extension Host meets that runtime baseline. Do not use
 `--ignore-scripts` in the normal setup path: it can skip installation work
