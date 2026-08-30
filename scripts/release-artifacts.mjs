@@ -1,12 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, open, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { link, lstat, open, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const checksumName = "SHA256SUMS.txt";
 const artifactStatFields = ["dev", "ino", "size", "mtimeMs", "ctimeMs", "birthtimeMs"];
-const defaultFsOps = { lstat, open, readdir, rename, rm, writeFile };
+const defaultFsOps = { link, lstat, open, readFile, readdir, realpath, rm, writeFile };
 
 export async function stageReleaseArtifacts({
   projectRoot,
@@ -79,12 +79,14 @@ export async function stageReleaseArtifacts({
 async function readReleaseArtifact({ assetName, assetPath, fsOps }) {
   const pathStats = await fsOps.lstat(assetPath);
   assertRegularNonEmptyArtifact(pathStats, assetName);
+  await assertCanonicalReleasePath(assetPath, assetName, fsOps);
 
   const noFollowFlag = process.platform === "win32" ? 0 : (constants.O_NOFOLLOW ?? 0);
   const fileHandle = await fsOps.open(assetPath, constants.O_RDONLY | noFollowFlag);
   try {
     const openedStats = await fileHandle.stat();
     assertRegularNonEmptyArtifact(openedStats, assetName);
+    await assertCanonicalReleasePath(assetPath, assetName, fsOps);
     assertSameArtifactStats(pathStats, openedStats, assetName, "between path and opened handle");
 
     const contents = await fileHandle.readFile();
@@ -96,6 +98,18 @@ async function readReleaseArtifact({ assetName, assetPath, fsOps }) {
     return contents;
   } finally {
     await fileHandle.close();
+  }
+}
+
+async function assertCanonicalReleasePath(assetPath, assetName, fsOps) {
+  if (process.platform !== "win32") {
+    return;
+  }
+  const canonicalPath = await fsOps.realpath(assetPath);
+  const resolvedPath = resolve(assetPath);
+  const resolvedCanonicalPath = resolve(canonicalPath);
+  if (resolvedPath.toLowerCase() !== resolvedCanonicalPath.toLowerCase()) {
+    throw new Error(`Release artifact path is not canonical: ${assetName}.`);
   }
 }
 
@@ -123,7 +137,8 @@ async function writeChecksumFile({ checksumPath, checksumContents, fsOps }) {
   );
   try {
     await fsOps.writeFile(temporaryPath, checksumContents, { flag: "wx" });
-    await fsOps.rename(temporaryPath, checksumPath);
+    await fsOps.link(temporaryPath, checksumPath);
+    await fsOps.rm(temporaryPath, { force: true });
   } catch (error) {
     try {
       await fsOps.rm(temporaryPath, { force: true });

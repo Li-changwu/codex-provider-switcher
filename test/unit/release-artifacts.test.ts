@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { constants } from "node:fs";
 import {
   lstat as realLstat,
   mkdir,
   mkdtemp,
+  open as realOpen,
   readFile,
   rm as realRm,
   symlink,
@@ -204,6 +206,7 @@ test("fails closed when the opened artifact identity differs from its path stat"
   const fixture = await createFixture(t, validFiles);
   let closed = false;
   let read = false;
+  let observedFlags: number | undefined;
 
   await assert.rejects(
     stageReleaseArtifacts({
@@ -211,7 +214,9 @@ test("fails closed when the opened artifact identity differs from its path stat"
       releaseDirectory: fixture.releaseDirectory,
       tag: "v0.1.0",
       fsOps: {
-        open: async () => ({
+        open: async (_path: string, flags: number) => {
+          observedFlags = flags;
+          return {
           stat: async () => ({
             dev: 1,
             ino: 2,
@@ -229,7 +234,8 @@ test("fails closed when the opened artifact identity differs from its path stat"
           close: async () => {
             closed = true;
           },
-        }),
+          };
+        },
       },
     }),
     /changed between path and opened handle/,
@@ -237,9 +243,14 @@ test("fails closed when the opened artifact identity differs from its path stat"
 
   assert.equal(read, false);
   assert.equal(closed, true);
+  assert.equal(
+    observedFlags,
+    constants.O_RDONLY |
+      (process.platform === "win32" ? 0 : (constants.O_NOFOLLOW ?? 0)),
+  );
 });
 
-test("cleans the unique checksum temporary file when atomic publish fails", async (t) => {
+test("cleans the unique checksum temporary file when hard-link publish fails", async (t) => {
   const fixture = await createFixture(t, validFiles);
   const temporaryPaths: string[] = [];
   const removedPaths: string[] = [];
@@ -254,8 +265,8 @@ test("cleans the unique checksum temporary file when atomic publish fails", asyn
           temporaryPaths.push(path);
           return writeFile(path, contents, options);
         },
-        rename: async () => {
-          throw new Error("atomic publish failed");
+        link: async () => {
+          throw new Error("hard-link publish failed");
         },
         rm: async (path: string, options: { force: boolean }) => {
           removedPaths.push(path);
@@ -263,7 +274,7 @@ test("cleans the unique checksum temporary file when atomic publish fails", asyn
         },
       },
     }),
-    /atomic publish failed/,
+    /hard-link publish failed/,
   );
 
   assert.equal(temporaryPaths.length, 1);
@@ -273,6 +284,72 @@ test("cleans the unique checksum temporary file when atomic publish fails", asyn
     realLstat(join(fixture.releaseDirectory, "SHA256SUMS.txt")),
     { code: "ENOENT" },
   );
+});
+
+test("uses no-follow flags and canonical paths for real artifact opens", async (t) => {
+  const fixture = await createFixture(t, validFiles);
+  const observedFlags: number[] = [];
+  const canonicalPathChecks: string[] = [];
+
+  await stageReleaseArtifacts({
+    projectRoot: fixture.projectRoot,
+    releaseDirectory: fixture.releaseDirectory,
+    tag: "v0.1.0",
+    fsOps: {
+      open: async (path: string, flags: number) => {
+        observedFlags.push(flags);
+        return realOpen(path, flags);
+      },
+      realpath: async (path: string) => {
+        canonicalPathChecks.push(path);
+        return path;
+      },
+    },
+  });
+
+  assert.deepEqual(observedFlags, [
+    constants.O_RDONLY |
+      (process.platform === "win32" ? 0 : (constants.O_NOFOLLOW ?? 0)),
+    constants.O_RDONLY |
+      (process.platform === "win32" ? 0 : (constants.O_NOFOLLOW ?? 0)),
+  ]);
+  if (process.platform === "win32") {
+    assert.equal(canonicalPathChecks.length, 4);
+  } else {
+    assert.equal(canonicalPathChecks.length, 0);
+  }
+});
+
+test("does not clobber a checksum created before hard-link publish", async (t) => {
+  const fixture = await createFixture(t, validFiles);
+  const checksumPath = join(fixture.releaseDirectory, "SHA256SUMS.txt");
+  const temporaryPaths: string[] = [];
+  const preexistingContents = "created concurrently\n";
+
+  await assert.rejects(
+    stageReleaseArtifacts({
+      projectRoot: fixture.projectRoot,
+      releaseDirectory: fixture.releaseDirectory,
+      tag: "v0.1.0",
+      fsOps: {
+        writeFile: async (path: string, contents: string, options: { flag: string }) => {
+          temporaryPaths.push(path);
+          return writeFile(path, contents, options);
+        },
+        link: async (temporaryPath: string, finalPath: string) => {
+          await writeFile(finalPath, preexistingContents, { flag: "wx" });
+          const error = new Error("checksum target already exists");
+          Object.assign(error, { code: "EEXIST" });
+          throw error;
+        },
+      },
+    }),
+    /checksum target already exists/,
+  );
+
+  assert.equal(temporaryPaths.length, 1);
+  assert.equal(await readFile(checksumPath, "utf8"), preexistingContents);
+  await assert.rejects(realLstat(temporaryPaths[0]), { code: "ENOENT" });
 });
 
 function sha256(contents: Buffer): string {
