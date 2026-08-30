@@ -400,6 +400,7 @@ export function createProfileCommandHandlers(
         layout: dependencies.layout,
         sessionId: anchor.sessionId,
         sourceEventHash: anchor.sourceEventHash,
+        sourceAnchorCatalog: continuationSourceAnchors,
         targetProfileId,
         mode: "fork",
         terminal: dependencies.nativeContinuationTerminal!,

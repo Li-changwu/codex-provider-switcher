@@ -651,6 +651,52 @@ test("fails closed when a trusted terminal does not report a fork session ID", a
   });
 });
 
+test("fails closed when the source anchor changes after capacity reservation", async () => {
+  await withLayout(async (layout) => {
+    clearCodexCapabilityCacheForTests();
+    await createActiveMappings(layout, 3);
+    const terminal = new FakeTerminal([{}, {}]);
+    const sourceEventHash = "a".repeat(64);
+
+    await assert.rejects(
+      () => continueSession({
+        layout,
+        sessionId: "source-1",
+        mode: "fork",
+        targetProfileId: "custom",
+        sourceEventHash,
+        sourceAnchorCatalog: async () => [{
+          sessionId: "source-1",
+          sourceEventHash: "b".repeat(64),
+        }],
+        terminal,
+        commandRunner: archiveCapableHelp,
+      }),
+      (error: unknown) => (
+        error instanceof ContinuationError &&
+        error.code === "invalid-event-hash" &&
+        !/source revision|source-1|[a-f0-9]{64}/i.test(error.message)
+      ),
+    );
+
+    assert.deepEqual(
+      terminal.invocations.map((invocation) => invocation.args[0]),
+      ["archive", "unarchive"],
+    );
+    assert.deepEqual(
+      (await listBranchMappings(layout))
+        .filter((mapping) => mapping.sourceSessionId === "source-1" && mapping.targetProfileId === "custom")
+        .map((mapping) => ({ branchSessionId: mapping.branchSessionId, status: mapping.status }))
+        .sort((left, right) => left.branchSessionId.localeCompare(right.branchSessionId)),
+      [
+        { branchSessionId: "branch-1", status: "active" },
+        { branchSessionId: "branch-2", status: "active" },
+        { branchSessionId: "branch-3", status: "active" },
+      ],
+    );
+  });
+});
+
 test("rejects a fork mapping whose branch session ID begins with an option marker", async () => {
   await withLayout(async (layout) => {
     clearCodexCapabilityCacheForTests();

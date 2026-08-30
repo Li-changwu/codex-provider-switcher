@@ -337,6 +337,7 @@ test("offers metadata-only native continuation after a committed Profile switch"
     layout: fixture.layout,
     sessionId: anchor.sessionId,
     sourceEventHash,
+    sourceAnchorCatalog: fixture.continuationSourceAnchors,
     targetProfileId: target.id,
     mode: "fork",
     terminal: nativeTerminal,
@@ -532,6 +533,9 @@ function commandFixture(options: {
     },
     set continuationSourceAnchors(value) {
       continuationSourceAnchors = value;
+    },
+    get continuationSourceAnchors() {
+      return continuationSourceAnchors;
     },
     set recoverPendingSwitches(value) {
       recoverPendingSwitches = value;

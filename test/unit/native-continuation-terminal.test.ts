@@ -75,6 +75,7 @@ test("archive waits for its matching Shell Integration execution end before repo
   harness.finishLatestCommand(0);
 
   assert.deepEqual(await resultPromise, { exitCode: 0 });
+  assert.equal(harness.disposeCalls, 1);
   assert.equal(harness.shellIntegrationListenerCount, 0);
   assert.equal(harness.endListenerCount, 0);
 });
@@ -118,6 +119,7 @@ test("unarchive returns the exit code from its matching Shell Integration execut
   assert.deepEqual(result, { exitCode: 23 });
   assert.deepEqual(harness.commands, [["codex", ["unarchive", "source-1"]]]);
   assert.deepEqual(harness.sent, []);
+  assert.equal(harness.disposeCalls, 1);
   assert.equal(harness.endListenerCount, 0);
 });
 
