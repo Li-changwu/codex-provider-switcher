@@ -7,6 +7,8 @@ import {
 
 const terminalArgumentPattern = /^[A-Za-z0-9._/-]+$/;
 const sessionIdentifierPattern = /^[A-Za-z0-9._-]+$/;
+const nativeCodexCommand = "codex";
+const terminalOperations = new Set(["resume", "archive", "unarchive"]);
 
 export interface NativeContinuationTerminal {
   show(preserveFocus?: boolean): void;
@@ -67,18 +69,18 @@ function assertSafeInvocation(invocation: TerminalInvocation): void {
   if (
     invocation.shell !== false ||
     invocation.title.trim().length === 0 ||
+    invocation.command !== nativeCodexCommand ||
     !terminalArgumentPattern.test(invocation.command) ||
-    invocation.args.length === 0 ||
-    invocation.args.some((argument) => !terminalArgumentPattern.test(argument))
+    invocation.args.length !== 2 ||
+    invocation.args.some((argument) => !terminalArgumentPattern.test(argument)) ||
+    !sessionIdentifierPattern.test(invocation.args[1])
   ) {
     throw new Error("The requested terminal invocation is unsafe.");
   }
-  if (
-    invocation.args[0] === "fork" &&
-    (invocation.args.length !== 2 || !sessionIdentifierPattern.test(invocation.args[1]))
-  ) {
-    throw new Error("The requested native fork invocation is invalid.");
+  if (invocation.args[0] === "fork" || terminalOperations.has(invocation.args[0])) {
+    return;
   }
+  throw new Error("The requested terminal invocation is unsafe.");
 }
 
 function forkSourceSessionId(invocation: TerminalInvocation): string | undefined {

@@ -62,6 +62,45 @@ test("rejects malformed or unsafe fork invocations without side effects", async 
   }
 });
 
+test("rejects a non-Codex fork command without creating a terminal or calling the fork client", async () => {
+  const harness = createHarness();
+  const adapter = createNativeContinuationTerminal(harness.api, layout(), {
+    forkNativeCodexThread: harness.fork,
+  });
+  const malformed = { ...invocation("fork", "source-1"), command: "other" };
+
+  await assert.rejects(adapter.launch(malformed));
+
+  assert.deepEqual(harness.options, []);
+  assert.deepEqual(harness.forkCalls, []);
+});
+
+test("rejects a fork invocation with extra arguments without side effects", async () => {
+  const harness = createHarness();
+  const adapter = createNativeContinuationTerminal(harness.api, layout(), {
+    forkNativeCodexThread: harness.fork,
+  });
+  const malformed = { ...invocation("fork", "source-1"), args: ["fork", "source-1", "extra"] };
+
+  await assert.rejects(adapter.launch(malformed));
+
+  assert.deepEqual(harness.options, []);
+  assert.deepEqual(harness.forkCalls, []);
+});
+
+test("rejects token-safe non-Codex terminal commands without creating a terminal", async () => {
+  const harness = createHarness();
+  const adapter = createNativeContinuationTerminal(harness.api, layout(), {
+    forkNativeCodexThread: harness.fork,
+  });
+  const malformed = { ...invocation("resume", "source-1"), command: "other" };
+
+  await assert.rejects(adapter.launch(malformed));
+
+  assert.deepEqual(harness.options, []);
+  assert.deepEqual(harness.forkCalls, []);
+});
+
 test("propagates a native fork-client failure without inventing a branch ID", async () => {
   const harness = createHarness({ forkError: new Error("client unavailable") });
   const adapter = createNativeContinuationTerminal(harness.api, layout(), {
