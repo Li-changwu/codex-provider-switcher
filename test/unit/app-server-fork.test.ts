@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import {
@@ -10,12 +12,14 @@ import {
   type ForkNativeCodexThreadInput,
 } from "../../src/ui/app-server-fork";
 
+const TEST_CODEX_HOME = join(tmpdir(), "codex-provider-switcher-fork-test", ".codex");
+
 test("sends only the native fork protocol in order and returns the response thread id", async () => {
   const harness = createHarness();
   const resultPromise = forkNativeCodexThread({
     command: "test-codex",
     sourceSessionId: "source_session-9",
-    codexHome: "C:/test/.codex",
+    codexHome: TEST_CODEX_HOME,
     spawn: harness.spawn,
     timeoutMs: 1_000,
   });
@@ -25,8 +29,8 @@ test("sends only the native fork protocol in order and returns the response thre
     command: "test-codex",
     args: ["app-server", "--listen", "stdio://"],
     options: {
-      cwd: "C:/test/.codex",
-      env: { ...process.env, CODEX_HOME: "C:/test/.codex" },
+      cwd: TEST_CODEX_HOME,
+      env: { ...process.env, CODEX_HOME: TEST_CODEX_HOME },
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
     },
@@ -595,7 +599,7 @@ function startFork(
   return forkNativeCodexThread({
     command: "test-codex",
     sourceSessionId: "source_session-9",
-    codexHome: "C:/test/.codex",
+    codexHome: TEST_CODEX_HOME,
     spawn: harness.spawn,
     timeoutMs: 1_000,
     ...overrides,
