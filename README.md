@@ -23,13 +23,16 @@ Do not install either artifact on macOS, WSL, musl Linux, or a different CPU arc
 Each release includes `SHA256SUMS.txt`. Verify the downloaded VSIX before installation:
 
 ```powershell
-Get-FileHash .\codex-provider-switcher-<version>@win32-x64.vsix -Algorithm SHA256
-Get-Content .\SHA256SUMS.txt
+$vsix = "codex-provider-switcher-<version>@win32-x64.vsix"
+$expected = (Select-String -Path .\SHA256SUMS.txt -Pattern "  $([regex]::Escape($vsix))$").Line.Split("  ")[0]
+(Get-FileHash ".\$vsix" -Algorithm SHA256).Hash.ToLowerInvariant() -eq $expected
 ```
 
 ```sh
-sha256sum -c SHA256SUMS.txt
+grep -F "  codex-provider-switcher-<version>@linux-x64.vsix" SHA256SUMS.txt | sha256sum -c -
 ```
+
+The selected command must print `True` or `OK`; otherwise, do not install the file.
 
 In VS Code, open the Extensions view, select the `...` menu, select **Install from VSIX...**, and choose the verified file. For Remote SSH, perform these steps in the connected Remote SSH window rather than a local window.
 

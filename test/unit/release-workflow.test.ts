@@ -116,6 +116,7 @@ test("README documents verified VSIX installation, Remote SSH, upgrade, and unin
 
   assert.match(readme, /GitHub Releases/);
   assert.match(readme, /SHA256SUMS\.txt/);
+  assert.match(readme, /sha256sum -c -/);
   assert.match(readme, /Install from VSIX\.\.\./);
   assert.match(readme, /Remote SSH/);
   assert.match(readme, /Upgrade/);
