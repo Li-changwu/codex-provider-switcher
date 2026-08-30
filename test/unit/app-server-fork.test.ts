@@ -210,6 +210,28 @@ test("fails closed when a fork response is not JSON-RPC 2.0", async () => {
   }
 });
 
+test("fails closed for malformed or errored JSON-RPC notifications", async () => {
+  for (const notification of [
+    { method: "server/ready", params: {} },
+    { jsonrpc: "1.0", method: "server/ready", params: {} },
+    {
+      jsonrpc: "2.0",
+      method: "server/ready",
+      params: {},
+      error: { code: -32000, message: "sensitive server diagnostic" },
+    },
+  ]) {
+    const harness = createHarness();
+    const resultPromise = startFork(harness);
+
+    await waitFor(() => harness.messages().length === 1);
+    harness.writeStdout(`${JSON.stringify(notification)}\n`);
+
+    await assertPromptlyFailsClosed(resultPromise, harness.child);
+    assert.deepEqual(harness.messages().map((message) => message.method), ["initialize"]);
+  }
+});
+
 test("fails closed when split UTF-8 bytes exceed the raw stdout limit", async () => {
   const harness = createHarness();
   const resultPromise = startFork(harness, { maxStdoutBytes: 2 });

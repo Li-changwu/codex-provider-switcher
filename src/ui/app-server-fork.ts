@@ -163,15 +163,15 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
         settle();
         return;
       }
-      if (typeof parsed.method === "string") {
-        return;
-      }
       if (parsed.jsonrpc !== "2.0") {
         settle();
         return;
       }
       if (Object.hasOwn(parsed, "error")) {
         settle();
+        return;
+      }
+      if (typeof parsed.method === "string") {
         return;
       }
       if (parsed.id !== phase || !Object.hasOwn(parsed, "result")) {
