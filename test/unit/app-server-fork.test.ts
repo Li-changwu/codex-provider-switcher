@@ -133,12 +133,51 @@ test("fails closed when stdout exceeds its bounded buffer", async () => {
   await assertFailsClosed(resultPromise, harness.child);
 });
 
+test("fails closed when complete JSONL records cumulatively exceed stdout bytes", async () => {
+  const notification = `${JSON.stringify({
+    jsonrpc: "2.0",
+    method: "server/ready",
+    params: {},
+  })}\n`;
+  const initializeResponse = `${JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    result: {},
+  })}\n`;
+  const maxStdoutBytes = Buffer.byteLength(notification) + Buffer.byteLength(initializeResponse) - 1;
+  const harness = createHarness();
+  const resultPromise = startFork(harness, { maxStdoutBytes });
+
+  assert.ok(Buffer.byteLength(notification) < maxStdoutBytes);
+  assert.ok(Buffer.byteLength(initializeResponse) < maxStdoutBytes);
+  await waitFor(() => harness.messages().length === 1);
+  harness.writeStdout(notification);
+  assert.equal(harness.child.killCalls.length, 0);
+  harness.writeStdout(initializeResponse);
+
+  await assertPromptlyFailsClosed(resultPromise, harness.child);
+  assert.deepEqual(harness.messages().map((message) => message.method), ["initialize"]);
+});
+
 test("fails closed immediately when stderr exceeds its retained byte limit", async () => {
   const harness = createHarness();
   const resultPromise = startFork(harness, { maxStderrBytes: 2 });
 
   await waitFor(() => harness.messages().length === 1);
   harness.child.stderr.write("abc");
+
+  await assertPromptlyFailsClosed(resultPromise, harness.child);
+});
+
+test("fails closed when split UTF-8 stderr bytes cumulatively exceed its limit", async () => {
+  const harness = createHarness();
+  const resultPromise = startFork(harness, { maxStderrBytes: 2 });
+
+  await waitFor(() => harness.messages().length === 1);
+  harness.child.stderr.write(Buffer.from([0xe2]));
+  harness.child.stderr.write(Buffer.from([0x82]));
+  assert.equal(harness.child.killCalls.length, 0);
+  harness.child.stderr.write(Buffer.from([0xac]));
 
   await assertPromptlyFailsClosed(resultPromise, harness.child);
 });

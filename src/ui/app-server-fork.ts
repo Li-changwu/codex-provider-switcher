@@ -63,7 +63,7 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
     let settled = false;
     let phase: 1 | 2 = 1;
     let stdoutBuffer = "";
-    let stdoutBufferedBytes = 0;
+    let totalStdoutBytes = 0;
     let retainedStderrBytes = 0;
     const retainedStderr: Buffer[] = [];
     const decoder = new StringDecoder("utf8");
@@ -87,11 +87,11 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
       }
 
       const bytes = asBuffer(chunk);
-      if (stdoutBufferedBytes + bytes.length > maxStdoutBytes) {
+      if (totalStdoutBytes + bytes.length > maxStdoutBytes) {
         settle();
         return;
       }
-      stdoutBufferedBytes += bytes.length;
+      totalStdoutBytes += bytes.length;
       stdoutBuffer += decoder.write(bytes);
       if (Buffer.byteLength(stdoutBuffer, "utf8") > maxStdoutBytes) {
         settle();
@@ -105,12 +105,6 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
         }
         let line = stdoutBuffer.slice(0, newline);
         stdoutBuffer = stdoutBuffer.slice(newline + 1);
-        const lineBytes = Buffer.byteLength(line, "utf8") + 1;
-        if (lineBytes > stdoutBufferedBytes) {
-          settle();
-          return;
-        }
-        stdoutBufferedBytes -= lineBytes;
         if (line.endsWith("\r")) {
           line = line.slice(0, -1);
         }
@@ -240,7 +234,7 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
       retainedStderr.length = 0;
       retainedStderrBytes = 0;
       stdoutBuffer = "";
-      stdoutBufferedBytes = 0;
+      totalStdoutBytes = 0;
       try {
         child.kill();
       } catch {
