@@ -3,6 +3,7 @@
   "displayName": "Codex Provider Switcher",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "publisher": "Li-changwu",
   "repository": {
     "type": "git",
