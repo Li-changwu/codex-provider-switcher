@@ -73,6 +73,21 @@ test("rejects a VSIX without required README documentation", async (context) => 
   );
 });
 
+test("rejects a VSIX without required license documentation", async (context) => {
+  const directory = await mkdtemp(join(tmpdir(), "codex-provider-switcher-vsix-"));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  const vsixPath = join(directory, "missing-license.vsix");
+  const entries = baseEntries();
+  delete entries["extension/LICENSE.txt"];
+
+  await writeVsix(vsixPath, entries);
+
+  await assert.rejects(
+    verifyVsix(vsixPath),
+    /VSIX is missing required entry: extension\/LICENSE\.txt/,
+  );
+});
+
 test("permits required README documentation in a VSIX", async (context) => {
   const directory = await mkdtemp(join(tmpdir(), "codex-provider-switcher-vsix-"));
   context.after(() => rm(directory, { recursive: true, force: true }));
@@ -525,6 +540,7 @@ function baseEntries(): Record<string, string> {
     "extension.vsixmanifest":
       '<?xml version="1.0" encoding="utf-8"?><PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011"><Metadata><Identity Id="fixture" Version="0.0.0" Publisher="fixture"/></Metadata><Installation><InstallationTarget Id="Microsoft.VisualStudio.Code"/></Installation></PackageManifest>',
     "extension/.gitignore": "node_modules/\n",
+    "extension/LICENSE.txt": "MIT License\n",
     "extension/README.md": "# Codex Provider Switcher\n",
     "extension/package.json": "{}",
     "extension/dist/extension.js": "",
