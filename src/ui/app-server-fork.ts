@@ -83,9 +83,11 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
 
   return new Promise<string>((resolve, reject) => {
     let settled = false;
+    let childClosed = false;
     let phase: "initialize" | "fork" | "terminating" = "initialize";
     let pendingThreadId: string | undefined;
     let terminationRequested = false;
+    let forceTerminationRequested = false;
     let stdoutBuffer = "";
     let totalStdoutBytes = 0;
     let totalStderrBytes = 0;
@@ -95,7 +97,15 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
 
     const onChildFailure = () => settleFailure();
     const onChildClose = () => {
+      const decoderTail = decoder.end();
+      const hasTrailingOutput = decoderTail.length > 0 || stdoutBuffer.length > 0;
+      childClosed = true;
       if (settled) {
+        finishClose();
+        return;
+      }
+      if (hasTrailingOutput) {
+        settleFailure();
         return;
       }
       if (pendingThreadId) {
@@ -263,12 +273,8 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
     }
 
     function beginTermination(): void {
-      if (timeoutHandle) {
-        clearTimeout(timeoutHandle);
-        timeoutHandle = undefined;
-      }
-      terminationGraceHandle = setTimeout(() => settleFailure(), terminationGraceTimeoutMs);
-      terminateChild();
+      clearTimeoutHandle();
+      requestTermination();
     }
 
     function settleFailure(): void {
@@ -276,10 +282,12 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
         return;
       }
       settled = true;
-      clearTimers();
-      removeListeners();
-      terminateChild();
+      clearTimeoutHandle();
+      requestTermination();
       reject(failure());
+      if (childClosed) {
+        finishClose();
+      }
     }
 
     function settleSuccess(threadId: string): void {
@@ -288,19 +296,28 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
       }
       settled = true;
       clearTimers();
-      removeListeners();
       resolve(threadId);
+      finishClose();
     }
 
-    function clearTimers(): void {
+    function clearTimeoutHandle(): void {
       if (timeoutHandle) {
         clearTimeout(timeoutHandle);
         timeoutHandle = undefined;
       }
+    }
+
+    function clearTimers(): void {
+      clearTimeoutHandle();
       if (terminationGraceHandle) {
         clearTimeout(terminationGraceHandle);
         terminationGraceHandle = undefined;
       }
+    }
+
+    function finishClose(): void {
+      clearTimers();
+      removeListeners();
     }
 
     function removeListeners(): void {
@@ -320,13 +337,32 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
       totalStdoutBytes = 0;
     }
 
-    function terminateChild(): void {
+    function requestTermination(): void {
       if (terminationRequested) {
         return;
       }
       terminationRequested = true;
+      sendSignal("SIGTERM");
+      if (!childClosed && !forceTerminationRequested) {
+        terminationGraceHandle = setTimeout(() => {
+          terminationGraceHandle = undefined;
+          forceTerminateChild();
+          settleFailure();
+        }, terminationGraceTimeoutMs);
+      }
+    }
+
+    function forceTerminateChild(): void {
+      if (forceTerminationRequested) {
+        return;
+      }
+      forceTerminationRequested = true;
+      sendSignal("SIGKILL");
+    }
+
+    function sendSignal(signal: NodeJS.Signals): void {
       try {
-        child.kill();
+        child.kill(signal);
       } catch {
         // The child may already have exited and still emit close.
       }

@@ -337,6 +337,22 @@ test("waits for child close before resolving a trusted fork id", async () => {
   assert.equal(await resultPromise, "trusted-branch_1");
 });
 
+test("fails closed when close follows a trusted fork response with trailing incomplete output", async () => {
+  for (const trailingOutput of [
+    "{\"jsonrpc\":\"2.0\",\"id\":3",
+    Buffer.from([0xe2]),
+  ]) {
+    const harness = createHarness();
+    const { resultPromise } = await startThroughForkRequest(harness);
+
+    harness.writeStdout("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"thread\":{\"id\":\"trusted-branch_1\"}}}\n");
+    harness.writeStdout(trailingOutput);
+    harness.child.emit("close", 0, null);
+
+    await assertFailsClosed(resultPromise, harness.child);
+  }
+});
+
 test("enforces output limits after a trusted fork response before close", async () => {
   const initializeResponse = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n";
   const forkResponse = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"thread\":{\"id\":\"trusted-branch_1\"}}}\n";
@@ -368,7 +384,33 @@ test("fails closed when a terminated child does not close within its grace timeo
   await waitFor(() => harness.messages().length === 3);
   harness.writeStdout("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"thread\":{\"id\":\"trusted-branch_1\"}}}\n");
 
-  await assertFailsClosed(resultPromise, harness.child);
+  await assert.rejects(resultPromise, (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.message, "Unable to obtain native Codex fork.");
+    return true;
+  });
+  assert.deepEqual(harness.child.killCalls, ["SIGTERM", "SIGKILL"]);
+});
+
+test("escalates a close-resistant child and drains stdout after the shutdown deadline", async () => {
+  const harness = createHarness();
+  const resultPromise = startFork(harness, { terminationGraceTimeoutMs: 5 });
+
+  await waitFor(() => harness.messages().length === 1);
+  harness.writeStdout("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n");
+  await waitFor(() => harness.messages().length === 3);
+  harness.writeStdout("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"thread\":{\"id\":\"trusted-branch_1\"}}}\n");
+
+  await assert.rejects(resultPromise, (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.message, "Unable to obtain native Codex fork.");
+    return true;
+  });
+  assert.deepEqual(harness.child.killCalls, ["SIGTERM", "SIGKILL"]);
+
+  harness.writeStdout("x".repeat(1024 * 1024));
+  assert.equal(harness.child.stdout.readableLength, 0);
+  harness.child.emit("close", 0, null);
 });
 
 test("guards late child and stdio errors after completion", async () => {
@@ -478,7 +520,7 @@ async function assertFailsClosed(resultPromise: Promise<string>, child: FakeChil
     assert.equal(error.message, "Unable to obtain native Codex fork.");
     return true;
   });
-  assert.equal(child.killCalls.length, 1);
+  assert.deepEqual(child.killCalls, ["SIGTERM"]);
 }
 
 async function assertPromptlyFailsClosed(resultPromise: Promise<string>, child: FakeChild): Promise<void> {
