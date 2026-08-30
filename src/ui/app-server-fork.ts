@@ -3,9 +3,11 @@ import { isAbsolute } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
 const DEFAULT_TIMEOUT_MS = 10_000;
+const DEFAULT_TERMINATION_GRACE_TIMEOUT_MS = 1_000;
 const DEFAULT_MAX_STDOUT_BYTES = 64 * 1024;
 const DEFAULT_MAX_STDERR_BYTES = 16 * 1024;
 const MAX_TIMEOUT_MS = 60_000;
+const MAX_TERMINATION_GRACE_TIMEOUT_MS = 10_000;
 const MAX_STDOUT_BYTES = 1024 * 1024;
 const MAX_STDERR_BYTES = 1024 * 1024;
 const FAILURE_MESSAGE = "Unable to obtain native Codex fork.";
@@ -39,6 +41,7 @@ export interface ForkNativeCodexThreadInput {
   readonly codexHome: string;
   readonly spawn?: AppServerSpawn;
   readonly timeoutMs?: number;
+  readonly terminationGraceTimeoutMs?: number;
   readonly maxStdoutBytes?: number;
   readonly maxStderrBytes?: number;
   readonly clientVersion?: string;
@@ -48,12 +51,18 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
   const command = input.command?.trim() || "codex";
   const clientVersion = input.clientVersion?.trim() || "0.1.0";
   const timeoutMs = boundedOption(input.timeoutMs, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+  const terminationGraceTimeoutMs = boundedOption(
+    input.terminationGraceTimeoutMs,
+    DEFAULT_TERMINATION_GRACE_TIMEOUT_MS,
+    MAX_TERMINATION_GRACE_TIMEOUT_MS,
+  );
   const maxStdoutBytes = boundedOption(input.maxStdoutBytes, DEFAULT_MAX_STDOUT_BYTES, MAX_STDOUT_BYTES);
   const maxStderrBytes = boundedOption(input.maxStderrBytes, DEFAULT_MAX_STDERR_BYTES, MAX_STDERR_BYTES);
   if (
     !isTrustedId(input.sourceSessionId)
     || !isAbsoluteCodexHome(input.codexHome)
     || timeoutMs === undefined
+    || terminationGraceTimeoutMs === undefined
     || maxStdoutBytes === undefined
     || maxStderrBytes === undefined
   ) {
@@ -74,16 +83,28 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
 
   return new Promise<string>((resolve, reject) => {
     let settled = false;
-    let phase: 1 | 2 = 1;
+    let phase: "initialize" | "fork" | "terminating" = "initialize";
+    let pendingThreadId: string | undefined;
+    let terminationRequested = false;
     let stdoutBuffer = "";
     let totalStdoutBytes = 0;
     let totalStderrBytes = 0;
     const decoder = new StringDecoder("utf8");
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    let terminationGraceHandle: ReturnType<typeof setTimeout> | undefined;
 
-    const onChildFailure = () => settle();
-    const onChildClose = () => settle();
-    const onStdioFailure = () => settle();
+    const onChildFailure = () => settleFailure();
+    const onChildClose = () => {
+      if (settled) {
+        return;
+      }
+      if (pendingThreadId) {
+        settleSuccess(pendingThreadId);
+      } else {
+        settleFailure();
+      }
+    };
+    const onStdioFailure = () => settleFailure();
     const ignoreLateError = () => undefined;
     const onStderrData = (chunk: unknown) => {
       if (settled) {
@@ -91,7 +112,7 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
       }
       const bytes = asBuffer(chunk);
       if (totalStderrBytes + bytes.length > maxStderrBytes) {
-        settle();
+        settleFailure();
         return;
       }
       totalStderrBytes += bytes.length;
@@ -103,15 +124,11 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
 
       const bytes = asBuffer(chunk);
       if (totalStdoutBytes + bytes.length > maxStdoutBytes) {
-        settle();
+        settleFailure();
         return;
       }
       totalStdoutBytes += bytes.length;
       stdoutBuffer += decoder.write(bytes);
-      if (Buffer.byteLength(stdoutBuffer, "utf8") > maxStdoutBytes) {
-        settle();
-        return;
-      }
 
       for (;;) {
         const newline = stdoutBuffer.indexOf("\n");
@@ -140,7 +157,7 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
     child.stdout.on("error", onStdioFailure);
     child.stderr.on("data", onStderrData);
     child.stderr.on("error", onStdioFailure);
-    timeoutHandle = setTimeout(() => settle(), timeoutMs);
+    timeoutHandle = setTimeout(() => settleFailure(), timeoutMs);
 
     try {
       writeRecord({
@@ -156,7 +173,7 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
         },
       });
     } catch {
-      settle();
+      settleFailure();
     }
 
     function handleLine(line: string): void {
@@ -164,16 +181,16 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
       try {
         parsed = JSON.parse(line);
       } catch {
-        settle();
+        settleFailure();
         return;
       }
 
       if (!isRecord(parsed)) {
-        settle();
+        settleFailure();
         return;
       }
       if (parsed.jsonrpc !== "2.0") {
-        settle();
+        settleFailure();
         return;
       }
       const hasMethod = Object.hasOwn(parsed, "method");
@@ -181,23 +198,39 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
       const hasResult = Object.hasOwn(parsed, "result");
       const hasError = Object.hasOwn(parsed, "error");
       if (hasMethod) {
-        if (typeof parsed.method !== "string" || hasId || hasResult || hasError) {
-          settle();
+        if (
+          typeof parsed.method !== "string"
+          || hasId
+          || hasResult
+          || hasError
+          || (Object.hasOwn(parsed, "params") && !isStructured(parsed.params))
+        ) {
+          settleFailure();
           return;
         }
         return;
       }
-      if (!hasId || parsed.id !== phase || hasResult === hasError) {
-        settle();
+      const expectedResponseId = phase === "initialize" ? 1 : phase === "fork" ? 2 : undefined;
+      if (
+        expectedResponseId === undefined
+        || !hasId
+        || parsed.id !== expectedResponseId
+        || hasResult === hasError
+      ) {
+        settleFailure();
         return;
       }
       if (hasError) {
-        settle();
+        settleFailure();
+        return;
+      }
+      if (!isStructured(parsed.result)) {
+        settleFailure();
         return;
       }
 
-      if (phase === 1) {
-        phase = 2;
+      if (phase === "initialize") {
+        phase = "fork";
         try {
           writeRecord({ jsonrpc: "2.0", method: "initialized", params: {} });
           writeRecord({
@@ -210,31 +243,67 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
             },
           });
         } catch {
-          settle();
+          settleFailure();
         }
         return;
       }
 
       const threadId = trustedThreadId(parsed.result);
       if (!threadId) {
-        settle();
+        settleFailure();
         return;
       }
-      settle(threadId);
+      phase = "terminating";
+      pendingThreadId = threadId;
+      beginTermination();
     }
 
     function writeRecord(record: object): void {
       child.stdin.write(`${JSON.stringify(record)}\n`);
     }
 
-    function settle(threadId?: string): void {
+    function beginTermination(): void {
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+        timeoutHandle = undefined;
+      }
+      terminationGraceHandle = setTimeout(() => settleFailure(), terminationGraceTimeoutMs);
+      terminateChild();
+    }
+
+    function settleFailure(): void {
       if (settled) {
         return;
       }
       settled = true;
+      clearTimers();
+      removeListeners();
+      terminateChild();
+      reject(failure());
+    }
+
+    function settleSuccess(threadId: string): void {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimers();
+      removeListeners();
+      resolve(threadId);
+    }
+
+    function clearTimers(): void {
       if (timeoutHandle) {
         clearTimeout(timeoutHandle);
+        timeoutHandle = undefined;
       }
+      if (terminationGraceHandle) {
+        clearTimeout(terminationGraceHandle);
+        terminationGraceHandle = undefined;
+      }
+    }
+
+    function removeListeners(): void {
       child.removeListener("error", onChildFailure);
       child.removeListener("close", onChildClose);
       child.stdin.removeListener("error", onStdioFailure);
@@ -249,15 +318,17 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
       totalStderrBytes = 0;
       stdoutBuffer = "";
       totalStdoutBytes = 0;
+    }
+
+    function terminateChild(): void {
+      if (terminationRequested) {
+        return;
+      }
+      terminationRequested = true;
       try {
         child.kill();
       } catch {
-        // The child may already be gone; the result remains fail-closed.
-      }
-      if (threadId) {
-        resolve(threadId);
-      } else {
-        reject(failure());
+        // The child may already have exited and still emit close.
       }
     }
   });
@@ -298,6 +369,10 @@ function asBuffer(chunk: unknown): Buffer {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isStructured(value: unknown): value is Record<string, unknown> | unknown[] {
+  return typeof value === "object" && value !== null;
 }
 
 function trustedThreadId(result: unknown): string | undefined {
