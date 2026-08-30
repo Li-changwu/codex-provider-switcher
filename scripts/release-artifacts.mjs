@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { link, lstat, open, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const checksumName = "SHA256SUMS.txt";
@@ -112,10 +112,10 @@ async function assertCanonicalReleasePath(assetPath, assetName, fsOps) {
   if (process.platform !== "win32") {
     return;
   }
+  const canonicalParentPath = await fsOps.realpath(dirname(assetPath));
   const canonicalPath = await fsOps.realpath(assetPath);
-  const resolvedPath = resolve(assetPath);
-  const resolvedCanonicalPath = resolve(canonicalPath);
-  if (resolvedPath.toLowerCase() !== resolvedCanonicalPath.toLowerCase()) {
+  const expectedCanonicalPath = join(canonicalParentPath, basename(assetPath));
+  if (expectedCanonicalPath.toLowerCase() !== canonicalPath.toLowerCase()) {
     throw new Error(`Release artifact path is not canonical: ${assetName}.`);
   }
 }

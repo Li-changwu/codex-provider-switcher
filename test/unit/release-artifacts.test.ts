@@ -314,10 +314,39 @@ test("uses no-follow flags and canonical paths for real artifact opens", async (
       (process.platform === "win32" ? 0 : (constants.O_NOFOLLOW ?? 0)),
   ]);
   if (process.platform === "win32") {
-    assert.equal(canonicalPathChecks.length, 4);
+    assert.equal(canonicalPathChecks.length, 8);
   } else {
     assert.equal(canonicalPathChecks.length, 0);
   }
+});
+
+test("accepts a Windows 8.3 alias for the artifact directory", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows canonical-path alias contract");
+    return;
+  }
+
+  const fixture = await createFixture(t, validFiles);
+  const canonicalDirectory = join(fixture.root, "expanded-release");
+  const artifactNames = new Set(Object.keys(validFiles));
+
+  await stageReleaseArtifacts({
+    projectRoot: fixture.projectRoot,
+    releaseDirectory: fixture.releaseDirectory,
+    tag: "v0.1.0",
+    fsOps: {
+      realpath: async (path: string) => {
+        if (path === fixture.releaseDirectory) {
+          return canonicalDirectory;
+        }
+        const name = path.slice(fixture.releaseDirectory.length + 1);
+        if (artifactNames.has(name)) {
+          return join(canonicalDirectory, name);
+        }
+        return path;
+      },
+    },
+  });
 });
 
 test("fails closed when a Windows artifact path changes after open", async (t) => {
@@ -339,7 +368,7 @@ test("fails closed when a Windows artifact path changes after open", async (t) =
       fsOps: {
         realpath: async (path: string) => {
           canonicalPaths.push(path);
-          return canonicalPaths.length === 1 ? path : `${path}.replaced`;
+          return canonicalPaths.length === 4 ? `${path}.replaced` : path;
         },
         open: async (path: string) => {
           const stats = await realLstat(path);
@@ -359,7 +388,7 @@ test("fails closed when a Windows artifact path changes after open", async (t) =
     /Release artifact path is not canonical/,
   );
 
-  assert.equal(canonicalPaths.length, 2);
+  assert.equal(canonicalPaths.length, 4);
   assert.equal(read, false);
   assert.equal(closed, true);
 });
