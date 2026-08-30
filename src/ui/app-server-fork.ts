@@ -342,8 +342,8 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
       if (!childClosed && !forceTerminationRequested) {
         terminationGraceHandle = setTimeout(() => {
           terminationGraceHandle = undefined;
-          forceTerminateChild();
           settleFailure();
+          forceTerminateChild();
         }, terminationGraceTimeoutMs);
       }
     }

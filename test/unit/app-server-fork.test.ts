@@ -392,6 +392,23 @@ test("fails closed when a terminated child does not close within its grace timeo
   assert.deepEqual(harness.child.killCalls, ["SIGTERM", "SIGKILL"]);
 });
 
+test("fails closed when SIGKILL synchronously closes a pending fork", async () => {
+  const harness = createHarness({ closeOnSigkill: true });
+  const resultPromise = startFork(harness, { terminationGraceTimeoutMs: 5 });
+
+  await waitFor(() => harness.messages().length === 1);
+  harness.writeStdout("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n");
+  await waitFor(() => harness.messages().length === 3);
+  harness.writeStdout("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"thread\":{\"id\":\"trusted-branch_1\"}}}\n");
+
+  await assert.rejects(resultPromise, (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.message, "Unable to obtain native Codex fork.");
+    return true;
+  });
+  assert.deepEqual(harness.child.killCalls, ["SIGTERM", "SIGKILL"]);
+});
+
 test("escalates a close-resistant child and drains stdout after the shutdown deadline", async () => {
   const harness = createHarness();
   const resultPromise = startFork(harness, { terminationGraceTimeoutMs: 5 });
@@ -494,8 +511,8 @@ interface SpawnCall {
   options: AppServerSpawnOptions;
 }
 
-function createHarness() {
-  const child = new FakeChild();
+function createHarness(options: { closeOnSigkill?: boolean } = {}) {
+  const child = new FakeChild(options.closeOnSigkill);
   const calls: SpawnCall[] = [];
   const spawn: AppServerSpawn = (command, args, options) => {
     calls.push({
@@ -607,7 +624,7 @@ class FakeChild extends EventEmitter implements AppServerChild {
   readonly killCalls: Array<NodeJS.Signals | number | undefined> = [];
   written = "";
 
-  constructor() {
+  constructor(private readonly closeOnSigkill = false) {
     super();
     this.stdin.on("data", (chunk: Buffer) => {
       this.written += chunk.toString("utf8");
@@ -616,6 +633,9 @@ class FakeChild extends EventEmitter implements AppServerChild {
 
   kill(signal?: NodeJS.Signals | number): boolean {
     this.killCalls.push(signal);
+    if (signal === "SIGKILL" && this.closeOnSigkill) {
+      this.emit("close", 0, null);
+    }
     return true;
   }
 }
