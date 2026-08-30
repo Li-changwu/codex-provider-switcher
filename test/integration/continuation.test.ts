@@ -1,30 +1,42 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { EventEmitter } from "node:events";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
+import sqlite3 from "sqlite3";
 import {
   clearCodexCapabilityCacheForTests,
   continueSession,
-  type InteractiveCodexTerminal,
-  type TerminalInvocation,
 } from "../../src/core/continuation";
 import type { CodexLayout } from "../../src/core/types";
+import {
+  forkNativeCodexThread,
+  type AppServerChild,
+} from "../../src/ui/app-server-fork";
+import {
+  createNativeContinuationTerminal,
+  type NativeContinuationTerminalApi,
+} from "../../src/ui/native-continuation-terminal";
 
-test("runs a fake Codex CLI with argument vectors for capability discovery and native fork", async () => {
+test("persists the native app-server fork thread ID rather than an independent terminal candidate", async () => {
   await withLayout(async (layout) => {
     clearCodexCapabilityCacheForTests();
-    const fakeCliPath = join(layout.codexHome, "fake-codex.cjs");
-    const invocationLogPath = join(layout.codexHome, "fake-codex.log");
-    await writeFile(fakeCliPath, [
-      "const { appendFileSync } = require('node:fs');",
-      "const args = process.argv.slice(2);",
-      "if (process.env.FAKE_CODEX_LOG) appendFileSync(process.env.FAKE_CODEX_LOG, JSON.stringify(args) + '\\n');",
-      "if (args.at(-1) === '--help') { process.stdout.write('Commands: resume fork\\n'); process.exit(0); }",
-      "if (args.at(-2) === 'fork' && args.at(-1) === 'source-1') { process.exit(0); }",
-      "process.exit(17);",
-    ].join("\n"), "utf8");
-    const terminal = new SpawnTerminal({ branchSessionId: "branch-1" });
+    const appServer = new FakeAppServerChild("branch-from-app-server");
+    const independentTerminalCandidateId = "branch-from-terminal";
+    let terminalCreationCount = 0;
+    const terminal = createNativeContinuationTerminal(fakeTerminalApi(() => {
+      terminalCreationCount += 1;
+      throw new Error(`Unexpected terminal candidate: ${independentTerminalCandidateId}`);
+    }), layout, {
+      forkNativeCodexThread: async ({ sourceSessionId, codexHome }) => forkNativeCodexThread({
+        command: "codex",
+        sourceSessionId,
+        codexHome,
+        spawn: () => appServer,
+        timeoutMs: 1_000,
+      }),
+    });
 
     const result = await continueSession({
       layout,
@@ -33,60 +45,116 @@ test("runs a fake Codex CLI with argument vectors for capability discovery and n
       targetProfileId: "custom",
       sourceEventHash: "a".repeat(64),
       terminal,
-      codexCommand: process.execPath,
-      codexCommandPrefixArgs: [fakeCliPath],
-      commandRunner: async (command, args) => run(command, args, {
-        ...process.env,
-        FAKE_CODEX_LOG: invocationLogPath,
-      }),
+      commandRunner: async (command, args) => {
+        assert.equal(command, "codex");
+        assert.deepEqual(args, ["--help"]);
+        return { exitCode: 0, stdout: "Commands: resume fork\n", stderr: "" };
+      },
     });
 
-    assert.equal(result.status, "forked");
-    assert.deepEqual(terminal.invocations, [{
-      command: process.execPath,
-      args: [fakeCliPath, "fork", "source-1"],
-      title: "Codex: Fork source-1",
-      shell: false,
+    assert.deepEqual(result, {
+      status: "forked",
+      sourceSessionId: "source-1",
+      branchSessionId: "branch-from-app-server",
+    });
+    assert.notEqual(result.branchSessionId, independentTerminalCandidateId);
+    assert.equal(terminalCreationCount, 0);
+    assert.deepEqual(appServer.receivedMethods, ["initialize", "initialized", "thread/fork"]);
+    assert.deepEqual(await readMappings(join(layout.switcherDir, "state.sqlite")), [{
+      sourceSessionId: "source-1",
+      targetProfileId: "custom",
+      branchSessionId: "branch-from-app-server",
+      sourceEventHash: "a".repeat(64),
+      status: "active",
     }]);
-    const invocations = (await readFile(invocationLogPath, "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as string[]);
-    assert.deepEqual(invocations, [["--help"]]);
   });
 });
 
-class SpawnTerminal implements InteractiveCodexTerminal {
-  readonly reportsForkOutcome = true;
-  readonly invocations: TerminalInvocation[] = [];
+class FakeAppServerChild extends EventEmitter implements AppServerChild {
+  readonly stdin = new PassThrough();
+  readonly stdout = new PassThrough();
+  readonly stderr = new PassThrough();
+  readonly receivedMethods: string[] = [];
+  private input = "";
 
-  constructor(private readonly result: { branchSessionId: string }) {}
+  constructor(private readonly branchId: string) {
+    super();
+    this.stdin.on("data", (chunk: Buffer) => this.receive(chunk));
+  }
 
-  async launch(invocation: TerminalInvocation) {
-    this.invocations.push(invocation);
-    const completed = await run(invocation.command, invocation.args);
-    return { exitCode: completed.exitCode, branchSessionId: this.result.branchSessionId };
+  kill(): boolean {
+    return true;
+  }
+
+  private receive(chunk: Buffer): void {
+    this.input += chunk.toString("utf8");
+    for (;;) {
+      const newline = this.input.indexOf("\n");
+      if (newline < 0) {
+        return;
+      }
+      const line = this.input.slice(0, newline);
+      this.input = this.input.slice(newline + 1);
+      const message = JSON.parse(line) as { id?: number; method: string };
+      this.receivedMethods.push(message.method);
+      if (message.id === 1 && message.method === "initialize") {
+        this.stdout.write('{"jsonrpc":"2.0","id":1,"result":{}}\n');
+      } else if (message.id === 2 && message.method === "thread/fork") {
+        this.stdout.write(`${JSON.stringify({
+          jsonrpc: "2.0",
+          id: 2,
+          result: { thread: { id: this.branchId } },
+        })}\n`);
+        queueMicrotask(() => this.emit("close", 0, null));
+      } else {
+        assert.deepEqual(message, { jsonrpc: "2.0", method: "initialized", params: {} });
+      }
+    }
   }
 }
 
-function run(
-  command: string,
-  args: readonly string[],
-  environment?: NodeJS.ProcessEnv,
-): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { shell: false, env: environment });
-    const stdout: Buffer[] = [];
-    const stderr: Buffer[] = [];
-    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
-    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
-    child.once("error", reject);
-    child.once("close", (code) => resolve({
-      exitCode: code ?? 1,
-      stdout: Buffer.concat(stdout).toString("utf8"),
-      stderr: Buffer.concat(stderr).toString("utf8"),
-    }));
+function fakeTerminalApi(onUnexpectedCreate: () => never): NativeContinuationTerminalApi {
+  return {
+    createTerminal: onUnexpectedCreate,
+    onDidChangeTerminalShellIntegration: () => ({ dispose: () => undefined }),
+    onDidEndTerminalShellExecution: () => ({ dispose: () => undefined }),
+  };
+}
+
+async function readMappings(databasePath: string): Promise<Array<{
+  sourceSessionId: string;
+  targetProfileId: string;
+  branchSessionId: string;
+  sourceEventHash: string;
+  status: string;
+}>> {
+  const database = await new Promise<sqlite3.Database>((resolve, reject) => {
+    const opened = new sqlite3.Database(databasePath, sqlite3.OPEN_READONLY, (error) => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve(opened);
+      }
+    });
   });
+  try {
+    return await new Promise((resolve, reject) => {
+      database.all<{
+        sourceSessionId: string;
+        targetProfileId: string;
+        branchSessionId: string;
+        sourceEventHash: string;
+        status: string;
+      }>(`SELECT source_session_id AS sourceSessionId,
+                target_profile_id AS targetProfileId,
+                branch_session_id AS branchSessionId,
+                source_event_hash AS sourceEventHash,
+                status
+           FROM branch_mappings`, (error, rows) => (error ? reject(error) : resolve(rows)));
+    });
+  } finally {
+    await new Promise<void>((resolve, reject) => database.close((error) => (error ? reject(error) : resolve())));
+  }
 }
 
 async function withLayout(callback: (layout: CodexLayout) => Promise<void>): Promise<void> {
