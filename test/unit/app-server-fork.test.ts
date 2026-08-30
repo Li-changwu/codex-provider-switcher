@@ -133,6 +133,55 @@ test("fails closed when stdout exceeds its bounded buffer", async () => {
   await assertFailsClosed(resultPromise, harness.child);
 });
 
+test("fails closed immediately when stderr exceeds its retained byte limit", async () => {
+  const harness = createHarness();
+  const resultPromise = startFork(harness, { maxStderrBytes: 2 });
+
+  await waitFor(() => harness.messages().length === 1);
+  harness.child.stderr.write("abc");
+
+  await assertPromptlyFailsClosed(resultPromise, harness.child);
+});
+
+test("fails closed when an initialize response is not JSON-RPC 2.0", async () => {
+  for (const jsonrpc of [undefined, "1.0"]) {
+    const harness = createHarness();
+    const resultPromise = startFork(harness);
+
+    await waitFor(() => harness.messages().length === 1);
+    harness.writeStdout(`${JSON.stringify({ id: 1, jsonrpc, result: {} })}\n`);
+
+    await assertPromptlyFailsClosed(resultPromise, harness.child);
+    assert.equal(harness.messages().length, 1);
+  }
+});
+
+test("fails closed when a fork response is not JSON-RPC 2.0", async () => {
+  for (const jsonrpc of [undefined, "1.0"]) {
+    const harness = createHarness();
+    const { resultPromise } = await startThroughForkRequest(harness);
+
+    harness.writeStdout(`${JSON.stringify({
+      id: 2,
+      jsonrpc,
+      result: { thread: { id: "trusted-branch_1" } },
+    })}\n`);
+
+    await assertPromptlyFailsClosed(resultPromise, harness.child);
+  }
+});
+
+test("fails closed when split UTF-8 bytes exceed the raw stdout limit", async () => {
+  const harness = createHarness();
+  const resultPromise = startFork(harness, { maxStdoutBytes: 2 });
+
+  await waitFor(() => harness.messages().length === 1);
+  harness.writeStdout(Buffer.from([0xe2, 0x82]));
+  harness.writeStdout(Buffer.from([0xac]));
+
+  await assertPromptlyFailsClosed(resultPromise, harness.child);
+});
+
 test("fails closed when the child errors or exits early", async () => {
   const errorHarness = createHarness();
   const errorResult = startFork(errorHarness);
@@ -197,7 +246,7 @@ function createHarness() {
         .filter(Boolean)
         .map((line) => JSON.parse(line) as { method: string; params: unknown; [key: string]: unknown });
     },
-    writeStdout(value: string) {
+    writeStdout(value: string | Buffer) {
       child.stdout.write(value);
     },
   };
@@ -234,6 +283,16 @@ async function assertFailsClosed(resultPromise: Promise<string>, child: FakeChil
     return true;
   });
   assert.equal(child.killCalls.length, 1);
+}
+
+async function assertPromptlyFailsClosed(resultPromise: Promise<string>, child: FakeChild): Promise<void> {
+  const handledResult = resultPromise.then(
+    () => "resolved",
+    () => "rejected",
+  );
+  await waitFor(() => child.killCalls.length === 1);
+  assert.equal(await handledResult, "rejected");
+  await assertFailsClosed(resultPromise, child);
 }
 
 class FakeChild extends EventEmitter implements AppServerChild {

@@ -63,6 +63,7 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
     let settled = false;
     let phase: 1 | 2 = 1;
     let stdoutBuffer = "";
+    let stdoutBufferedBytes = 0;
     let retainedStderrBytes = 0;
     const retainedStderr: Buffer[] = [];
     const decoder = new StringDecoder("utf8");
@@ -73,11 +74,12 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
     const onStderrData = (chunk: unknown) => {
       const bytes = asBuffer(chunk);
       const available = maxStderrBytes - retainedStderrBytes;
-      if (available > 0) {
-        const retained = Buffer.from(bytes.subarray(0, available));
-        retainedStderr.push(retained);
-        retainedStderrBytes += retained.length;
+      if (bytes.length > available) {
+        settle();
+        return;
       }
+      retainedStderr.push(Buffer.from(bytes));
+      retainedStderrBytes += bytes.length;
     };
     const onStdoutData = (chunk: unknown) => {
       if (settled) {
@@ -85,11 +87,16 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
       }
 
       const bytes = asBuffer(chunk);
-      if (Buffer.byteLength(stdoutBuffer, "utf8") + bytes.length > maxStdoutBytes) {
+      if (stdoutBufferedBytes + bytes.length > maxStdoutBytes) {
         settle();
         return;
       }
+      stdoutBufferedBytes += bytes.length;
       stdoutBuffer += decoder.write(bytes);
+      if (Buffer.byteLength(stdoutBuffer, "utf8") > maxStdoutBytes) {
+        settle();
+        return;
+      }
 
       for (;;) {
         const newline = stdoutBuffer.indexOf("\n");
@@ -98,6 +105,12 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
         }
         let line = stdoutBuffer.slice(0, newline);
         stdoutBuffer = stdoutBuffer.slice(newline + 1);
+        const lineBytes = Buffer.byteLength(line, "utf8") + 1;
+        if (lineBytes > stdoutBufferedBytes) {
+          settle();
+          return;
+        }
+        stdoutBufferedBytes -= lineBytes;
         if (line.endsWith("\r")) {
           line = line.slice(0, -1);
         }
@@ -157,6 +170,10 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
         return;
       }
       if (typeof parsed.method === "string") {
+        return;
+      }
+      if (parsed.jsonrpc !== "2.0") {
+        settle();
         return;
       }
       if (Object.hasOwn(parsed, "error")) {
@@ -223,6 +240,7 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
       retainedStderr.length = 0;
       retainedStderrBytes = 0;
       stdoutBuffer = "";
+      stdoutBufferedBytes = 0;
       try {
         child.kill();
       } catch {
