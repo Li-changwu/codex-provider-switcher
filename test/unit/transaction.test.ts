@@ -1991,24 +1991,36 @@ test("rejects a restore parent whose ancestor real path changes", async (t) => {
 
 test("records the SHA256 of the saved backup bytes after the source path changes", async () => {
   await withLayout(async (layout) => {
-    const original = Buffer.alloc(8 * 1024 * 1024, "a");
-    await writeFile(layout.configPath, original);
-    const transaction = await beginTransaction(layout, { operationId: "saved-backup-hash" });
-    const backupPath = join(transaction.backupDirectory, "0000-config.toml");
+    const original = "source content before the backup copy";
+    const replacement = "source content after the backup copy";
     const replacementPath = join(layout.codexHome, "replacement-config.toml");
-    const backup = transaction.backupTargets([{ kind: "config", path: layout.configPath }]);
+    let sourceReplaced = false;
+    const transaction = await beginTransaction(layout, {
+      operationId: "saved-backup-hash",
+      io: {
+        async readHashChunk() {
+          if (sourceReplaced) {
+            return;
+          }
+          sourceReplaced = true;
+          await writeFile(replacementPath, replacement, "utf8");
+          await rename(replacementPath, layout.configPath);
+        },
+      },
+    });
+    try {
+      await writeFile(layout.configPath, original, "utf8");
+      const manifest = await transaction.backupTargets([{ kind: "config", path: layout.configPath }]);
+      const [entry] = manifest.entries;
 
-    await waitForFile(backupPath);
-    await writeFile(replacementPath, "source content after the backup copy", "utf8");
-    await rename(replacementPath, layout.configPath);
-    const manifest = await backup;
-    const [entry] = manifest.entries;
-
-    assert.ok(entry?.backupPath);
-    assert.equal(entry.sha256, sha256(await readFile(entry.backupPath)));
-    assert.notEqual(entry.sha256, sha256(await readFile(layout.configPath)));
-    await transaction.markRolledBack();
-    await transaction.release();
+      assert.equal(sourceReplaced, true);
+      assert.ok(entry?.backupPath);
+      assert.equal(entry.sha256, sha256(await readFile(entry.backupPath)));
+      assert.notEqual(entry.sha256, sha256(await readFile(layout.configPath)));
+    } finally {
+      await transaction.markRolledBack().catch(() => undefined);
+      await transaction.release().catch(() => undefined);
+    }
   });
 });
 
@@ -3858,18 +3870,6 @@ async function assertInvalidPersistedCustomProfileIdRejected(
     assert.equal(restoreCalls, 0);
     assert.equal(await readFile(journalPath, "utf8"), contents);
   });
-}
-
-async function waitForFile(path: string): Promise<void> {
-  for (let attempt = 0; attempt < 200; attempt += 1) {
-    try {
-      await access(path);
-      return;
-    } catch {
-      await new Promise((resolve) => setTimeout(resolve, 1));
-    }
-  }
-  throw new Error(`Timed out waiting for ${path}`);
 }
 
 function sha256(contents: Buffer): string {
