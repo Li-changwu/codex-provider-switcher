@@ -117,27 +117,23 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
     const onStdioFailure = () => settleFailure();
     const ignoreLateError = () => undefined;
     const onStderrData = (chunk: unknown) => {
-      if (settled) {
-        return;
-      }
       const bytes = asBuffer(chunk);
       if (totalStderrBytes + bytes.length > maxStderrBytes) {
-        settleFailure();
+        handleStreamLimitExceeded();
         return;
       }
       totalStderrBytes += bytes.length;
     };
     const onStdoutData = (chunk: unknown) => {
-      if (settled) {
-        return;
-      }
-
       const bytes = asBuffer(chunk);
       if (totalStdoutBytes + bytes.length > maxStdoutBytes) {
-        settleFailure();
+        handleStreamLimitExceeded();
         return;
       }
       totalStdoutBytes += bytes.length;
+      if (settled) {
+        return;
+      }
       stdoutBuffer += decoder.write(bytes);
 
       for (;;) {
@@ -360,6 +356,21 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
       sendSignal("SIGKILL");
     }
 
+    function handleStreamLimitExceeded(): void {
+      if (!settled) {
+        settleFailure();
+        return;
+      }
+      forceTerminateChild();
+      destroyStdio();
+    }
+
+    function destroyStdio(): void {
+      destroyStream(child.stdin);
+      destroyStream(child.stdout);
+      destroyStream(child.stderr);
+    }
+
     function sendSignal(signal: NodeJS.Signals): void {
       try {
         child.kill(signal);
@@ -368,6 +379,18 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
       }
     }
   });
+}
+
+function destroyStream(stream: NodeJS.ReadableStream | NodeJS.WritableStream): void {
+  const destroy = (stream as { destroy?: () => void }).destroy;
+  if (!destroy) {
+    return;
+  }
+  try {
+    destroy.call(stream);
+  } catch {
+    // A stream can already be detached while the child is closing.
+  }
 }
 
 function spawnAppServer(

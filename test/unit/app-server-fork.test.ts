@@ -413,6 +413,43 @@ test("escalates a close-resistant child and drains stdout after the shutdown dea
   harness.child.emit("close", 0, null);
 });
 
+test("destroys stdio when stdout or stderr exceeds its bound after grace expiry", async () => {
+  const initializeResponse = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n";
+  const forkResponse = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"thread\":{\"id\":\"trusted-branch_1\"}}}\n";
+
+  for (const overflow of [
+    (harness: ReturnType<typeof createHarness>) => harness.writeStdout("x"),
+    (harness: ReturnType<typeof createHarness>) => harness.child.stderr.write("xx"),
+  ]) {
+    const harness = createHarness();
+    const resultPromise = startFork(harness, {
+      terminationGraceTimeoutMs: 5,
+      maxStdoutBytes: Buffer.byteLength(initializeResponse) + Buffer.byteLength(forkResponse),
+      maxStderrBytes: 1,
+    });
+
+    await waitFor(() => harness.messages().length === 1);
+    harness.writeStdout(initializeResponse);
+    await waitFor(() => harness.messages().length === 3);
+    harness.writeStdout(forkResponse);
+
+    await assert.rejects(resultPromise, (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.message, "Unable to obtain native Codex fork.");
+      return true;
+    });
+    assert.deepEqual(harness.child.killCalls, ["SIGTERM", "SIGKILL"]);
+
+    overflow(harness);
+
+    assert.equal(harness.child.stdin.destroyed, true);
+    assert.equal(harness.child.stdout.destroyed, true);
+    assert.equal(harness.child.stderr.destroyed, true);
+    assert.deepEqual(harness.child.killCalls, ["SIGTERM", "SIGKILL"]);
+    harness.child.emit("close", 0, null);
+  }
+});
+
 test("guards late child and stdio errors after completion", async () => {
   const harness = createHarness();
   const { resultPromise } = await startThroughForkRequest(harness);
