@@ -134,7 +134,7 @@ function validatedTimeout(
   defaultTimeoutMs: number,
   timeoutName: string,
 ): number {
-  const timeoutMs = injectedTimeoutMs ?? defaultTimeoutMs;
+  const timeoutMs = injectedTimeoutMs === undefined ? defaultTimeoutMs : injectedTimeoutMs;
   if (
     !Number.isSafeInteger(timeoutMs) ||
     timeoutMs <= 0 ||

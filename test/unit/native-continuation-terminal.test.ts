@@ -282,6 +282,24 @@ test("rejects invalid injected Shell Integration and command timeout bounds at c
   }
 });
 
+test("rejects explicit null injected timeout values at construction", () => {
+  for (const option of ["shellIntegrationTimeoutMs", "shellCommandTimeoutMs"] as const) {
+    const harness = createHarness();
+    const dependencies = {
+      forkNativeCodexThread: harness.fork,
+      [option]: null,
+    } as unknown as Parameters<typeof createNativeContinuationTerminal>[2];
+
+    assert.throws(
+      () => createNativeContinuationTerminal(harness.api, layout(), dependencies),
+      /timeout/i,
+      `${option}=null must be rejected during adapter creation`,
+    );
+    assert.deepEqual(harness.options, []);
+    assert.deepEqual(harness.forkCalls, []);
+  }
+});
+
 function invocation(operation: "resume" | "fork" | "archive" | "unarchive", sessionId: string): TerminalInvocation {
   return {
     command: "codex",
