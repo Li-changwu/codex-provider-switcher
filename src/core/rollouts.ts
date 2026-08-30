@@ -38,6 +38,11 @@ export interface RolloutChange {
   replacements: readonly RolloutReplacement[];
 }
 
+export interface ContinuationSourceAnchor {
+  readonly sessionId: string;
+  readonly sourceEventHash: string;
+}
+
 export interface RolloutInverseReplacement {
   line: number;
   start: number;
@@ -186,6 +191,30 @@ export async function scanRollouts(
   };
 }
 
+export async function listContinuationSourceAnchors(
+  layout: CodexLayout,
+): Promise<ContinuationSourceAnchor[]> {
+  const candidates = await findRolloutFiles(layout);
+  const sessionIds = new Set<string>();
+  const anchors: ContinuationSourceAnchor[] = [];
+
+  for (const candidate of candidates) {
+    const anchor = await scanContinuationSourceAnchor(candidate.path, candidate.identity);
+    if (sessionIds.has(anchor.sessionId)) {
+      throw new RolloutValidationError(
+        "unsupported-layout",
+        `Session ${anchor.sessionId} appears in more than one rollout: ${candidate.path}`,
+      );
+    }
+    sessionIds.add(anchor.sessionId);
+    anchors.push(anchor);
+  }
+
+  return anchors.sort((left, right) =>
+    left.sessionId < right.sessionId ? -1 : left.sessionId > right.sessionId ? 1 : 0,
+  );
+}
+
 export async function applyRolloutChanges(
   changes: readonly RolloutChange[],
   signal?: AbortSignal,
@@ -321,6 +350,72 @@ interface ObservedRollout {
   sessionId: string;
   encryptedContent: boolean;
   change?: ProvenancedRolloutChange;
+}
+
+async function scanContinuationSourceAnchor(
+  path: string,
+  identity: RolloutFileIdentity,
+): Promise<ContinuationSourceAnchor> {
+  const hash = createHash("sha256");
+  let lineNumber = 0;
+  let sessionId: string | undefined;
+  let sessionMetaSeen = false;
+
+  await withVerifiedRolloutHandle(
+    path,
+    identity,
+    "unsupported-layout",
+    async (sourceHandle) => {
+      for await (const entry of readJsonlLines(sourceHandle, path, (chunk) => hash.update(chunk))) {
+        const record = parseJsonLine(path, lineNumber, entry.line);
+        if (record.type === "session_meta") {
+          if (sessionMetaSeen) {
+            throw new RolloutValidationError(
+              "unsupported-layout",
+              `Rollout contains duplicate session_meta records: ${path}`,
+            );
+          }
+          sessionMetaSeen = true;
+
+          const properties = scanRootProperties(path, lineNumber, entry.line);
+          assertUniqueRootKeys(path, lineNumber, properties);
+          const payloadProperty = properties.find((property) => property.name === "payload");
+          const payload = record.payload;
+          if (!payloadProperty || !isRecord(payload)) {
+            throw new RolloutValidationError(
+              "unsupported-layout",
+              `Rollout session_meta has no object payload: ${path}`,
+            );
+          }
+
+          const payloadProperties = scanObjectProperties(
+            path,
+            lineNumber,
+            entry.line,
+            payloadProperty.valueStart,
+          );
+          assertUniqueRootKeys(path, lineNumber, payloadProperties);
+          if (typeof payload.id !== "string" || payload.id.length === 0) {
+            throw new RolloutValidationError(
+              "missing-session-id",
+              `Rollout session_meta has no valid payload.id: ${path}`,
+            );
+          }
+          sessionId = payload.id;
+        }
+        lineNumber += 1;
+      }
+    },
+  );
+
+  if (sessionId === undefined) {
+    throw new RolloutValidationError(
+      "missing-session-id",
+      `Rollout does not contain a session_meta event: ${path}`,
+    );
+  }
+
+  return { sessionId, sourceEventHash: hash.digest("hex").toLowerCase() };
 }
 
 interface RolloutChangeSnapshot {

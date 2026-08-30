@@ -19,6 +19,7 @@ import {
   applyRolloutChanges,
   collectRolloutChanges,
   createRolloutInversePatches,
+  listContinuationSourceAnchors,
   reverseRolloutInversePatch,
   RolloutCancelledError,
   RolloutPersistenceError,
@@ -27,6 +28,97 @@ import {
   validateRolloutInversePatch,
 } from "../../src/core/rollouts";
 import type { CodexLayout } from "../../src/core/types";
+
+test("lists deterministic metadata-only continuation anchors from active and archived rollouts", async () => {
+  await withLayout(async (layout) => {
+    const activePath = join(layout.sessionsDir, "sensitive-transcript-path.jsonl");
+    const archivedPath = join(layout.archivedSessionsDir, "archived.jsonl");
+    const active = `${sessionMetaLine("zeta", "openai")}\n${messageLineWithText("transcript-do-not-leak")}\n`;
+    const archived = `${sessionMetaLine("alpha", "custom")}\n${messageLine(false)}\n`;
+    await writeFile(activePath, active, "utf8");
+    await writeFile(archivedPath, archived, "utf8");
+
+    const anchors = await listContinuationSourceAnchors(layout);
+
+    assert.deepEqual(anchors, [
+      { sessionId: "alpha", sourceEventHash: sha256(archived) },
+      { sessionId: "zeta", sourceEventHash: sha256(active) },
+    ]);
+    for (const anchor of anchors) {
+      assert.deepEqual(Object.keys(anchor).sort(), ["sessionId", "sourceEventHash"]);
+      assert.match(anchor.sourceEventHash, /^[a-f0-9]{64}$/);
+    }
+    const serialized = JSON.stringify(anchors);
+    assert.equal(serialized.includes("transcript-do-not-leak"), false);
+    assert.equal(serialized.includes("sensitive-transcript-path.jsonl"), false);
+  });
+});
+
+test("updates only the edited rollout continuation source hash", async () => {
+  await withLayout(async (layout) => {
+    const activePath = join(layout.sessionsDir, "active.jsonl");
+    const archivedPath = join(layout.archivedSessionsDir, "archived.jsonl");
+    const active = `${sessionMetaLine("active", "openai")}\n${messageLine(false)}\n`;
+    const archived = `${sessionMetaLine("archived", "custom")}\n${messageLine(false)}\n`;
+    await writeFile(activePath, active, "utf8");
+    await writeFile(archivedPath, archived, "utf8");
+    const before = await listContinuationSourceAnchors(layout);
+
+    const editedArchived = `${archived}${messageLineWithText("edited transcript")}\n`;
+    await writeFile(archivedPath, editedArchived, "utf8");
+    const after = await listContinuationSourceAnchors(layout);
+
+    assert.deepEqual(before, [
+      { sessionId: "active", sourceEventHash: sha256(active) },
+      { sessionId: "archived", sourceEventHash: sha256(archived) },
+    ]);
+    assert.deepEqual(after, [
+      { sessionId: "active", sourceEventHash: sha256(active) },
+      { sessionId: "archived", sourceEventHash: sha256(editedArchived) },
+    ]);
+  });
+});
+
+test("fails closed when continuation source anchors contain duplicate session IDs", async () => {
+  await withLayout(async (layout) => {
+    const activePath = join(layout.sessionsDir, "active.jsonl");
+    const archivedPath = join(layout.archivedSessionsDir, "archived.jsonl");
+    const active = `${sessionMetaLine("duplicate", "openai")}\n`;
+    const archived = `${sessionMetaLine("duplicate", "custom")}\n`;
+    await writeFile(activePath, active, "utf8");
+    await writeFile(archivedPath, archived, "utf8");
+
+    await assert.rejects(
+      () => listContinuationSourceAnchors(layout),
+      (error: unknown) =>
+        error instanceof RolloutValidationError && error.code === "unsupported-layout",
+    );
+    assert.equal(await readFile(activePath, "utf8"), active);
+    assert.equal(await readFile(archivedPath, "utf8"), archived);
+  });
+});
+
+test("fails closed when continuation source metadata is missing or malformed", async () => {
+  const invalidRecords = [
+    `${messageLine(false)}\n`,
+    '{"type":"session_meta","payload":{}}\n',
+    '{"type":"session_meta","payload":{"id":42}}\n',
+    '{"type":"session_meta","payload":null}\n',
+  ];
+
+  for (const [index, content] of invalidRecords.entries()) {
+    await withLayout(async (layout) => {
+      const path = join(layout.sessionsDir, `invalid-${index}.jsonl`);
+      await writeFile(path, content, "utf8");
+
+      await assert.rejects(
+        () => listContinuationSourceAnchors(layout),
+        (error: unknown) => error instanceof RolloutValidationError,
+      );
+      assert.equal(await readFile(path, "utf8"), content);
+    });
+  }
+});
 
 test("rejects a sessions directory symlink that escapes Codex Home", async (t) => {
   const externalRoot = await mkdtemp(join(tmpdir(), "codex-rollout-external-"));
@@ -939,13 +1031,17 @@ function sessionMetaLine(
 }
 
 function messageLine(encrypted: boolean): string {
+  return messageLineWithText("Keep message", encrypted);
+}
+
+function messageLineWithText(text: string, encrypted = false): string {
   return JSON.stringify({
     timestamp: "2026-08-25T00:01:00.000Z",
     type: "response_item",
     payload: {
       type: "message",
       role: "assistant",
-      content: [{ type: "output_text", text: "Keep message" }],
+      content: [{ type: "output_text", text }],
     },
     ...(encrypted ? { encrypted_content: "opaque-history" } : {}),
   });
