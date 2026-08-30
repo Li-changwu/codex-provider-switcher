@@ -106,6 +106,7 @@ test("returns a nonzero archive execution exit code instead of reporting success
 
   assert.deepEqual(result, { exitCode: 7 });
   assert.deepEqual(harness.commands, [["codex", ["archive", "source-1"]]]);
+  assert.equal(harness.disposeCalls, 1);
 });
 
 test("fails closed and removes listeners when Shell Integration is unavailable", async () => {

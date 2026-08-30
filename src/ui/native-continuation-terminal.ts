@@ -115,12 +115,16 @@ export function createNativeContinuationTerminal(
           terminal,
           shellIntegrationTimeoutMs,
         );
-        return await executeTerminalCommand(
+        const result = await executeTerminalCommand(
           api,
           shellIntegration,
           [archiveAction, invocation.args[1]],
           shellCommandTimeoutMs,
         );
+        if (result.exitCode !== 0) {
+          terminal.dispose();
+        }
+        return result;
       } catch (error: unknown) {
         terminal.dispose();
         throw error;
