@@ -1,10 +1,17 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, symlink, unlink, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { stageReleaseArtifacts } from "../../scripts/release-artifacts.mjs";
+
+const execFileAsync = promisify(execFile);
+const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+const cliPath = join(projectRoot, "scripts/release-artifacts.mjs");
 
 const manifest = {
   name: "codex-provider-switcher",
@@ -156,6 +163,32 @@ test("rejects an existing SHA256SUMS.txt", async (t) => {
     /SHA256SUMS\.txt already exists/,
   );
   assert.equal(await readFile(checksumPath, "utf8"), "pre-existing\n");
+});
+
+test("CLI rejects missing and extra arguments with usage on stderr", async () => {
+  for (const args of [[], ["release-directory", "v0.1.0", "extra"]]) {
+    await assert.rejects(
+      execFileAsync(process.execPath, [cliPath, ...args], { cwd: projectRoot }),
+      (error: unknown) => {
+        const failure = error as { code?: number | string; stderr?: string };
+        assert.notEqual(failure.code, 0);
+        assert.match(failure.stderr ?? "", /Usage: node scripts\/release-artifacts\.mjs/);
+        return true;
+      },
+    );
+  }
+});
+
+test("CLI prints only sorted release asset names on success", async (t) => {
+  const fixture = await createFixture(t, validFiles);
+  const result = await execFileAsync(
+    process.execPath,
+    [cliPath, fixture.releaseDirectory, "v0.1.0"],
+    { cwd: projectRoot },
+  );
+
+  assert.equal(result.stdout, `${linuxAsset}\n${windowsAsset}\nSHA256SUMS.txt\n`);
+  assert.equal(result.stderr, "");
 });
 
 function sha256(contents: Buffer): string {
