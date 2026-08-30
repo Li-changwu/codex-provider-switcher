@@ -16,7 +16,7 @@
 - Modify: `test/unit/switch-service.test.ts`
 - Test: `test/unit/switch-service.test.ts`
 
-- [ ] **Step 1: Write a failing test for a retry that succeeds**
+- [x] **Step 1: Write a failing test for a retry that succeeds**
 
 Add a test named `retries recoveryRequired journalling after rollback fails`.
 Use the existing `withLayout` and `dependencies` helpers. Supply a legal auth
@@ -38,7 +38,7 @@ Expected: FAIL with one observed marker publication because
 `rollbackAfterFailure` currently skips the outer `markRecoveryRequired()`
 call.
 
-- [ ] **Step 2: Add a failing test for a second marker failure**
+- [x] **Step 2: Add a failing test for a second marker failure**
 
 Add a test named `keeps recovery marker failure diagnostics bounded` using the
 same auth mutation and restoration failure. Make every `recoveryRequired`
@@ -50,7 +50,7 @@ is released so a later `beginTransaction` can acquire it. Run the focused test
 command again and confirm the test fails with one marker attempt because the
 retry is unreachable.
 
-- [ ] **Step 3: Preserve the no-retry success path**
+- [x] **Step 3: Preserve the no-retry success path**
 
 Update the existing successful rollback assertion in
 `test/unit/switch-service.test.ts` to record `recoveryRequired` journal
@@ -69,7 +69,7 @@ success-path assertion remains green.
 - Modify: `src/core/switch-service.ts`
 - Test: `test/unit/switch-service.test.ts`
 
-- [ ] **Step 1: Replace the unreachable condition**
+- [x] **Step 1: Replace the unreachable condition**
 
 In `rollbackAfterFailure`, replace the second duplicated condition:
 
@@ -99,7 +99,7 @@ Do not change the `rollback()` call, state return, error summarization, or
 transaction release logic. The returned state remains `recoveryRequired` when
 durable rollback fails, regardless of whether the retry succeeds.
 
-- [ ] **Step 2: Run focused tests and type checking**
+- [x] **Step 2: Run focused tests and type checking**
 
 Run:
 
@@ -118,7 +118,7 @@ Expected: all selected tests pass and TypeScript exits with code 0.
 - Add: `docs/superpowers/specs/2026-08-30-recovery-marker-retry-design.md`
 - Add: `docs/superpowers/plans/2026-08-30-recovery-marker-retry.md`
 
-- [ ] **Step 1: Run the full verification suite**
+- [x] **Step 1: Run the full verification suite**
 
 Run:
 
@@ -133,7 +133,7 @@ git diff --check
 Expected: every command exits 0; unit and integration output reports zero
 failures; only the repository's existing platform-gated skips remain.
 
-- [ ] **Step 2: Confirm scope and sensitive-data invariants**
+- [x] **Step 2: Confirm scope and sensitive-data invariants**
 
 Run:
 
@@ -146,7 +146,7 @@ Confirm the production diff is limited to the retry condition and bounded
 error collection, tests cover success/failure paths, and no credential or
 transcript content is added.
 
-- [ ] **Step 3: Commit the implementation**
+- [x] **Step 3: Commit the implementation**
 
 ```text
 git add src/core/switch-service.ts test/unit/switch-service.test.ts docs/superpowers/specs/2026-08-30-recovery-marker-retry-design.md docs/superpowers/plans/2026-08-30-recovery-marker-retry.md
