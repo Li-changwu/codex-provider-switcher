@@ -57,22 +57,68 @@ git add src/core/rollouts.ts test/unit/rollouts.test.ts
 git commit -m "feat: expose metadata-only continuation anchors"
 ```
 
-### Task 2: Add Trusted App-server Fork Execution
+### Task 2: Add the Bounded App-server JSONL Fork Client
+
+**Files:**
+- Create: `src/ui/app-server-fork.ts`
+- Create: `test/unit/app-server-fork.test.ts`
+
+- [ ] **Step 1: Write failing JSONL-client tests.**
+
+Use an injected fake child process to assert `forkNativeCodexThread(...)` sends
+`initialize`, waits for the matching response, sends `initialized`, then sends
+`thread/fork` with the input session ID and `excludeTurns: true`. Assert it
+returns the valid `result.thread.id`. Assert malformed or missing IDs, server
+errors, oversized output, early exit, and timeout reject without returning an
+ID. Assert sent methods never include a transcript-read method.
+
+- [ ] **Step 2: Run the focused test and verify it fails.**
+
+Run: `npm test -- test/unit/app-server-fork.test.ts`
+
+Expected: FAIL because the module does not exist.
+
+- [ ] **Step 3: Implement the bounded JSONL client.**
+
+Create `forkNativeCodexThread(...)` with an injected child-process factory for
+tests. Spawn `codex app-server --listen stdio://` under the supplied Codex Home
+and drive bounded JSONL `initialize` / `initialized` / `thread/fork` requests.
+Set `excludeTurns: true`, accept only a valid `result.thread.id`, and terminate
+the child on every terminal path. Never parse terminal output, log raw protocol
+records, or call a transcript API.
+
+- [ ] **Step 4: Run focused and type verification.**
+
+Run: `npm test -- test/unit/app-server-fork.test.ts`
+
+Expected: PASS.
+
+Run: `npm run check`
+
+Expected: PASS.
+
+- [ ] **Step 5: Commit the fork client.**
+
+```powershell
+git add src/ui/app-server-fork.ts test/unit/app-server-fork.test.ts
+git commit -m "feat: obtain native fork IDs through app-server"
+```
+
+### Task 3: Add the Native Continuation Terminal Adapter
 
 **Files:**
 - Create: `src/ui/native-continuation-terminal.ts`
 - Create: `test/unit/native-continuation-terminal.test.ts`
 
-- [ ] **Step 1: Write failing JSONL fork-adapter tests.**
+- [ ] **Step 1: Write failing terminal-adapter tests.**
 
-Use an injected fake child process to assert a fork sends `initialize`, waits
-for its matching response, sends `initialized`, then sends `thread/fork` with
-the input session ID and `excludeTurns: true`. Assert a valid
-`result.thread.id` produces `{ exitCode: 0, branchSessionId }`. Assert an
-unknown ID, protocol error, oversized output, early process exit, and timeout
-reject without returning an ID. Assert no request method is a transcript-read
-method. Assert resume creates a visible terminal with the layout's `cwd` and
-`CODEX_HOME`.
+Use a fake VS Code terminal and injected `forkNativeCodexThread` dependency.
+Assert resume creates a visible terminal using `{ cwd: layout.codexHome, env:
+{ CODEX_HOME: layout.codexHome } }` and submits only a safe argument-vector
+invocation. Assert fork does not create a VS Code terminal, delegates only the
+source ID to the fork client, and returns `{ exitCode: 0, branchSessionId }`.
+Assert malformed fork invocations and fork-client failures reject without
+inventing an ID.
 
 - [ ] **Step 2: Run the focused test and verify it fails.**
 
@@ -80,17 +126,13 @@ Run: `npm test -- test/unit/native-continuation-terminal.test.ts`
 
 Expected: FAIL because the module does not exist.
 
-- [ ] **Step 3: Implement the adapter.**
+- [ ] **Step 3: Implement the thin terminal adapter.**
 
-Create `createNativeContinuationTerminal(...)` with an injected child-process
-factory for tests. It returns an `InteractiveCodexTerminal` with
-`reportsForkOutcome: true`. For resume, create a visible terminal using
-`{ cwd: layout.codexHome, env: { CODEX_HOME: layout.codexHome } }`. For fork,
-spawn `codex app-server --listen stdio://` under that layout, drive bounded
-JSONL `initialize` / `initialized` / `thread/fork` requests, set
-`excludeTurns: true`, accept only a valid `result.thread.id`, and terminate the
-child on every terminal path. Never parse terminal output or log raw protocol
-records.
+Create `createNativeContinuationTerminal(...)` returning an
+`InteractiveCodexTerminal` with `reportsForkOutcome: true`. Route resume to a
+visible terminal scoped to the active layout; route a validated fork invocation
+to `forkNativeCodexThread(...)`. The adapter contains no protocol parsing,
+transcript behavior, or mapping persistence.
 
 - [ ] **Step 4: Run focused and type verification.**
 
@@ -102,14 +144,14 @@ Run: `npm run check`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the adapter.**
+- [ ] **Step 5: Commit the terminal adapter.**
 
 ```powershell
 git add src/ui/native-continuation-terminal.ts test/unit/native-continuation-terminal.test.ts
-git commit -m "feat: obtain native fork IDs through app-server"
+git commit -m "feat: add native continuation terminal adapter"
 ```
 
-### Task 3: Connect Post-switch Continuation Selection
+### Task 4: Connect Post-switch Continuation Selection
 
 **Files:**
 - Modify: `src/ui/commands.ts`
@@ -159,7 +201,7 @@ git add src/ui/commands.ts src/activation.ts test/unit/commands.test.ts
 git commit -m "feat: offer mapped native continuation after switch"
 ```
 
-### Task 4: Cover the Native Fork Contract and Document It
+### Task 5: Cover the Native Fork Contract and Document It
 
 **Files:**
 - Modify: `test/integration/continuation.test.ts`
