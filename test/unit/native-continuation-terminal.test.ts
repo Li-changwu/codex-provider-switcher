@@ -54,6 +54,34 @@ test("archive waits for its matching Shell Integration execution end before repo
   assert.equal(harness.endListenerCount, 0);
 });
 
+test("fails closed when an archive Shell Integration execution never ends", async () => {
+  const harness = createHarness({ deferCommandEnd: true });
+  const adapter = createNativeContinuationTerminal(harness.api, layout(), {
+    forkNativeCodexThread: harness.fork,
+    shellCommandTimeoutMs: 5,
+  });
+
+  const resultPromise = adapter.launch(invocation("archive", "source-1"));
+  await harness.commandStarted;
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  const harnessDeadline = new Promise<never>((_resolve, reject) => {
+    deadline = setTimeout(() => reject(new Error("test harness deadline")), 20);
+  });
+  try {
+    await assert.rejects(
+      Promise.race([resultPromise, harnessDeadline]),
+      /native Codex terminal command timed out/i,
+    );
+  } finally {
+    if (deadline !== undefined) {
+      clearTimeout(deadline);
+    }
+  }
+  assert.equal(harness.disposeCalls, 1);
+  assert.equal(harness.shellIntegrationListenerCount, 0);
+  assert.equal(harness.endListenerCount, 0);
+});
+
 test("unarchive returns the exit code from its matching Shell Integration execution", async () => {
   const harness = createHarness({ exitCodes: [23] });
   const adapter = createNativeContinuationTerminal(harness.api, layout(), {

@@ -7,6 +7,7 @@ import {
 
 const terminalArgumentPattern = /^[A-Za-z0-9._/-]+$/;
 const defaultShellIntegrationTimeoutMs = 30_000;
+const defaultShellCommandTimeoutMs = 30_000;
 const sessionIdentifierPattern = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const nativeCodexCommand = "codex";
 const terminalOperations = new Set(["resume", "archive", "unarchive"]);
@@ -61,6 +62,7 @@ export type NativeForkClient = (
 export interface NativeContinuationTerminalDependencies {
   readonly forkNativeCodexThread?: NativeForkClient;
   readonly shellIntegrationTimeoutMs?: number;
+  readonly shellCommandTimeoutMs?: number;
 }
 
 export function createNativeContinuationTerminal(
@@ -71,6 +73,8 @@ export function createNativeContinuationTerminal(
   const forkNativeCodexThread = dependencies.forkNativeCodexThread ?? defaultForkNativeCodexThread;
   const shellIntegrationTimeoutMs = dependencies.shellIntegrationTimeoutMs
     ?? defaultShellIntegrationTimeoutMs;
+  const shellCommandTimeoutMs = dependencies.shellCommandTimeoutMs
+    ?? defaultShellCommandTimeoutMs;
 
   return {
     reportsForkOutcome: true,
@@ -108,6 +112,7 @@ export function createNativeContinuationTerminal(
           api,
           shellIntegration,
           [archiveAction, invocation.args[1]],
+          shellCommandTimeoutMs,
         );
       } catch (error: unknown) {
         terminal.dispose();
@@ -164,9 +169,11 @@ async function executeTerminalCommand(
   api: NativeContinuationTerminalApi,
   shellIntegration: NativeContinuationShellIntegration,
   args: ["archive" | "unarchive", string],
+  timeoutMs: number,
 ): Promise<{ readonly exitCode: number }> {
   return await new Promise((resolve, reject) => {
     let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     let execution: NativeContinuationShellExecution | undefined;
     const earlyEndEvents: NativeContinuationShellExecutionEndEvent[] = [];
     const endSubscription = api.onDidEndTerminalShellExecution((event) => {
@@ -183,6 +190,9 @@ async function executeTerminalCommand(
     });
     try {
       execution = shellIntegration.executeCommand(nativeCodexCommand, args);
+      timer = setTimeout(() => {
+        settleError(new Error("The native Codex terminal command timed out."));
+      }, timeoutMs);
       for (const event of earlyEndEvents) {
         if (event.execution === execution) {
           settle(event.exitCode);
@@ -198,6 +208,9 @@ async function executeTerminalCommand(
         return;
       }
       settled = true;
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
       endSubscription.dispose();
       if (exitCode === undefined) {
         reject(new Error("The native Codex archive command did not report an exit code."));
@@ -211,6 +224,9 @@ async function executeTerminalCommand(
         return;
       }
       settled = true;
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
       endSubscription.dispose();
       reject(error);
     }
