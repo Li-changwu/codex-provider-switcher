@@ -8,6 +8,13 @@ const checksumName = "SHA256SUMS.txt";
 const artifactStatFields = ["dev", "ino", "size", "mtimeMs", "ctimeMs", "birthtimeMs"];
 const defaultFsOps = { link, lstat, open, readFile, readdir, realpath, rm, writeFile };
 
+/**
+ * Stages release artifacts from an exclusively created, private directory.
+ * Callers must prevent concurrent additions, replacements, or removals in the
+ * release directory for the entire duration of this operation. Windows has no
+ * pure-Node O_NOFOLLOW equivalent, so canonical-path checks fail closed when
+ * an artifact path changes before or after it is opened.
+ */
 export async function stageReleaseArtifacts({
   projectRoot,
   releaseDirectory,

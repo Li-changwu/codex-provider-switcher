@@ -320,6 +320,50 @@ test("uses no-follow flags and canonical paths for real artifact opens", async (
   }
 });
 
+test("fails closed when a Windows artifact path changes after open", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows canonical-path replacement contract");
+    return;
+  }
+
+  const fixture = await createFixture(t, validFiles);
+  const canonicalPaths: string[] = [];
+  let read = false;
+  let closed = false;
+
+  await assert.rejects(
+    stageReleaseArtifacts({
+      projectRoot: fixture.projectRoot,
+      releaseDirectory: fixture.releaseDirectory,
+      tag: "v0.1.0",
+      fsOps: {
+        realpath: async (path: string) => {
+          canonicalPaths.push(path);
+          return canonicalPaths.length === 1 ? path : `${path}.replaced`;
+        },
+        open: async (path: string) => {
+          const stats = await realLstat(path);
+          return {
+            stat: async () => stats,
+            readFile: async () => {
+              read = true;
+              return validFiles[linuxAsset];
+            },
+            close: async () => {
+              closed = true;
+            },
+          };
+        },
+      },
+    }),
+    /Release artifact path is not canonical/,
+  );
+
+  assert.equal(canonicalPaths.length, 2);
+  assert.equal(read, false);
+  assert.equal(closed, true);
+});
+
 test("does not clobber a checksum created before hard-link publish", async (t) => {
   const fixture = await createFixture(t, validFiles);
   const checksumPath = join(fixture.releaseDirectory, "SHA256SUMS.txt");
