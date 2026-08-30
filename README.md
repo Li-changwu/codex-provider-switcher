@@ -10,6 +10,33 @@ VS Code extension for maintaining named local Codex provider profiles and switch
 
 macOS, WSL, cross-device switching, and cloud profile/session synchronization are not supported.
 
+## Install from GitHub Releases
+
+This extension is distributed through [GitHub Releases](https://github.com/Li-changwu/codex-provider-switcher/releases), not the VS Code Marketplace. Download the VSIX that matches the machine running the VS Code Extension Host:
+
+- Native Windows x64: `codex-provider-switcher-<version>@win32-x64.vsix`.
+- Native glibc Linux x64: `codex-provider-switcher-<version>@linux-x64.vsix`.
+- Remote SSH Linux x64: open the Remote SSH window first, then use the Linux VSIX in that window so VS Code installs it on the remote Extension Host.
+
+Do not install either artifact on macOS, WSL, musl Linux, or a different CPU architecture.
+
+Each release includes `SHA256SUMS.txt`. Verify the downloaded VSIX before installation:
+
+```powershell
+Get-FileHash .\codex-provider-switcher-<version>@win32-x64.vsix -Algorithm SHA256
+Get-Content .\SHA256SUMS.txt
+```
+
+```sh
+sha256sum -c SHA256SUMS.txt
+```
+
+In VS Code, open the Extensions view, select the `...` menu, select **Install from VSIX...**, and choose the verified file. For Remote SSH, perform these steps in the connected Remote SSH window rather than a local window.
+
+### Upgrade and Uninstall
+
+To upgrade, download and verify the newer VSIX for the same Extension Host, then repeat **Install from VSIX...**. VS Code replaces the extension while preserving its local VS Code SecretStorage and the Codex Home data on that host. To uninstall, use the extension's gear menu and choose **Uninstall** in the same local or Remote SSH window where it was installed. Uninstalling the extension does not delete Codex profiles, backups, sessions, or credentials; remove those separately only when you explicitly intend to do so.
+
 ## Profiles and Credentials
 
 Create a named Profile with non-secret TOML configuration. Custom provider API keys are stored separately in VS Code SecretStorage; the TOML must not contain credentials.

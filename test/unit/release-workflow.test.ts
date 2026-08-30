@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const workflowPath = resolve(projectRoot, ".github/workflows/release.yml");
+const readmePath = resolve(projectRoot, "README.md");
+const developmentPath = resolve(projectRoot, "docs/development.md");
 
 test("release workflow is triggered only by pushed version tags", async () => {
   const workflow = await readFile(workflowPath, "utf8");
@@ -103,4 +105,26 @@ test("release job waits for both packages, validates assets, then creates the re
     releaseJob,
     /run: gh release create "\$GITHUB_REF_NAME" release-assets\/\* --repo "\$GITHUB_REPOSITORY" --title "\$GITHUB_REF_NAME" --generate-notes\r?\n\s+env:\r?\n\s+GH_TOKEN:\s+\$\{\{\s*github\.token\s*\}\}/,
   );
+});
+
+test("README documents verified VSIX installation, Remote SSH, upgrade, and uninstall", async () => {
+  const readme = await readFile(readmePath, "utf8");
+
+  assert.match(readme, /GitHub Releases/);
+  assert.match(readme, /SHA256SUMS\.txt/);
+  assert.match(readme, /Install from VSIX\.\.\./);
+  assert.match(readme, /Remote SSH/);
+  assert.match(readme, /Upgrade/);
+  assert.match(readme, /Uninstall/);
+});
+
+test("development documentation defines the tag contract and release gates", async () => {
+  const development = await readFile(developmentPath, "utf8");
+
+  assert.match(development, /v\$\{version\}/);
+  assert.match(development, /package\.json/);
+  assert.match(development, /SHA256SUMS\.txt/);
+  assert.match(development, /npm run package:win32-x64/);
+  assert.match(development, /npm run package:linux-x64/);
+  assert.match(development, /GitHub Release/);
 });
