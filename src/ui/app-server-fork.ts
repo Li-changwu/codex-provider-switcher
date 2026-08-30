@@ -1,9 +1,13 @@
 import { spawn as nodeSpawn } from "node:child_process";
+import { isAbsolute } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_STDOUT_BYTES = 64 * 1024;
 const DEFAULT_MAX_STDERR_BYTES = 16 * 1024;
+const MAX_TIMEOUT_MS = 60_000;
+const MAX_STDOUT_BYTES = 1024 * 1024;
+const MAX_STDERR_BYTES = 1024 * 1024;
 const FAILURE_MESSAGE = "Unable to obtain native Codex fork.";
 const TRUSTED_THREAD_ID = /^[A-Za-z0-9._-]+$/;
 
@@ -43,9 +47,18 @@ export interface ForkNativeCodexThreadInput {
 export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promise<string> {
   const command = input.command?.trim() || "codex";
   const clientVersion = input.clientVersion?.trim() || "0.1.0";
-  const timeoutMs = positiveLimit(input.timeoutMs, DEFAULT_TIMEOUT_MS);
-  const maxStdoutBytes = positiveLimit(input.maxStdoutBytes, DEFAULT_MAX_STDOUT_BYTES);
-  const maxStderrBytes = positiveLimit(input.maxStderrBytes, DEFAULT_MAX_STDERR_BYTES);
+  const timeoutMs = boundedOption(input.timeoutMs, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+  const maxStdoutBytes = boundedOption(input.maxStdoutBytes, DEFAULT_MAX_STDOUT_BYTES, MAX_STDOUT_BYTES);
+  const maxStderrBytes = boundedOption(input.maxStderrBytes, DEFAULT_MAX_STDERR_BYTES, MAX_STDERR_BYTES);
+  if (
+    !isTrustedId(input.sourceSessionId)
+    || !isAbsoluteCodexHome(input.codexHome)
+    || timeoutMs === undefined
+    || maxStdoutBytes === undefined
+    || maxStderrBytes === undefined
+  ) {
+    return Promise.reject(failure());
+  }
   let child: AppServerChild;
 
   try {
@@ -64,22 +77,24 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
     let phase: 1 | 2 = 1;
     let stdoutBuffer = "";
     let totalStdoutBytes = 0;
-    let retainedStderrBytes = 0;
-    const retainedStderr: Buffer[] = [];
+    let totalStderrBytes = 0;
     const decoder = new StringDecoder("utf8");
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
 
     const onChildFailure = () => settle();
+    const onChildClose = () => settle();
     const onStdioFailure = () => settle();
+    const ignoreLateError = () => undefined;
     const onStderrData = (chunk: unknown) => {
+      if (settled) {
+        return;
+      }
       const bytes = asBuffer(chunk);
-      const available = maxStderrBytes - retainedStderrBytes;
-      if (bytes.length > available) {
+      if (totalStderrBytes + bytes.length > maxStderrBytes) {
         settle();
         return;
       }
-      retainedStderr.push(Buffer.from(bytes));
-      retainedStderrBytes += bytes.length;
+      totalStderrBytes += bytes.length;
     };
     const onStdoutData = (chunk: unknown) => {
       if (settled) {
@@ -119,18 +134,12 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
     };
 
     child.on("error", onChildFailure);
-    child.on("exit", onChildFailure);
-    child.on("close", onChildFailure);
+    child.on("close", onChildClose);
     child.stdin.on("error", onStdioFailure);
-    child.stdin.on("close", onStdioFailure);
     child.stdout.on("data", onStdoutData);
     child.stdout.on("error", onStdioFailure);
-    child.stdout.on("end", onStdioFailure);
-    child.stdout.on("close", onStdioFailure);
     child.stderr.on("data", onStderrData);
     child.stderr.on("error", onStdioFailure);
-    child.stderr.on("end", onStdioFailure);
-    child.stderr.on("close", onStdioFailure);
     timeoutHandle = setTimeout(() => settle(), timeoutMs);
 
     try {
@@ -167,14 +176,22 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
         settle();
         return;
       }
-      if (Object.hasOwn(parsed, "error")) {
+      const hasMethod = Object.hasOwn(parsed, "method");
+      const hasId = Object.hasOwn(parsed, "id");
+      const hasResult = Object.hasOwn(parsed, "result");
+      const hasError = Object.hasOwn(parsed, "error");
+      if (hasMethod) {
+        if (typeof parsed.method !== "string" || hasId || hasResult || hasError) {
+          settle();
+          return;
+        }
+        return;
+      }
+      if (!hasId || parsed.id !== phase || hasResult === hasError) {
         settle();
         return;
       }
-      if (typeof parsed.method === "string") {
-        return;
-      }
-      if (parsed.id !== phase || !Object.hasOwn(parsed, "result")) {
+      if (hasError) {
         settle();
         return;
       }
@@ -219,20 +236,17 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
         clearTimeout(timeoutHandle);
       }
       child.removeListener("error", onChildFailure);
-      child.removeListener("exit", onChildFailure);
-      child.removeListener("close", onChildFailure);
+      child.removeListener("close", onChildClose);
       child.stdin.removeListener("error", onStdioFailure);
-      child.stdin.removeListener("close", onStdioFailure);
       child.stdout.removeListener("data", onStdoutData);
       child.stdout.removeListener("error", onStdioFailure);
-      child.stdout.removeListener("end", onStdioFailure);
-      child.stdout.removeListener("close", onStdioFailure);
       child.stderr.removeListener("data", onStderrData);
       child.stderr.removeListener("error", onStdioFailure);
-      child.stderr.removeListener("end", onStdioFailure);
-      child.stderr.removeListener("close", onStdioFailure);
-      retainedStderr.length = 0;
-      retainedStderrBytes = 0;
+      child.on("error", ignoreLateError);
+      child.stdin.on("error", ignoreLateError);
+      child.stdout.on("error", ignoreLateError);
+      child.stderr.on("error", ignoreLateError);
+      totalStderrBytes = 0;
       stdoutBuffer = "";
       totalStdoutBytes = 0;
       try {
@@ -257,8 +271,19 @@ function spawnAppServer(
   return nodeSpawn(command, args, options);
 }
 
-function positiveLimit(value: number | undefined, fallback: number): number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : fallback;
+function boundedOption(value: number | undefined, fallback: number, maximum: number): number | undefined {
+  if (value === undefined) {
+    return fallback;
+  }
+  return Number.isSafeInteger(value) && value > 0 && value <= maximum ? value : undefined;
+}
+
+function isAbsoluteCodexHome(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0 && isAbsolute(value);
+}
+
+function isTrustedId(value: unknown): value is string {
+  return typeof value === "string" && TRUSTED_THREAD_ID.test(value);
 }
 
 function asBuffer(chunk: unknown): Buffer {
