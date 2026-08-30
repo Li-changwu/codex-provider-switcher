@@ -20,8 +20,9 @@ Home.
 ## Native Continuation
 
 After a Profile switch has committed, the extension may offer a choice of local
-source session IDs. Continuation uses native Codex fork or reuse through the
-Codex app-server; it does not display, extract, replay, or use readable
+source session IDs. A new native branch obtains its ID from native Codex
+app-server `thread/fork`; an existing valid local mapping is reused with native
+`codex resume`. Continuation does not display, extract, replay, or use readable
 transcript content as a fallback. The local mapping store keeps at most three
 active branches for each source session and target Profile, applying native
 archive and unarchive retention locally when necessary. The manual

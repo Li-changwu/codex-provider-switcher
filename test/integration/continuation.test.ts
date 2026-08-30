@@ -100,6 +100,15 @@ class FakeAppServerChild extends EventEmitter implements AppServerChild {
       if (message.id === 1 && message.method === "initialize") {
         this.stdout.write('{"jsonrpc":"2.0","id":1,"result":{}}\n');
       } else if (message.id === 2 && message.method === "thread/fork") {
+        assert.deepEqual(message, {
+          jsonrpc: "2.0",
+          id: 2,
+          method: "thread/fork",
+          params: {
+            threadId: "source-1",
+            excludeTurns: true,
+          },
+        });
         this.stdout.write(`${JSON.stringify({
           jsonrpc: "2.0",
           id: 2,
