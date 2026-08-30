@@ -9,9 +9,13 @@ const workflowPath = resolve(projectRoot, ".github/workflows/release.yml");
 const readmePath = resolve(projectRoot, "README.md");
 const developmentPath = resolve(projectRoot, "docs/development.md");
 
+async function readWorkflow(): Promise<string> {
+  return (await readFile(workflowPath, "utf8")).replace(/\r\n/g, "\n");
+}
+
 test("release workflow is triggered only by pushed version tags", async () => {
-  const workflow = await readFile(workflowPath, "utf8");
-  const triggerBlock = workflow.match(/^on:\r?\n([\s\S]*?)^permissions:/m)?.[1];
+  const workflow = await readWorkflow();
+  const triggerBlock = workflow.match(/^on:\n([\s\S]*?)^permissions:/m)?.[1];
 
   assert.match(workflow, /name:\s*Release\b/);
   assert.equal(
@@ -22,8 +26,8 @@ test("release workflow is triggered only by pushed version tags", async () => {
 });
 
 test("package matrix builds both native VSIX targets and fails on missing artifacts", async () => {
-  const workflow = await readFile(workflowPath, "utf8");
-  const packageJob = workflow.match(/^  package:\r?\n([\s\S]*?)^  release:/m)?.[1] ?? "";
+  const workflow = await readWorkflow();
+  const packageJob = workflow.match(/^  package:\n([\s\S]*?)^  release:/m)?.[1] ?? "";
 
   assert.notEqual(packageJob, "", "package job must be present");
   assert.match(packageJob, /- os: windows-latest\r?\n\s+target: win32-x64/);
@@ -41,7 +45,7 @@ test("package matrix builds both native VSIX targets and fails on missing artifa
 });
 
 test("workflow pins every third-party action to an immutable commit", async () => {
-  const workflow = await readFile(workflowPath, "utf8");
+  const workflow = await readWorkflow();
   const actionUses = [...workflow.matchAll(/^\s+-\s+uses:\s+([^\s]+)$/gm)].map(
     (match) => match[1],
   );
@@ -65,21 +69,21 @@ test("workflow pins every third-party action to an immutable commit", async () =
 });
 
 test("only the release job can write repository contents", async () => {
-  const workflow = await readFile(workflowPath, "utf8");
+  const workflow = await readWorkflow();
 
-  const releaseJob = workflow.match(/^  release:\r?\n([\s\S]*)$/m)?.[1] ?? "";
+  const releaseJob = workflow.match(/^  release:\n([\s\S]*)$/m)?.[1] ?? "";
 
   assert.match(workflow, /^permissions:\r?\n  contents:\s*read\s*$/m);
   assert.match(releaseJob, /^    permissions:\r?\n      contents:\s*write\s*$/m);
   assert.equal((workflow.match(/contents:\s*write/g) ?? []).length, 1);
-  const packageJob = workflow.match(/\n  package:\s*\r?\n([\s\S]*?)\r?\n  release:/)?.[1] ?? "";
+  const packageJob = workflow.match(/\n  package:\s*\n([\s\S]*?)\n  release:/)?.[1] ?? "";
   assert.notEqual(packageJob, "", "package job must be present");
   assert.doesNotMatch(packageJob, /contents:\s*write/);
 });
 
 test("release job waits for both packages, validates assets, then creates the release", async () => {
-  const workflow = await readFile(workflowPath, "utf8");
-  const releaseJob = workflow.match(/^  release:\r?\n([\s\S]*)$/m)?.[1] ?? "";
+  const workflow = await readWorkflow();
+  const releaseJob = workflow.match(/^  release:\n([\s\S]*)$/m)?.[1] ?? "";
 
   assert.notEqual(releaseJob, "", "release job must be present");
   assert.match(releaseJob, /^    needs:\s*package\s*$/m);
