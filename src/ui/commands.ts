@@ -22,6 +22,10 @@ import type { ActiveProfileState, ProfileLookup } from "../core/profile-switch-o
 import type { ProfileSecretReader } from "../core/profile-switch-orchestrator";
 import type { SwitchRequest } from "../core/switch-service";
 import {
+  listContinuationSourceAnchors,
+  type ContinuationSourceAnchor,
+} from "../core/rollouts";
+import {
   recoverPendingSwitches as recoverPendingSwitchesByDefault,
   type RecoveryDependencies,
   type RecoveryResult,
@@ -108,6 +112,10 @@ export type BackupRecovery = (
   dependencies?: RecoveryDependencies,
 ) => Promise<RecoveryResult>;
 
+export type ContinuationSourceAnchorCatalog = (
+  layout: CodexLayout,
+) => Promise<readonly ContinuationSourceAnchor[]>;
+
 export interface ProfileCommandDependencies {
   readonly layout: CodexLayout;
   readonly profiles: CommandProfileStore;
@@ -117,6 +125,8 @@ export interface ProfileCommandDependencies {
   readonly officialLogin?: OfficialLoginExecutor;
   readonly switchStoredProfile?: StoredProfileSwitcher;
   readonly continueSession?: SessionContinuation;
+  readonly continuationSourceAnchors?: ContinuationSourceAnchorCatalog;
+  readonly nativeContinuationTerminal?: InteractiveCodexTerminal;
   readonly recoverPendingSwitches?: BackupRecovery;
   readonly restoreAuthMode?: NonNullable<RecoveryDependencies["restoreAuthMode"]>;
   readonly refreshStatus?: () => Promise<void>;
@@ -137,6 +147,8 @@ export function createProfileCommandHandlers(
   const mutex = new OperationMutex();
   const switchProfile = dependencies.switchStoredProfile ?? switchStoredProfileByDefault;
   const continueSession = dependencies.continueSession ?? continueStoredSession;
+  const continuationSourceAnchors = dependencies.continuationSourceAnchors
+    ?? listContinuationSourceAnchors;
   const recoverPendingSwitches = dependencies.recoverPendingSwitches
     ?? recoverPendingSwitchesByDefault;
 
@@ -300,6 +312,9 @@ export function createProfileCommandHandlers(
       }
       const result = await switchWithProgress(selectedProfile.id, "Switching Codex Profile");
       await reportSwitchResult(result);
+      if (result.status === "committed" && dependencies.nativeContinuationTerminal) {
+        await offerNativeContinuation(selectedProfile.id);
+      }
     } catch {
       await dependencies.ui.error("Could not switch the Codex Profile.");
     } finally {
@@ -357,6 +372,51 @@ export function createProfileCommandHandlers(
       await dependencies.ui.error("Could not start native Codex resume.");
     } finally {
       await refreshStatus();
+    }
+  }
+
+  async function offerNativeContinuation(targetProfileId: string): Promise<void> {
+    try {
+      const anchors = await continuationSourceAnchors(dependencies.layout);
+      if (anchors.length === 0) {
+        await dependencies.ui.info("No local Codex sessions are available for native continuation.");
+        return;
+      }
+      const selected = await dependencies.ui.pick(
+        anchors.map((anchor) => ({
+          label: anchor.sessionId,
+          value: anchor.sessionId,
+        })),
+        { placeHolder: "Select a local Codex session to continue" },
+      );
+      if (!selected) {
+        return;
+      }
+      const anchor = anchors.find((candidate) => candidate.sessionId === selected.value);
+      if (!anchor) {
+        return;
+      }
+      const result = await continueSession({
+        layout: dependencies.layout,
+        sessionId: anchor.sessionId,
+        sourceEventHash: anchor.sourceEventHash,
+        targetProfileId,
+        mode: "fork",
+        terminal: dependencies.nativeContinuationTerminal!,
+      });
+      if (result.status === "forked" || result.status === "reusedBranch") {
+        await dependencies.ui.info("Native Codex continuation started.");
+        return;
+      }
+      if (result.status === "readableContentFallback") {
+        await dependencies.ui.info(
+          "Native Codex continuation is unavailable. No readable content was transferred.",
+        );
+        return;
+      }
+      await dependencies.ui.info("Native Codex continuation started.");
+    } catch {
+      await dependencies.ui.error("Native Codex continuation is unavailable.");
     }
   }
 

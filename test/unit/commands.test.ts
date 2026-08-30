@@ -4,7 +4,9 @@ import {
   createProfileCommandHandlers,
   createVscodeProfileCommandUi,
 } from "../../src/ui/commands";
+import type { InteractiveCodexTerminal } from "../../src/core/continuation";
 import type { OfficialLoginExecutor } from "../../src/core/official-login";
+import type { ContinuationSourceAnchor } from "../../src/core/rollouts";
 import type { CodexLayout, ProfileRecord } from "../../src/core/types";
 
 const customToml = [
@@ -286,8 +288,153 @@ test("does not provide readable content or implicit consent to a continuation fa
   assert.equal(request?.mode, "resume");
   assert.equal(request?.readableFallbackPrompt, undefined);
   assert.equal(request?.confirmReadableContent, undefined);
+  assert.equal(fixture.ui.inputPrompts.at(-1), "Session ID to resume");
+  assert.deepEqual(fixture.ui.createTerminalTitles, ["Codex: Resume session-123"]);
   assert.equal(fixture.ui.confirmations.length, 0);
   assert.match(fixture.ui.infos.at(-1) ?? "", /No readable content was transferred/);
+});
+
+test("offers metadata-only native continuation after a committed Profile switch", async () => {
+  const target = profile("research", "Research", "custom");
+  const fixtureSecret = "fixture secret message";
+  const fixturePath = "/private/rollouts/session.jsonl";
+  const sourceEventHash = "a".repeat(64);
+  const anchor: ContinuationSourceAnchor = {
+    sessionId: "session-123",
+    sourceEventHash,
+  };
+  const nativeTerminal = fakeNativeContinuationTerminal();
+  const fixture = commandFixture({
+    records: [target],
+    activeProfileId: target.id,
+    picks: [target.id, anchor.sessionId],
+    confirmations: [true],
+    nativeContinuationTerminal: nativeTerminal,
+  });
+  let catalogLayout: CodexLayout | undefined;
+  let request: Record<string, unknown> | undefined;
+  fixture.continuationSourceAnchors = async (value) => {
+    catalogLayout = value;
+    return [anchor];
+  };
+  fixture.continueSession = async (value) => {
+    request = value as unknown as Record<string, unknown>;
+    return {
+      status: "forked",
+      sourceSessionId: anchor.sessionId,
+      branchSessionId: "branch-456",
+    };
+  };
+  fixture.rebuildHandlers();
+
+  await fixture.handlers.switchProfile();
+
+  assert.equal(catalogLayout, fixture.layout);
+  assert.deepEqual(fixture.ui.pickItems[1], [
+    { label: anchor.sessionId, value: anchor.sessionId },
+  ]);
+  assert.deepEqual(request, {
+    layout: fixture.layout,
+    sessionId: anchor.sessionId,
+    sourceEventHash,
+    targetProfileId: target.id,
+    mode: "fork",
+    terminal: nativeTerminal,
+  });
+  const visibleTrace = JSON.stringify({
+    pickItems: fixture.ui.pickItems,
+    infos: fixture.ui.infos,
+    errors: fixture.ui.errors,
+  });
+  assert.doesNotMatch(visibleTrace, new RegExp(fixtureSecret));
+  assert.doesNotMatch(visibleTrace, new RegExp(fixturePath));
+  assert.doesNotMatch(visibleTrace, new RegExp(sourceEventHash));
+  assert.match(fixture.ui.infos.at(-1) ?? "", /Native Codex continuation started/);
+});
+
+test("does nothing when the post-switch native continuation picker is dismissed", async () => {
+  const target = profile("research", "Research", "custom");
+  const fixture = commandFixture({
+    records: [target],
+    activeProfileId: target.id,
+    picks: [target.id],
+    confirmations: [true],
+    nativeContinuationTerminal: fakeNativeContinuationTerminal(),
+  });
+  let continuationCalls = 0;
+  fixture.continuationSourceAnchors = async () => [{
+    sessionId: "session-123",
+    sourceEventHash: "b".repeat(64),
+  }];
+  fixture.continueSession = async () => {
+    continuationCalls += 1;
+    return { status: "forked", sourceSessionId: "session-123" };
+  };
+  fixture.rebuildHandlers();
+
+  await fixture.handlers.switchProfile();
+
+  assert.equal(fixture.ui.pickItems.length, 2);
+  assert.equal(continuationCalls, 0);
+});
+
+test("does not inspect continuation anchors for cancelled or failed Profile switches", async () => {
+  for (const status of ["cancelled", "failed"] as const) {
+    const target = profile("research", "Research", "custom");
+    const fixture = commandFixture({
+      records: [target],
+      activeProfileId: target.id,
+      picks: [target.id],
+      confirmations: [true],
+      nativeContinuationTerminal: fakeNativeContinuationTerminal(),
+    });
+    let catalogCalls = 0;
+    fixture.continuationSourceAnchors = async () => {
+      catalogCalls += 1;
+      return [];
+    };
+    fixture.switchStoredProfile = async () => switchResult(status);
+    fixture.rebuildHandlers();
+
+    await fixture.handlers.switchProfile();
+
+    assert.equal(catalogCalls, 0, status);
+    assert.equal(fixture.ui.pickItems.length, 1, status);
+  }
+});
+
+test("redacts post-switch native continuation catalog and continuation failures", async () => {
+  for (const failure of ["catalog", "continuation"] as const) {
+    const target = profile("research", "Research", "custom");
+    const fixture = commandFixture({
+      records: [target],
+      activeProfileId: target.id,
+      picks: [target.id, "session-123"],
+      confirmations: [true],
+      nativeContinuationTerminal: fakeNativeContinuationTerminal(),
+    });
+    const secret = `secret-${failure}-failure`;
+    fixture.continuationSourceAnchors = async () => {
+      if (failure === "catalog") {
+        throw new Error(secret);
+      }
+      return [{ sessionId: "session-123", sourceEventHash: "c".repeat(64) }];
+    };
+    fixture.continueSession = async () => {
+      if (failure === "continuation") {
+        throw new Error(secret);
+      }
+      return { status: "forked", sourceSessionId: "session-123" };
+    };
+    fixture.rebuildHandlers();
+
+    await fixture.handlers.switchProfile();
+
+    const messages = JSON.stringify({ infos: fixture.ui.infos, errors: fixture.ui.errors });
+    assert.doesNotMatch(messages, new RegExp(secret));
+    assert.doesNotMatch(messages, /Could not switch the Codex Profile/);
+    assert.match(messages, /Native Codex continuation is unavailable/);
+  }
 });
 
 test("redacts a custom key when SecretStorage rejects a post-create write", async () => {
@@ -315,6 +462,7 @@ function commandFixture(options: {
   cancelProgress?: boolean;
   failSecretWrite?: boolean;
   officialLogin?: OfficialLoginExecutor;
+  nativeContinuationTerminal?: InteractiveCodexTerminal;
 } = {}) {
   const events: string[] = [];
   const profiles = new FakeProfiles(options.records ?? [], events);
@@ -334,9 +482,11 @@ function commandFixture(options: {
     recoveryRequiredOperationIds: [],
     recoveryDiagnostics: [],
   });
+  let continuationSourceAnchors = async (): Promise<readonly ContinuationSourceAnchor[]> => [];
 
+  const fixtureLayout = layout();
   const dependencies = () => ({
-    layout: layout(),
+    layout: fixtureLayout,
     profiles,
     secrets,
     activeProfiles,
@@ -344,6 +494,10 @@ function commandFixture(options: {
     officialLogin,
     switchStoredProfile,
     continueSession,
+    continuationSourceAnchors,
+    ...(options.nativeContinuationTerminal === undefined
+      ? {}
+      : { nativeContinuationTerminal: options.nativeContinuationTerminal }),
     recoverPendingSwitches,
     refreshStatus: async () => {
       statusRefreshes += 1;
@@ -358,6 +512,7 @@ function commandFixture(options: {
     get handlers() {
       return handlers;
     },
+    layout: fixtureLayout,
     profiles,
     rebuildHandlers() {
       handlers = createProfileCommandHandlers(dependencies());
@@ -374,6 +529,9 @@ function commandFixture(options: {
     },
     set continueSession(value) {
       continueSession = value;
+    },
+    set continuationSourceAnchors(value) {
+      continuationSourceAnchors = value;
     },
     set recoverPendingSwitches(value) {
       recoverPendingSwitches = value;
@@ -473,8 +631,10 @@ class FakeUi {
   readonly errors: string[] = [];
   readonly infos: string[] = [];
   readonly inputOptions: Array<{ password?: boolean }> = [];
+  readonly inputPrompts: string[] = [];
   readonly pickItems: Array<Array<{ label: string; description?: string; value: string }>> = [];
   readonly progressReports: Array<{ message: string; increment?: number }> = [];
+  readonly createTerminalTitles: string[] = [];
   private readonly inputs: string[];
   private readonly picks: string[];
   private readonly confirmationAnswers: boolean[];
@@ -495,17 +655,23 @@ class FakeUi {
 
   private readonly cancelProgress: boolean;
 
-  async input(options: { password?: boolean }): Promise<string | undefined> {
+  async input(options: { password?: boolean; prompt?: string }): Promise<string | undefined> {
     this.inputOptions.push(options);
+    this.inputPrompts.push(options.prompt ?? "");
     return this.inputs.shift();
   }
 
   async pick<T extends { value: string }>(items: readonly T[]): Promise<T | undefined> {
-    this.pickItems.push(items.map((item) => ({
-      label: (item as T & { label: string }).label,
-      description: (item as T & { description?: string }).description,
-      value: item.value,
-    })));
+    this.pickItems.push(items.map((item) => {
+      const pickItem = item as T & { label: string; description?: string };
+      return {
+        label: pickItem.label,
+        ...(Object.hasOwn(pickItem, "description")
+          ? { description: pickItem.description }
+          : {}),
+        value: pickItem.value,
+      };
+    }));
     const selected = this.picks.shift();
     return items.find((item) => item.value === selected);
   }
@@ -548,7 +714,8 @@ class FakeUi {
     await task;
   }
 
-  createTerminal() {
+  createTerminal(title: string) {
+    this.createTerminalTitles.push(title);
     return {
       launch: async () => ({}),
     };
@@ -588,7 +755,14 @@ function profile(
   };
 }
 
-function switchResult(status: "committed" | "cancelled") {
+function fakeNativeContinuationTerminal(): InteractiveCodexTerminal {
+  return {
+    reportsForkOutcome: true,
+    launch: async () => ({ exitCode: 0, branchSessionId: "unused-branch" }),
+  };
+}
+
+function switchResult(status: "committed" | "cancelled" | "failed") {
   return {
     status,
     operationId: "operation-1",
