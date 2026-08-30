@@ -120,6 +120,76 @@ test("fails closed when continuation source metadata is missing or malformed", a
   }
 });
 
+test("redacts missing continuation anchor metadata failures", async () => {
+  await withLayout(async (layout) => {
+    const path = join(layout.sessionsDir, "missing-anchor-fixture.jsonl");
+    const transcript = "missing-anchor-transcript";
+    await writeFile(path, `${messageLineWithText(transcript)}\n`, "utf8");
+
+    await assert.rejects(
+      () => listContinuationSourceAnchors(layout),
+      (error: unknown) => {
+        if (!(error instanceof RolloutValidationError)) {
+          return false;
+        }
+        assert.equal(error.message.includes(path), false);
+        assert.equal(error.message.includes(transcript), false);
+        return error.code === "missing-session-id";
+      },
+    );
+  });
+});
+
+test("redacts malformed continuation anchor metadata failures", async () => {
+  await withLayout(async (layout) => {
+    const path = join(layout.sessionsDir, "malformed-anchor-fixture.jsonl");
+    const transcript = "malformed-anchor-transcript";
+    await writeFile(
+      path,
+      `{"type":"session_meta","payload":null}\n${messageLineWithText(transcript)}\n`,
+      "utf8",
+    );
+
+    await assert.rejects(
+      () => listContinuationSourceAnchors(layout),
+      (error: unknown) => {
+        if (!(error instanceof RolloutValidationError)) {
+          return false;
+        }
+        assert.equal(error.message.includes(path), false);
+        assert.equal(error.message.includes(transcript), false);
+        return error.code === "unsupported-layout";
+      },
+    );
+  });
+});
+
+test("redacts duplicate continuation anchor metadata failures", async () => {
+  await withLayout(async (layout) => {
+    const activePath = join(layout.sessionsDir, "duplicate-anchor-active.jsonl");
+    const archivedPath = join(layout.archivedSessionsDir, "duplicate-anchor-fixture.jsonl");
+    const transcript = "duplicate-anchor-transcript";
+    await writeFile(activePath, `${sessionMetaLine("duplicate-anchor", "openai")}\n`, "utf8");
+    await writeFile(
+      archivedPath,
+      `${sessionMetaLine("duplicate-anchor", "custom")}\n${messageLineWithText(transcript)}\n`,
+      "utf8",
+    );
+
+    await assert.rejects(
+      () => listContinuationSourceAnchors(layout),
+      (error: unknown) => {
+        if (!(error instanceof RolloutValidationError)) {
+          return false;
+        }
+        assert.equal(error.message.includes(archivedPath), false);
+        assert.equal(error.message.includes(transcript), false);
+        return error.code === "unsupported-layout";
+      },
+    );
+  });
+});
+
 test("rejects a sessions directory symlink that escapes Codex Home", async (t) => {
   const externalRoot = await mkdtemp(join(tmpdir(), "codex-rollout-external-"));
   try {

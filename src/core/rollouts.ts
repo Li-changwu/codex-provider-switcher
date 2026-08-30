@@ -194,25 +194,33 @@ export async function scanRollouts(
 export async function listContinuationSourceAnchors(
   layout: CodexLayout,
 ): Promise<ContinuationSourceAnchor[]> {
-  const candidates = await findRolloutFiles(layout);
-  const sessionIds = new Set<string>();
-  const anchors: ContinuationSourceAnchor[] = [];
+  try {
+    const candidates = await findRolloutFiles(layout);
+    const sessionIds = new Set<string>();
+    const anchors: ContinuationSourceAnchor[] = [];
 
-  for (const candidate of candidates) {
-    const anchor = await scanContinuationSourceAnchor(candidate.path, candidate.identity);
-    if (sessionIds.has(anchor.sessionId)) {
-      throw new RolloutValidationError(
-        "unsupported-layout",
-        `Session ${anchor.sessionId} appears in more than one rollout: ${candidate.path}`,
-      );
+    for (const candidate of candidates) {
+      const anchor = await scanContinuationSourceAnchor(candidate.path, candidate.identity);
+      if (sessionIds.has(anchor.sessionId)) {
+        throw new RolloutValidationError(
+          "unsupported-layout",
+          `Session ${anchor.sessionId} appears in more than one rollout: ${candidate.path}`,
+        );
+      }
+      sessionIds.add(anchor.sessionId);
+      anchors.push(anchor);
     }
-    sessionIds.add(anchor.sessionId);
-    anchors.push(anchor);
-  }
 
-  return anchors.sort((left, right) =>
-    left.sessionId < right.sessionId ? -1 : left.sessionId > right.sessionId ? 1 : 0,
-  );
+    return anchors.sort((left, right) =>
+      left.sessionId < right.sessionId ? -1 : left.sessionId > right.sessionId ? 1 : 0,
+    );
+  } catch (error: unknown) {
+    const code = error instanceof RolloutValidationError ? error.code : "unsupported-layout";
+    throw new RolloutValidationError(
+      code,
+      "Continuation source anchors could not be resolved.",
+    );
+  }
 }
 
 export async function applyRolloutChanges(
