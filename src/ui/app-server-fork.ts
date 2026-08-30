@@ -11,7 +11,7 @@ const MAX_TERMINATION_GRACE_TIMEOUT_MS = 10_000;
 const MAX_STDOUT_BYTES = 1024 * 1024;
 const MAX_STDERR_BYTES = 1024 * 1024;
 const FAILURE_MESSAGE = "Unable to obtain native Codex fork.";
-const TRUSTED_THREAD_ID = /^[A-Za-z0-9._-]+$/;
+const TRUSTED_THREAD_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 export interface AppServerChild {
   readonly stdin: NodeJS.WritableStream;

@@ -178,6 +178,19 @@ test("disposes the unarchive terminal when Shell Integration execution throws", 
   assert.equal(harness.endListenerCount, 0);
 });
 
+test("disposes the archive terminal when showing it throws", async () => {
+  const failure = new Error("show failed");
+  const harness = createHarness({ showError: failure });
+  const adapter = createNativeContinuationTerminal(harness.api, layout(), {
+    forkNativeCodexThread: harness.fork,
+  });
+
+  await assert.rejects(adapter.launch(invocation("archive", "source-1")), failure);
+  assert.equal(harness.disposeCalls, 1);
+  assert.equal(harness.shellIntegrationListenerCount, 0);
+  assert.equal(harness.endListenerCount, 0);
+});
+
 test("fork delegates to the native fork client without creating a terminal", async () => {
   const harness = createHarness({ branchSessionId: "branch-2" });
   const adapter = createNativeContinuationTerminal(harness.api, layout(), {

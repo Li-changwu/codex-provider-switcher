@@ -101,6 +101,20 @@ test("fails closed for a missing or malformed fork thread identifier", async () 
   }
 });
 
+test("rejects a fork thread identifier that begins with an option marker", async () => {
+  const harness = createHarness();
+  const { resultPromise } = await startThroughForkRequest(harness);
+
+  harness.writeStdout(`${JSON.stringify({
+    jsonrpc: "2.0",
+    id: 2,
+    result: { thread: { id: "-help" } },
+  })}\n`);
+  harness.child.emit("close", 1, null);
+
+  await assertFailsClosed(resultPromise, harness.child);
+});
+
 test("rejects invalid input and unbounded limits before spawning", async () => {
   const invalidInputs: Array<Partial<ForkNativeCodexThreadInput>> = [
     { timeoutMs: 0 },

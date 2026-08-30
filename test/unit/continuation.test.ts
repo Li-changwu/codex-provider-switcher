@@ -169,6 +169,22 @@ test("launches native resume with an argument array after one capability check",
   });
 });
 
+test("rejects a continuation request whose session ID begins with an option marker", async () => {
+  await withLayout(async (layout) => {
+    await assert.rejects(
+      () => continueSession({
+        layout,
+        sessionId: "-help",
+        mode: "resume",
+        targetProfileId: "custom",
+        terminal: new FakeTerminal(),
+        commandRunner: successfulHelp,
+      }),
+      /session ID is invalid/i,
+    );
+  });
+});
+
 test("reuses an active fork only while the source event hash is unchanged", async () => {
   await withLayout(async (layout) => {
     clearCodexCapabilityCacheForTests();
@@ -631,6 +647,27 @@ test("fails closed when a trusted terminal does not report a fork session ID", a
       /did not report a trusted session ID/i,
     );
     assert.deepEqual(terminal.invocations.map((invocation) => invocation.args[0]), ["fork"]);
+    assert.deepEqual(await listBranchMappings(layout), []);
+  });
+});
+
+test("rejects a fork mapping whose branch session ID begins with an option marker", async () => {
+  await withLayout(async (layout) => {
+    clearCodexCapabilityCacheForTests();
+    const terminal = new FakeTerminal([{ branchSessionId: "-help" }]);
+
+    await assert.rejects(
+      () => continueSession({
+        layout,
+        sessionId: "source-1",
+        mode: "fork",
+        targetProfileId: "custom",
+        sourceEventHash: hash("source revision"),
+        terminal,
+        commandRunner: successfulHelp,
+      }),
+      /branch session ID is invalid/i,
+    );
     assert.deepEqual(await listBranchMappings(layout), []);
   });
 });

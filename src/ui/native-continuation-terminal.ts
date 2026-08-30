@@ -111,11 +111,11 @@ export function createNativeContinuationTerminal(
           throw error;
         }
       }
-      terminal.show(true);
       const archiveAction: "archive" | "unarchive" = invocation.args[0] === "archive"
         ? "archive"
         : "unarchive";
       try {
+        terminal.show(true);
         const shellIntegration = await waitForShellIntegration(
           api,
           terminal,

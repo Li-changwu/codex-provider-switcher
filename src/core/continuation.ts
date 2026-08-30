@@ -23,7 +23,7 @@ const maximumCapturedCommandOutputBytes = 64 * 1024;
 const maximumReadableFallbackBytes = 128 * 1024;
 const defaultCapabilityProbeTimeoutMs = 10_000;
 const continuationDatabaseBusyTimeoutMs = 10_000;
-const sessionIdentifierPattern = /^[A-Za-z0-9._-]+$/;
+const sessionIdentifierPattern = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const profileIdentifierPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const sha256Pattern = /^[a-f0-9]{64}$/i;
 
