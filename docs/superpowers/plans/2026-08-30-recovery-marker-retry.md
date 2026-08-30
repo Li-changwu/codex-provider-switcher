@@ -19,32 +19,36 @@
 - [ ] **Step 1: Write a failing test for a retry that succeeds**
 
 Add a test named `retries recoveryRequired journalling after rollback fails`.
-Use the existing `withLayout` and `dependencies` helpers. Supply a commit
-mutation that writes new config bytes and then throws. In `transactionIo`,
-wrap `renameJournal` and count published `recoveryRequired` records. Throw on
-the first such publication only, then delegate to the real `rename`; the
-transaction's own rollback failure should leave the outer switch service with
-the opportunity to retry. Assert the result is `failed`, its `journalState`
-is `recoveryRequired`, and the final journal entry has that state. Assert the
-marker publication count is at least two and the replacement config bytes are
-still present. Run:
+Use the existing `withLayout` and `dependencies` helpers. Supply a legal auth
+mutation with `markTargetAppliedBeforeApply: true`; its `apply` removes the
+auth file and throws, while the injected `restoreAuthMode` throws during
+rollback. In `transactionIo`, wrap `renameJournal` and count published
+`recoveryRequired` records. Throw on the first such publication only, then
+delegate to the real `rename`; the transaction's internal marker attempt
+fails and the outer switch service must retry. Assert the result is `failed`,
+its `journalState` is `recoveryRequired`, the marker publication count is
+exactly two, and the final journal entry has that state. Assert the auth mode
+and missing auth file remain in the failed post-apply state. Run:
 
 ```text
 npx tsx --test test/unit/switch-service.test.ts --test-name-pattern "retries recoveryRequired"
 ```
 
-Expected: FAIL because `rollbackAfterFailure` currently skips the outer
-`markRecoveryRequired()` call.
+Expected: FAIL with one observed marker publication because
+`rollbackAfterFailure` currently skips the outer `markRecoveryRequired()`
+call.
 
 - [ ] **Step 2: Add a failing test for a second marker failure**
 
 Add a test named `keeps recovery marker failure diagnostics bounded` using the
-same mutation. Make every `recoveryRequired` journal publication throw an
-error containing the sentinel text `journal-secret-detail`. Assert the result
-is `failed`, `journalState` is `recoveryRequired`, and serializing the result
-does not contain `journal-secret-detail`. Assert the transaction lock is
-released so a later `beginTransaction` can acquire it. Run the focused test
-command again and confirm the test fails because the retry is unreachable.
+same auth mutation and restoration failure. Make every `recoveryRequired`
+journal publication throw an error containing the sentinel text
+`journal-secret-detail`. Assert the result is `failed`, `journalState` is
+`recoveryRequired`, the two marker attempts are observed, and serializing the
+result does not contain `journal-secret-detail`. Assert the transaction lock
+is released so a later `beginTransaction` can acquire it. Run the focused test
+command again and confirm the test fails with one marker attempt because the
+retry is unreachable.
 
 - [ ] **Step 3: Preserve the no-retry success path**
 

@@ -35,9 +35,11 @@ write and the outer retry fail.
 
 ## Verification
 
-Unit tests will inject a journal append failure at the first
-`recoveryRequired` publication and verify the outer retry succeeds. A second
-case will fail both publications and verify a bounded `recoveryRequired`
-result without leaking injected error text. An existing successful rollback
-case will verify no marker retry occurs. The complete type check, unit suite,
-integration suite, and whitespace check remain required before the PR.
+Unit tests will use the supported auth pre-apply evidence path and inject an
+auth restoration failure, so `rollback()` reaches its durable recovery marker
+boundary. The first case will fail the transaction's marker publication and
+verify the outer retry succeeds on the second attempt. A second case will
+fail both publications and verify a bounded `recoveryRequired` result without
+leaking injected error text. An existing successful rollback case will verify
+no marker retry occurs. The complete type check, unit suite, integration
+suite, and whitespace check remain required before the PR.
