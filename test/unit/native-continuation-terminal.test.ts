@@ -90,6 +90,36 @@ test("fails closed and removes listeners when Shell Integration is unavailable",
   await assert.rejects(adapter.launch(invocation("archive", "source-1")), /shell integration/i);
 
   assert.deepEqual(harness.commands, []);
+  assert.equal(harness.disposeCalls, 1);
+  assert.equal(harness.shellIntegrationListenerCount, 0);
+  assert.equal(harness.endListenerCount, 0);
+});
+
+test("disposes the archive terminal when its matching execution has no exit code", async () => {
+  const harness = createHarness({ deferCommandEnd: true });
+  const adapter = createNativeContinuationTerminal(harness.api, layout(), {
+    forkNativeCodexThread: harness.fork,
+  });
+
+  const resultPromise = adapter.launch(invocation("archive", "source-1"));
+  await harness.commandStarted;
+  harness.finishLatestCommand(undefined);
+
+  await assert.rejects(resultPromise, /did not report an exit code/i);
+  assert.equal(harness.disposeCalls, 1);
+  assert.equal(harness.shellIntegrationListenerCount, 0);
+  assert.equal(harness.endListenerCount, 0);
+});
+
+test("disposes the unarchive terminal when Shell Integration execution throws", async () => {
+  const failure = new Error("execution failed");
+  const harness = createHarness({ commandError: failure });
+  const adapter = createNativeContinuationTerminal(harness.api, layout(), {
+    forkNativeCodexThread: harness.fork,
+  });
+
+  await assert.rejects(adapter.launch(invocation("unarchive", "source-1")), failure);
+  assert.equal(harness.disposeCalls, 1);
   assert.equal(harness.shellIntegrationListenerCount, 0);
   assert.equal(harness.endListenerCount, 0);
 });
@@ -226,6 +256,7 @@ function layout(): CodexLayout {
 
 interface HarnessOptions {
   readonly branchSessionId?: string;
+  readonly commandError?: Error;
   readonly deferCommandEnd?: boolean;
   readonly exitCodes?: readonly number[];
   readonly forkError?: Error;
@@ -253,6 +284,9 @@ function createHarness(options: HarnessOptions = {}) {
   let showCalls = 0;
   const shell: FakeShell = {
     executeCommand(executable, args) {
+      if (options.commandError) {
+        throw options.commandError;
+      }
       const execution = { id: ++executionId };
       latestExecution = execution;
       commands.push([executable, [...args]]);
@@ -263,6 +297,7 @@ function createHarness(options: HarnessOptions = {}) {
       return execution;
     },
   };
+  let disposeCalls = 0;
   const terminal: FakeTerminal = {
     shellIntegration: options.shellIntegration === false ? undefined : shell,
     show() {
@@ -270,6 +305,9 @@ function createHarness(options: HarnessOptions = {}) {
     },
     sendText(text, shouldExecute) {
       sent.push({ text, shouldExecute });
+    },
+    dispose() {
+      disposeCalls += 1;
     },
   };
   const api: NativeContinuationTerminalApi = {
@@ -293,6 +331,9 @@ function createHarness(options: HarnessOptions = {}) {
     commandStarted,
     get commands() {
       return commands;
+    },
+    get disposeCalls() {
+      return disposeCalls;
     },
     get endListenerCount() {
       return executionEndEvent.listenerCount;
@@ -334,6 +375,7 @@ interface FakeTerminal {
   readonly shellIntegration: FakeShell | undefined;
   show(preserveFocus?: boolean): void;
   sendText(text: string, shouldExecute?: boolean): void;
+  dispose(): void;
 }
 
 class TestEvent<Event> {

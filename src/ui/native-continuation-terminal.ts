@@ -15,6 +15,7 @@ export interface NativeContinuationTerminal {
   readonly shellIntegration: NativeContinuationShellIntegration | undefined;
   show(preserveFocus?: boolean): void;
   sendText(text: string, shouldExecute?: boolean): void;
+  dispose(): void;
 }
 
 export interface NativeContinuationDisposable {
@@ -97,16 +98,21 @@ export function createNativeContinuationTerminal(
       const archiveAction: "archive" | "unarchive" = invocation.args[0] === "archive"
         ? "archive"
         : "unarchive";
-      const shellIntegration = await waitForShellIntegration(
-        api,
-        terminal,
-        shellIntegrationTimeoutMs,
-      );
-      return await executeTerminalCommand(
-        api,
-        shellIntegration,
-        [archiveAction, invocation.args[1]],
-      );
+      try {
+        const shellIntegration = await waitForShellIntegration(
+          api,
+          terminal,
+          shellIntegrationTimeoutMs,
+        );
+        return await executeTerminalCommand(
+          api,
+          shellIntegration,
+          [archiveAction, invocation.args[1]],
+        );
+      } catch (error: unknown) {
+        terminal.dispose();
+        throw error;
+      }
     },
   };
 }
