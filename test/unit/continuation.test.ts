@@ -235,6 +235,52 @@ test("reuses an active fork only while the source event hash is unchanged", asyn
   });
 });
 
+test("rejects a stale reusable mapping before resuming its branch", async () => {
+  await withLayout(async (layout) => {
+    clearCodexCapabilityCacheForTests();
+    const oldSourceEventHash = hash("source revision one");
+    const createTerminal = new FakeTerminal([{ branchSessionId: "branch-1" }]);
+
+    await continueSession({
+      layout,
+      sessionId: "source-1",
+      mode: "fork",
+      targetProfileId: "custom",
+      sourceEventHash: oldSourceEventHash,
+      terminal: createTerminal,
+      commandRunner: successfulHelp,
+    });
+
+    const before = await listBranchMappings(layout);
+    const terminal = new FakeTerminal();
+    const newSourceEventHash = hash("source revision changed");
+
+    await assert.rejects(
+      () => continueSession({
+        layout,
+        sessionId: "source-1",
+        mode: "fork",
+        targetProfileId: "custom",
+        sourceEventHash: oldSourceEventHash,
+        sourceAnchorCatalog: async () => [{
+          sessionId: "source-1",
+          sourceEventHash: newSourceEventHash,
+        }],
+        terminal,
+        commandRunner: successfulHelp,
+      }),
+      (error: unknown) => (
+        error instanceof ContinuationError &&
+        error.code === "invalid-event-hash" &&
+        !/source revision|source-1|[a-f0-9]{64}/i.test(error.message)
+      ),
+    );
+
+    assert.deepEqual(terminal.invocations, []);
+    assert.deepEqual(await listBranchMappings(layout), before);
+  });
+});
+
 test("reactivates an archived fork when its source hash becomes current again", async () => {
   await withLayout(async (layout) => {
     clearCodexCapabilityCacheForTests();
@@ -657,6 +703,7 @@ test("fails closed when the source anchor changes after capacity reservation", a
     await createActiveMappings(layout, 3);
     const terminal = new FakeTerminal([{}, {}]);
     const sourceEventHash = "a".repeat(64);
+    let catalogReads = 0;
 
     await assert.rejects(
       () => continueSession({
@@ -667,7 +714,7 @@ test("fails closed when the source anchor changes after capacity reservation", a
         sourceEventHash,
         sourceAnchorCatalog: async () => [{
           sessionId: "source-1",
-          sourceEventHash: "b".repeat(64),
+          sourceEventHash: catalogReads++ === 0 ? sourceEventHash : "b".repeat(64),
         }],
         terminal,
         commandRunner: archiveCapableHelp,

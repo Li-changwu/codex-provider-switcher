@@ -189,6 +189,7 @@ async function continueFork(
   commitCompensation: ForkCommitCompensation,
 ): Promise<ContinueSessionResult> {
   const sourceEventHash = request.sourceEventHash!;
+  await assertCurrentSourceAnchor(request);
   const existing = await store.findReusable(
     request.sessionId,
     request.targetProfileId,
