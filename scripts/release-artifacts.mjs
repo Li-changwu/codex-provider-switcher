@@ -1,15 +1,20 @@
-import { createHash } from "node:crypto";
-import { lstat, readFile, readdir, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { constants } from "node:fs";
+import { lstat, open, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const checksumName = "SHA256SUMS.txt";
+const artifactStatFields = ["dev", "ino", "size", "mtimeMs", "ctimeMs", "birthtimeMs"];
+const defaultFsOps = { lstat, open, readdir, rename, rm, writeFile };
 
 export async function stageReleaseArtifacts({
   projectRoot,
   releaseDirectory,
   tag,
+  fsOps = {},
 }) {
+  const operations = { ...defaultFsOps, ...fsOps };
   const manifest = JSON.parse(
     await readFile(resolve(projectRoot, "package.json"), "utf8"),
   );
@@ -22,7 +27,7 @@ export async function stageReleaseArtifacts({
     `${manifest.name}-${manifest.version}@linux-x64.vsix`,
     `${manifest.name}-${manifest.version}@win32-x64.vsix`,
   ].sort();
-  const entries = (await readdir(releaseDirectory)).sort();
+  const entries = (await operations.readdir(releaseDirectory)).sort();
 
   if (entries.includes(checksumName)) {
     throw new Error(`${checksumName} already exists.`);
@@ -46,17 +51,11 @@ export async function stageReleaseArtifacts({
   const checksums = new Map();
   for (const assetName of assetNames) {
     const assetPath = join(releaseDirectory, assetName);
-    const stats = await lstat(assetPath);
-    if (stats.isSymbolicLink() || !stats.isFile()) {
-      throw new Error(
-        `Release artifact must be a regular non-symlink file: ${assetName}.`,
-      );
-    }
-    if (stats.size === 0) {
-      throw new Error(`Release artifact must be non-empty: ${assetName}.`);
-    }
-
-    const contents = await readFile(assetPath);
+    const contents = await readReleaseArtifact({
+      assetName,
+      assetPath,
+      fsOps: operations,
+    });
     const checksum = createHash("sha256").update(contents).digest("hex");
     checksums.set(assetName, checksum);
   }
@@ -65,12 +64,77 @@ export async function stageReleaseArtifacts({
   const checksumContents = `${assetNames
     .map((assetName) => `${checksums.get(assetName)}  ${assetName}`)
     .join("\n")}\n`;
-  await writeFile(checksumPath, checksumContents, { flag: "wx" });
+  await writeChecksumFile({
+    checksumPath,
+    checksumContents,
+    fsOps: operations,
+  });
 
   return {
     assetNames: [...assetNames, checksumName],
     checksumPath,
   };
+}
+
+async function readReleaseArtifact({ assetName, assetPath, fsOps }) {
+  const pathStats = await fsOps.lstat(assetPath);
+  assertRegularNonEmptyArtifact(pathStats, assetName);
+
+  const noFollowFlag = process.platform === "win32" ? 0 : (constants.O_NOFOLLOW ?? 0);
+  const fileHandle = await fsOps.open(assetPath, constants.O_RDONLY | noFollowFlag);
+  try {
+    const openedStats = await fileHandle.stat();
+    assertRegularNonEmptyArtifact(openedStats, assetName);
+    assertSameArtifactStats(pathStats, openedStats, assetName, "between path and opened handle");
+
+    const contents = await fileHandle.readFile();
+    const finalStats = await fileHandle.stat();
+    assertSameArtifactStats(openedStats, finalStats, assetName, "while being read");
+    if (contents.byteLength !== openedStats.size) {
+      throw new Error(`Release artifact changed while being read: ${assetName}.`);
+    }
+    return contents;
+  } finally {
+    await fileHandle.close();
+  }
+}
+
+function assertRegularNonEmptyArtifact(stats, assetName) {
+  if (stats.isSymbolicLink() || !stats.isFile()) {
+    throw new Error(
+      `Release artifact must be a regular non-symlink file: ${assetName}.`,
+    );
+  }
+  if (stats.size === 0) {
+    throw new Error(`Release artifact must be non-empty: ${assetName}.`);
+  }
+}
+
+function assertSameArtifactStats(before, after, assetName, phase) {
+  if (artifactStatFields.some((field) => before[field] !== after[field])) {
+    throw new Error(`Release artifact changed ${phase}: ${assetName}.`);
+  }
+}
+
+async function writeChecksumFile({ checksumPath, checksumContents, fsOps }) {
+  const temporaryPath = join(
+    dirname(checksumPath),
+    `.${checksumName}.${randomUUID()}.tmp`,
+  );
+  try {
+    await fsOps.writeFile(temporaryPath, checksumContents, { flag: "wx" });
+    await fsOps.rename(temporaryPath, checksumPath);
+  } catch (error) {
+    try {
+      await fsOps.rm(temporaryPath, { force: true });
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        `Failed to publish ${checksumName} and remove its temporary file.`,
+      );
+    }
+    throw error;
+  }
 }
 
 async function main() {

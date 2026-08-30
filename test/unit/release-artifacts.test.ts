@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, symlink, unlink, writeFile, mkdir } from "node:fs/promises";
+import {
+  lstat as realLstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm as realRm,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
@@ -191,6 +200,81 @@ test("CLI prints only sorted release asset names on success", async (t) => {
   assert.equal(result.stderr, "");
 });
 
+test("fails closed when the opened artifact identity differs from its path stat", async (t) => {
+  const fixture = await createFixture(t, validFiles);
+  let closed = false;
+  let read = false;
+
+  await assert.rejects(
+    stageReleaseArtifacts({
+      projectRoot: fixture.projectRoot,
+      releaseDirectory: fixture.releaseDirectory,
+      tag: "v0.1.0",
+      fsOps: {
+        open: async () => ({
+          stat: async () => ({
+            dev: 1,
+            ino: 2,
+            size: validFiles[linuxAsset].byteLength,
+            mtimeMs: 3,
+            ctimeMs: 4,
+            birthtimeMs: 5,
+            isFile: () => true,
+            isSymbolicLink: () => false,
+          }),
+          readFile: async () => {
+            read = true;
+            return validFiles[linuxAsset];
+          },
+          close: async () => {
+            closed = true;
+          },
+        }),
+      },
+    }),
+    /changed between path and opened handle/,
+  );
+
+  assert.equal(read, false);
+  assert.equal(closed, true);
+});
+
+test("cleans the unique checksum temporary file when atomic publish fails", async (t) => {
+  const fixture = await createFixture(t, validFiles);
+  const temporaryPaths: string[] = [];
+  const removedPaths: string[] = [];
+
+  await assert.rejects(
+    stageReleaseArtifacts({
+      projectRoot: fixture.projectRoot,
+      releaseDirectory: fixture.releaseDirectory,
+      tag: "v0.1.0",
+      fsOps: {
+        writeFile: async (path: string, contents: string, options: { flag: string }) => {
+          temporaryPaths.push(path);
+          return writeFile(path, contents, options);
+        },
+        rename: async () => {
+          throw new Error("atomic publish failed");
+        },
+        rm: async (path: string, options: { force: boolean }) => {
+          removedPaths.push(path);
+          return realRm(path, options);
+        },
+      },
+    }),
+    /atomic publish failed/,
+  );
+
+  assert.equal(temporaryPaths.length, 1);
+  assert.deepEqual(removedPaths, temporaryPaths);
+  await assert.rejects(realLstat(temporaryPaths[0]), { code: "ENOENT" });
+  await assert.rejects(
+    realLstat(join(fixture.releaseDirectory, "SHA256SUMS.txt")),
+    { code: "ENOENT" },
+  );
+});
+
 function sha256(contents: Buffer): string {
   return createHash("sha256").update(contents).digest("hex");
 }
@@ -200,7 +284,7 @@ async function createFixture(
   files: Record<string, Buffer>,
 ): Promise<{ root: string; projectRoot: string; releaseDirectory: string }> {
   const root = await mkdtemp(join(tmpdir(), "release-artifacts-test-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(() => realRm(root, { recursive: true, force: true }));
   const projectRoot = join(root, "project");
   const releaseDirectory = join(root, "release");
   await mkdir(projectRoot);
