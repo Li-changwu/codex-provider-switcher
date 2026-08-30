@@ -392,6 +392,36 @@ test("fails closed when a terminated child does not close within its grace timeo
   assert.deepEqual(harness.child.killCalls, ["SIGTERM", "SIGKILL"]);
 });
 
+test("cleans up a child that ignores SIGKILL without emitting close or output", async () => {
+  const harness = createHarness();
+  const resultPromise = startFork(harness, { terminationGraceTimeoutMs: 5 });
+
+  await waitFor(() => harness.messages().length === 1);
+  harness.writeStdout("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n");
+  await waitFor(() => harness.messages().length === 3);
+  harness.writeStdout("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"thread\":{\"id\":\"trusted-branch_1\"}}}\n");
+
+  await assert.rejects(resultPromise, (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.message, "Unable to obtain native Codex fork.");
+    return true;
+  });
+  assert.deepEqual(harness.child.killCalls, ["SIGTERM", "SIGKILL"]);
+  assert.equal(harness.child.stdin.destroyed, true);
+  assert.equal(harness.child.stdout.destroyed, true);
+  assert.equal(harness.child.stderr.destroyed, true);
+  assert.equal(harness.child.listenerCount("close"), 0);
+  assert.equal(harness.child.stdout.listenerCount("data"), 0);
+  assert.equal(harness.child.stderr.listenerCount("data"), 0);
+
+  assert.doesNotThrow(() => {
+    harness.child.emit("error", new Error("late child error"));
+    harness.child.stdin.emit("error", new Error("late stdin error"));
+    harness.child.stdout.emit("error", new Error("late stdout error"));
+    harness.child.stderr.emit("error", new Error("late stderr error"));
+  });
+});
+
 test("fails closed when SIGKILL synchronously closes a pending fork", async () => {
   const harness = createHarness({ closeOnSigkill: true });
   const resultPromise = startFork(harness, { terminationGraceTimeoutMs: 5 });

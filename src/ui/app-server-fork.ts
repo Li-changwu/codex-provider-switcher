@@ -94,6 +94,7 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
     const decoder = new StringDecoder("utf8");
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
     let terminationGraceHandle: ReturnType<typeof setTimeout> | undefined;
+    let cleanupFinished = false;
 
     const onChildFailure = () => settleFailure();
     const onChildClose = () => {
@@ -312,6 +313,10 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
     }
 
     function finishClose(): void {
+      if (cleanupFinished) {
+        return;
+      }
+      cleanupFinished = true;
       clearTimers();
       removeListeners();
     }
@@ -354,6 +359,8 @@ export function forkNativeCodexThread(input: ForkNativeCodexThreadInput): Promis
       }
       forceTerminationRequested = true;
       sendSignal("SIGKILL");
+      destroyStdio();
+      finishClose();
     }
 
     function handleStreamLimitExceeded(): void {
