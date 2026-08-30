@@ -261,6 +261,27 @@ test("reports a trustworthy fork outcome to the continuation core", () => {
   assert.equal(createNativeContinuationTerminal(harness.api, layout()).reportsForkOutcome, true);
 });
 
+test("rejects invalid injected Shell Integration and command timeout bounds at construction", () => {
+  const invalidTimeouts = [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 1.5, 60_001];
+
+  for (const option of ["shellIntegrationTimeoutMs", "shellCommandTimeoutMs"] as const) {
+    for (const value of invalidTimeouts) {
+      const harness = createHarness();
+
+      assert.throws(
+        () => createNativeContinuationTerminal(harness.api, layout(), {
+          forkNativeCodexThread: harness.fork,
+          [option]: value,
+        }),
+        /timeout/i,
+        `${option}=${value} must be rejected during adapter creation`,
+      );
+      assert.deepEqual(harness.options, []);
+      assert.deepEqual(harness.forkCalls, []);
+    }
+  }
+});
+
 function invocation(operation: "resume" | "fork" | "archive" | "unarchive", sessionId: string): TerminalInvocation {
   return {
     command: "codex",

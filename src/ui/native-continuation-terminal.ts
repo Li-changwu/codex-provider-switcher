@@ -8,6 +8,7 @@ import {
 const terminalArgumentPattern = /^[A-Za-z0-9._/-]+$/;
 const defaultShellIntegrationTimeoutMs = 30_000;
 const defaultShellCommandTimeoutMs = 30_000;
+const maximumShellTimeoutMs = 60_000;
 const sessionIdentifierPattern = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const nativeCodexCommand = "codex";
 const terminalOperations = new Set(["resume", "archive", "unarchive"]);
@@ -71,10 +72,16 @@ export function createNativeContinuationTerminal(
   dependencies: NativeContinuationTerminalDependencies = {},
 ): InteractiveCodexTerminal {
   const forkNativeCodexThread = dependencies.forkNativeCodexThread ?? defaultForkNativeCodexThread;
-  const shellIntegrationTimeoutMs = dependencies.shellIntegrationTimeoutMs
-    ?? defaultShellIntegrationTimeoutMs;
-  const shellCommandTimeoutMs = dependencies.shellCommandTimeoutMs
-    ?? defaultShellCommandTimeoutMs;
+  const shellIntegrationTimeoutMs = validatedTimeout(
+    dependencies.shellIntegrationTimeoutMs,
+    defaultShellIntegrationTimeoutMs,
+    "Shell Integration",
+  );
+  const shellCommandTimeoutMs = validatedTimeout(
+    dependencies.shellCommandTimeoutMs,
+    defaultShellCommandTimeoutMs,
+    "Shell command",
+  );
 
   return {
     reportsForkOutcome: true,
@@ -120,6 +127,22 @@ export function createNativeContinuationTerminal(
       }
     },
   };
+}
+
+function validatedTimeout(
+  injectedTimeoutMs: number | undefined,
+  defaultTimeoutMs: number,
+  timeoutName: string,
+): number {
+  const timeoutMs = injectedTimeoutMs ?? defaultTimeoutMs;
+  if (
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs <= 0 ||
+    timeoutMs > maximumShellTimeoutMs
+  ) {
+    throw new Error(`${timeoutName} timeout must be a positive safe integer no greater than ${maximumShellTimeoutMs}ms.`);
+  }
+  return timeoutMs;
 }
 
 async function waitForShellIntegration(
