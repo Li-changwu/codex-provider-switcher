@@ -2,6 +2,36 @@
 
 Install dependencies with `npm ci` and build with `npm run build`.
 
+## GitHub Release Delivery
+
+GitHub Releases are the installable distribution channel; this project does not
+publish to the VS Code Marketplace. Pushing a `v*` tag runs the release
+workflow. Before any assets are published, the tag must exactly equal
+`v${version}`, where `version` is read from `package.json`. A mismatch fails
+the release job.
+
+The workflow runs the native package commands on their matching runners:
+
+```text
+npm run package:win32-x64
+npm run package:linux-x64
+```
+
+Each command remains the package gate for its target: it checks types, builds
+the extension, validates the native SQLite binding, audits production
+dependencies, creates the VSIX, and verifies its contents. The release job
+downloads exactly the two target VSIX files into a clean directory, rejects
+missing or unexpected artifacts, and writes deterministic `SHA256SUMS.txt`
+before it calls the GitHub CLI to create the GitHub Release. The release
+workflow has `contents: read` by default; only its release job receives
+`contents: write`.
+
+Do not push a version tag merely to test this workflow. Open a pull request,
+wait for Windows and Ubuntu CI to pass, merge it, then deliberately push the
+matching tag when a public GitHub Release is intended. Do not add Marketplace
+credentials, provider API keys, OAuth data, profiles, or sessions to the
+workflow or release artifacts.
+
 ## Official Profile Login
 
 Switching to an official Profile runs native `codex login` in the current
