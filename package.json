@@ -1,7 +1,7 @@
 {
   "name": "codex-provider-switcher",
   "displayName": "Codex Provider Switcher",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Safely manage and switch local Codex provider profiles on Windows, Linux, and Remote SSH.",
   "license": "MIT",

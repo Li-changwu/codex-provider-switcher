@@ -191,14 +191,25 @@ test("CLI rejects missing and extra arguments with usage on stderr", async () =>
 });
 
 test("CLI prints only sorted release asset names on success", async (t) => {
-  const fixture = await createFixture(t, validFiles);
+  const projectManifest = JSON.parse(
+    await readFile(join(projectRoot, "package.json"), "utf8"),
+  ) as { name: string; version: string };
+  const cliLinuxAsset = `${projectManifest.name}-${projectManifest.version}@linux-x64.vsix`;
+  const cliWindowsAsset = `${projectManifest.name}-${projectManifest.version}@win32-x64.vsix`;
+  const fixture = await createFixture(t, {
+    [cliLinuxAsset]: Buffer.from("linux artifact"),
+    [cliWindowsAsset]: Buffer.from("windows artifact"),
+  });
   const result = await execFileAsync(
     process.execPath,
-    [cliPath, fixture.releaseDirectory, "v0.1.0"],
+    [cliPath, fixture.releaseDirectory, `v${projectManifest.version}`],
     { cwd: projectRoot },
   );
 
-  assert.equal(result.stdout, `${linuxAsset}\n${windowsAsset}\nSHA256SUMS.txt\n`);
+  assert.equal(
+    result.stdout,
+    `${cliLinuxAsset}\n${cliWindowsAsset}\nSHA256SUMS.txt\n`,
+  );
   assert.equal(result.stderr, "");
 });
 

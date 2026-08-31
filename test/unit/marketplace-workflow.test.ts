@@ -6,6 +6,9 @@ import { fileURLToPath } from "node:url";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const workflowPath = resolve(projectRoot, ".github/workflows/marketplace.yml");
+const packagePath = resolve(projectRoot, "package.json");
+const packageLockPath = resolve(projectRoot, "package-lock.json");
+const changelogPath = resolve(projectRoot, "CHANGELOG.md");
 const readmePath = resolve(projectRoot, "README.md");
 const developmentPath = resolve(projectRoot, "docs/development.md");
 const publishingGuidePath = resolve(projectRoot, "docs/marketplace-publishing.md");
@@ -13,6 +16,24 @@ const publishingGuidePath = resolve(projectRoot, "docs/marketplace-publishing.md
 async function readWorkflow(): Promise<string> {
   return (await readFile(workflowPath, "utf8")).replace(/\r\n/g, "\n");
 }
+
+test("Marketplace release metadata is aligned on version 0.1.1", async () => {
+  const manifest = JSON.parse(await readFile(packagePath, "utf8")) as {
+    version?: unknown;
+  };
+  const lockfile = JSON.parse(await readFile(packageLockPath, "utf8")) as {
+    version?: unknown;
+    packages?: Record<string, { version?: unknown }>;
+  };
+  const changelog = await readFile(changelogPath, "utf8");
+  const guide = await readFile(publishingGuidePath, "utf8");
+
+  assert.equal(manifest.version, "0.1.1");
+  assert.equal(lockfile.version, "0.1.1");
+  assert.equal(lockfile.packages?.[""]?.version, "0.1.1");
+  assert.match(changelog, /^## 0\.1\.1$/m);
+  assert.match(guide, /`v0\.1\.1`/);
+});
 
 test("Marketplace publication is manual, tag-scoped, and read-only", async () => {
   const workflow = await readWorkflow();
@@ -61,7 +82,7 @@ test("native package jobs build the exact input tag without Marketplace credenti
     packageJob,
     /uses: actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a/,
   );
-  assert.match(packageJob, /path: codex-provider-switcher-0\.1\.0@\$\{\{ matrix\.target \}\}\.vsix/);
+  assert.match(packageJob, /path: codex-provider-switcher-0\.1\.1@\$\{\{ matrix\.target \}\}\.vsix/);
   assert.match(packageJob, /if-no-files-found: error/);
   assert.doesNotMatch(packageJob, /\b(?:environment|VSCE_PAT|secrets\.)\b/);
 });
@@ -86,7 +107,7 @@ test("protected publish job validates both native packages before local vsce pub
   const validationCommand =
     'node scripts/release-artifacts.mjs "$GITHUB_WORKSPACE/marketplace-assets" "${{ inputs.tag }}"';
   const publishCommand =
-    "./node_modules/.bin/vsce publish --packagePath marketplace-assets/codex-provider-switcher-0.1.0@win32-x64.vsix marketplace-assets/codex-provider-switcher-0.1.0@linux-x64.vsix --skip-duplicate";
+    "./node_modules/.bin/vsce publish --packagePath marketplace-assets/codex-provider-switcher-0.1.1@win32-x64.vsix marketplace-assets/codex-provider-switcher-0.1.1@linux-x64.vsix --skip-duplicate";
   const validationIndex = publishJob.indexOf(validationCommand);
   const publishIndex = publishJob.indexOf(publishCommand);
   assert.ok(validationIndex >= 0, "release artifact validation must use the input tag");
@@ -130,7 +151,7 @@ test("owner guide covers Publisher and least-privilege PAT setup without token e
   assert.match(guide, /GitHub Environment[^\n]*`marketplace`/);
   assert.match(guide, /Environment Secret[^\n]*`VSCE_PAT`/);
   assert.match(guide, /Marketplace Publish/);
-  assert.match(guide, /`v0\.1\.0`/);
+  assert.match(guide, /`v0\.1\.1`/);
   assert.match(guide, /rotate|rotation/iu);
   assert.match(guide, /revoke|revocation/iu);
   assert.match(guide, /Remove-Item Env:NODE_TLS_REJECT_UNAUTHORIZED/);

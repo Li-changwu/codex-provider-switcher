@@ -42,9 +42,9 @@ Use an Environment Secret, not a repository or organization secret. Only the fin
 
 ## 4. Run the First Publication
 
-1. Confirm that the existing tag is `v0.1.0` and that `package.json` still contains version `0.1.0`.
+1. Confirm that the existing tag is `v0.1.1` and that `package.json` contains version `0.1.1`.
 2. Open the repository's **Actions** tab and select **Marketplace Publish**.
-3. Choose **Run workflow**, enter `v0.1.0` in the `tag` field, and start the run.
+3. Choose **Run workflow**, enter `v0.1.1` in the `tag` field, and start the run.
 4. Wait for both `win32-x64` and `linux-x64` package jobs to pass.
 5. Review the pending `marketplace` Environment deployment and approve it only after the tag and package jobs are correct.
 6. Wait for artifact validation and both Marketplace uploads to finish. A missing secret, invalid Publisher, tag mismatch, package mismatch, or Marketplace rejection must leave the run failed.
