@@ -6,6 +6,7 @@ import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  assertContinuationEligible,
   clearCodexCapabilityCacheForTests,
   ContinuationError,
   continueSession,
@@ -20,6 +21,22 @@ import type {
 } from "../../src/core/windows-file-operations";
 
 const nodeRequire = createRequire(import.meta.url);
+
+test("requires a current Provider and session synchronization eligibility", () => {
+  const eligibility = {
+    providerId: "research",
+    sessionIds: new Set(["session-1"]),
+  };
+  assert.doesNotThrow(() => assertContinuationEligible(eligibility, "research", "session-1"));
+  assert.throws(
+    () => assertContinuationEligible(eligibility, "other", "session-1"),
+    /synchronized/i,
+  );
+  assert.throws(
+    () => assertContinuationEligible(eligibility, "research", "session-2"),
+    /synchronized/i,
+  );
+});
 
 test("opens an existing zero-inode state database and lists its fork mapping", async (t) => {
   if (process.platform !== "win32") {

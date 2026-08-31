@@ -73,6 +73,7 @@ export type ActiveProfileSwitchState =
 
 export interface StoredProfileSwitchResult extends SwitchResult {
   readonly activeProfileState: ActiveProfileSwitchState;
+  readonly synchronizedChanges?: number;
 }
 
 /**
@@ -95,6 +96,7 @@ export async function switchStoredProfile(
   }
 
   let reconciliationRequired = false;
+  let synchronizedChanges: number | undefined;
   const result = await switchTransactionally(
     request,
     createStoredProfileSwitchDependencies(
@@ -103,10 +105,14 @@ export async function switchStoredProfile(
       () => {
         reconciliationRequired = true;
       },
+      (count) => {
+        synchronizedChanges = count;
+      },
     ),
   );
   return {
     ...result,
+    ...(result.status === "committed" ? { synchronizedChanges } : {}),
     activeProfileState:
       result.status === "committed"
         ? result.acknowledgementFailed
@@ -134,6 +140,7 @@ function createStoredProfileSwitchDependencies(
   request: SwitchRequest,
   dependencies: StoredProfileSwitchDependencies,
   markReconciliationRequired: () => void,
+  recordSynchronizedChanges: (count: number) => void,
 ): SwitchDependencies {
   let prepared: PreparedStoredProfileSwitch | undefined;
   let rolloutChanges: readonly RolloutChange[] = [];
@@ -192,6 +199,7 @@ function createStoredProfileSwitchDependencies(
         onProgress: (progress) => report(progress.completed, progress.total),
       });
       rolloutChanges = scan.changes;
+      recordSynchronizedChanges(scan.changes.length);
       inversePatches = createRolloutInversePatches(scan.changes);
     },
     createMutationPlan: async () => {

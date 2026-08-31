@@ -123,6 +123,27 @@ export interface ContinueSessionResult {
   readonly retentionWarning?: boolean;
 }
 
+export interface ContinuationEligibility {
+  readonly providerId: string;
+  readonly sessionIds: ReadonlySet<string>;
+}
+
+export function assertContinuationEligible(
+  eligibility: ContinuationEligibility | undefined,
+  providerId: string,
+  sessionId: string,
+): void {
+  if (
+    eligibility?.providerId !== providerId ||
+    !eligibility.sessionIds.has(sessionId)
+  ) {
+    throw new ContinuationError(
+      "invalid-session",
+      "The session must be synchronized for the selected Provider before it can continue.",
+    );
+  }
+}
+
 interface CodexCapabilities {
   readonly resume: boolean;
   readonly fork: boolean;
