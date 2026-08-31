@@ -35,6 +35,9 @@ test("packages verified platform-specific native dependencies", async () => {
   assert.equal(manifest.dependencies?.sqlite3, "^6.0.1");
   assert.equal(manifest.dependencies?.["@vscode/sqlite3"], undefined);
   assert.equal(manifest.devDependencies?.["@types/vscode"], "^1.98.0");
+  assert.equal(manifest.devDependencies?.["@vscode/vsce"], "^3.9.2");
+  assert.equal(manifest.devDependencies?.esbuild, "^0.28.2");
+  assert.equal(manifest.devDependencies?.sharp, "^0.35.4");
   assert.deepEqual(manifest.repository, {
     type: "git",
     url: "https://github.com/Li-changwu/codex-provider-switcher.git",
