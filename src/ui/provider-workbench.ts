@@ -56,6 +56,7 @@ export interface ProviderWorkbenchDependencies {
 }
 
 type WorkbenchMessage =
+  | { readonly type: "listProfiles" }
   | { readonly type: "loadProfile"; readonly profileId: string }
   | { readonly type: "listSessions"; readonly profileId: string }
   | { readonly type: "syncSessions"; readonly profileId: string }
@@ -86,6 +87,8 @@ export class ProviderWorkbenchController {
   async handleMessage(raw: unknown): Promise<any> {
     const message = parseMessage(raw);
     switch (message.type) {
+      case "listProfiles":
+        return this.listProfiles();
       case "loadProfile":
         return this.loadProfile(message.profileId);
       case "listSessions":
@@ -108,6 +111,23 @@ export class ProviderWorkbenchController {
   clearEligibility(): void {
     this.eligibility = undefined;
     this.anchors.clear();
+  }
+
+  private async listProfiles() {
+    const [profiles, activeProfileId] = await Promise.all([
+      this.dependencies.profiles.list(),
+      this.dependencies.activeProfileId(),
+    ]);
+    return {
+      type: "profileList" as const,
+      activeProfileId,
+      profiles: profiles.map((profile) => ({
+        id: profile.id,
+        name: profile.name,
+        kind: profile.kind,
+        active: profile.id === activeProfileId,
+      })),
+    };
   }
 
   private async loadProfile(profileId: string) {
@@ -238,8 +258,21 @@ export class ProviderWorkbenchController {
         message.apiKey!,
       );
     }
+    let loginCompleted = false;
+    if (message.kind === "official") {
+      const login = await this.dependencies.switchProfile(profile.id, this.dependencies.onProgress);
+      if (login.status !== "committed") {
+        throw new Error("The official Provider was saved, but OpenAI login did not complete.");
+      }
+      loginCompleted = true;
+    }
     await this.dependencies.onStateChanged?.();
-    return { type: "operationCompleted" as const, operation: "createProfile" as const, profileId: profile.id };
+    return {
+      type: "operationCompleted" as const,
+      operation: "createProfile" as const,
+      profileId: profile.id,
+      loginCompleted,
+    };
   }
 
   private async saveProfile(message: Extract<WorkbenchMessage, { type: "saveProfile" }>) {
@@ -271,6 +304,9 @@ function parseMessage(raw: unknown): WorkbenchMessage {
     throw new Error("Invalid Provider workbench message.");
   }
   const type = raw.type;
+  if (type === "listProfiles") {
+    return { type };
+  }
   if (["loadProfile", "listSessions", "syncSessions", "switchProfile", "deleteProfile"].includes(type)) {
     return { type, profileId: requiredId(raw.profileId) } as WorkbenchMessage;
   }

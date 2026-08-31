@@ -22,10 +22,19 @@ import {
   type ProfileCommandHandlers,
 } from "./ui/commands";
 import type { ActiveProfileState, ProfileLookup } from "./core/profile-switch-orchestrator";
+import { switchStoredProfile as switchStoredProfileByDefault } from "./core/profile-switch-orchestrator";
+import { continueSession as continueStoredSession } from "./core/continuation";
+import { listContinuationSourceAnchors } from "./core/rollouts";
 import { createVscodeOfficialLoginExecutor } from "./ui/official-login-terminal";
 import { createNativeContinuationTerminal } from "./ui/native-continuation-terminal";
+import { ProviderTreeDataProvider } from "./ui/provider-tree";
+import { ProviderWorkbenchController } from "./ui/provider-workbench";
+import { ProviderWorkbenchPanel } from "./ui/provider-webview";
 
 export const commandIds = [
+  "codexProvider.openWorkbench",
+  "codexProvider.addProvider",
+  "codexProvider.refreshProviders",
   "codexProvider.createProfile",
   "codexProvider.editProfile",
   "codexProvider.switchProfile",
@@ -38,7 +47,7 @@ export const commandAvailabilityContextKey = "codexProvider.commandsAvailable";
 
 export type ExtensionHostApi = Pick<
   typeof vscode,
-  "commands" | "window" | "StatusBarAlignment" | "ProgressLocation"
+  "commands" | "window" | "StatusBarAlignment" | "ProgressLocation" | "ViewColumn"
 >;
 
 export interface ExtensionActivationContext extends StartupExtensionContext {
@@ -56,7 +65,7 @@ export type StartupRecovery = (
 ) => Promise<Pick<RecoveryResult, "recoveryRequiredOperationIds">>;
 
 type CommandId = typeof commandIds[number];
-type ExtensionCommandHandlers = Partial<Record<CommandId, () => Promise<void>>>;
+type ExtensionCommandHandlers = Partial<Record<CommandId, (...args: any[]) => Promise<void>>>;
 
 export interface ExtensionLifecycleOptions {
   readonly createCommandHandlers?: (
@@ -114,37 +123,120 @@ export async function activateExtensionWithStartupPrerequisites(
 
   const prerequisites = startupProfilePrerequisites;
   const activeProfiles = new ActiveProfileStore(prerequisites.layout);
-  const lifecycle = registerExtensionLifecycle(context, api, {
+  const officialLogin = createVscodeOfficialLoginExecutor({
+    createTerminal: (options) => api.window.createTerminal(options),
+    onDidChangeTerminalShellIntegration:
+      api.window.onDidChangeTerminalShellIntegration,
+    onDidEndTerminalShellExecution:
+      api.window.onDidEndTerminalShellExecution,
+  });
+  const nativeContinuationTerminal = createNativeContinuationTerminal({
+    createTerminal: (options) => api.window.createTerminal(options),
+    onDidChangeTerminalShellIntegration:
+      api.window.onDidChangeTerminalShellIntegration,
+    onDidEndTerminalShellExecution:
+      api.window.onDidEndTerminalShellExecution,
+  }, prerequisites.layout);
+  const tree = new ProviderTreeDataProvider({
+    listProfiles: () => prerequisites.profiles.list(),
+    activeProfileId: async () => {
+      const snapshot = await activeProfiles.snapshot();
+      return snapshot.state === "present" ? snapshot.record.profileId : undefined;
+    },
+  });
+  let lifecycle: ExtensionLifecycleRegistration;
+  let panel: ProviderWorkbenchPanel | undefined;
+  const refreshProviderUi = async (): Promise<void> => {
+    tree.refresh();
+    panel?.refresh();
+    await lifecycle?.refreshStatus();
+  };
+  const controller = new ProviderWorkbenchController({
+    profiles: prerequisites.profiles,
+    secrets: prerequisites.secrets,
+    activeProfileId: async () => {
+      const snapshot = await activeProfiles.snapshot();
+      return snapshot.state === "present" ? snapshot.record.profileId : undefined;
+    },
+    switchProfile: async (profileId, onProgress) => switchStoredProfileByDefault(
+      { targetProfileId: profileId },
+      {
+        layout: prerequisites.layout,
+        profiles: prerequisites.profiles,
+        secrets: prerequisites.secrets,
+        activeProfiles,
+        officialLogin,
+        onProgress: (event) => onProgress?.(event),
+      },
+    ),
+    listSessionAnchors: () => listContinuationSourceAnchors(prerequisites.layout),
+    continueSession: async (request) => continueStoredSession({
+      layout: prerequisites.layout,
+      sessionId: request.sessionId,
+      mode: request.mode,
+      targetProfileId: request.profileId,
+      sourceEventHash: request.sourceEventHash,
+      sourceAnchorCatalog: listContinuationSourceAnchors,
+      terminal: nativeContinuationTerminal,
+    }),
+    confirm: async (message) => (
+      await api.window.showWarningMessage(message, { modal: true }, "Continue")
+    ) === "Continue",
+    onStateChanged: refreshProviderUi,
+    onProgress: (event) => panel?.postProgress(event),
+  });
+  if (
+    typeof api.window.createWebviewPanel === "function" &&
+    api.ViewColumn !== undefined
+  ) {
+    panel = new ProviderWorkbenchPanel(
+      api.window,
+      api.ViewColumn.One,
+      controller,
+    );
+  }
+  lifecycle = registerExtensionLifecycle(context, api, {
     getStatusText: createActiveProfileStatusText(
       activeProfiles,
       prerequisites.profiles,
     ),
-    createCommandHandlers: (refresh) => toExtensionCommandHandlers(
-      createProfileCommandHandlers({
+    createCommandHandlers: (refresh) => ({
+      ...toExtensionCommandHandlers(createProfileCommandHandlers({
         layout: prerequisites.layout,
         profiles: prerequisites.profiles,
         secrets: prerequisites.secrets,
         activeProfiles,
         ui: createVscodeProfileCommandUi(api),
-        officialLogin: createVscodeOfficialLoginExecutor({
-          createTerminal: (options) => api.window.createTerminal(options),
-          onDidChangeTerminalShellIntegration:
-            api.window.onDidChangeTerminalShellIntegration,
-          onDidEndTerminalShellExecution:
-            api.window.onDidEndTerminalShellExecution,
-        }),
-        nativeContinuationTerminal: createNativeContinuationTerminal({
-          createTerminal: (options) => api.window.createTerminal(options),
-          onDidChangeTerminalShellIntegration:
-            api.window.onDidChangeTerminalShellIntegration,
-          onDidEndTerminalShellExecution:
-            api.window.onDidEndTerminalShellExecution,
-        }, prerequisites.layout),
+        officialLogin,
+        nativeContinuationTerminal,
         restoreAuthMode: createStartupAuthModeRestorer(prerequisites),
         refreshStatus: refresh,
-      }),
-    ),
+      })),
+      "codexProvider.openWorkbench": async (profileId?: string) => {
+        panel?.open(profileId);
+      },
+      "codexProvider.addProvider": async () => {
+        panel?.openCreate();
+      },
+      "codexProvider.refreshProviders": async () => {
+        await refreshProviderUi();
+      },
+    }),
   });
+  try {
+    if (typeof api.window.registerTreeDataProvider === "function") {
+      context.subscriptions.push(
+        api.window.registerTreeDataProvider("codexProvider.providers", tree),
+      );
+    }
+    if (panel) {
+      context.subscriptions.push(panel);
+    }
+  } catch (error) {
+    panel?.dispose();
+    lifecycle.dispose();
+    throw error;
+  }
   await lifecycle.refreshStatus();
   try {
     await api.commands.executeCommand("setContext", commandAvailabilityContextKey, true);

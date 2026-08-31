@@ -13,6 +13,16 @@ test("rejects unknown messages and never exposes a configured custom secret", as
   assert.doesNotMatch(serialized, /raw-key/);
 });
 
+test("lists public Provider navigation data without configuration contents", async () => {
+  const fixture = workbenchFixture();
+  const result = await fixture.controller.handleMessage({ type: "listProfiles" });
+  assert.deepEqual(result, {
+    type: "profileList",
+    activeProfileId: "proxy",
+    profiles: [{ id: "proxy", name: "Research Proxy", kind: "custom", active: true }],
+  });
+});
+
 test("enables sessions only after a successful user-triggered synchronization", async () => {
   const fixture = workbenchFixture();
   assert.equal(fixture.switchCalls.length, 0);
@@ -43,6 +53,47 @@ test("confirms and forks synchronized history when native resume is unavailable"
   assert.equal(result.type, "continuationCompleted");
   assert.equal(result.mode, "fork");
   assert.equal(result.branchSessionId, "branch-1");
+});
+
+test("starts the native official login switch after creating an official Provider", async () => {
+  const created: ProfileRecord = {
+    ...profile(),
+    id: "official-lab",
+    name: "Official Lab",
+    kind: "official",
+    providerId: "openai",
+    apiKeySecretId: undefined,
+  };
+  const switched: string[] = [];
+  const controller = new ProviderWorkbenchController({
+    profiles: {
+      list: async () => [],
+      get: async () => undefined,
+      readConfig: async () => undefined,
+      create: async () => created,
+      update: async () => undefined,
+      delete: async () => false,
+    },
+    secrets: { get: async () => undefined, set: async () => undefined },
+    activeProfileId: async () => undefined,
+    switchProfile: async (id) => {
+      switched.push(id);
+      return { status: "committed", synchronizedChanges: 0 };
+    },
+    listSessionAnchors: async () => [],
+    continueSession: async () => { throw new Error("unused"); },
+    confirm: async () => true,
+  });
+
+  const result = await controller.handleMessage({
+    type: "createProfile",
+    name: "Official Lab",
+    kind: "official",
+  });
+
+  assert.deepEqual(switched, ["official-lab"]);
+  assert.equal(result.type, "operationCompleted");
+  assert.equal(result.loginCompleted, true);
 });
 
 function workbenchFixture() {

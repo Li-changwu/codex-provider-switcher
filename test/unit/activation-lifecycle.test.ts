@@ -635,6 +635,9 @@ function trackedDisposable() {
 
 function lifecycleCommandHandlers() {
   return {
+    "codexProvider.openWorkbench": async () => undefined,
+    "codexProvider.addProvider": async () => undefined,
+    "codexProvider.refreshProviders": async () => undefined,
     "codexProvider.createProfile": async () => undefined,
     "codexProvider.editProfile": async () => undefined,
     "codexProvider.switchProfile": async () => undefined,
