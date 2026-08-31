@@ -5,6 +5,7 @@ docs/**
 test/**
 src/**
 scripts/**
+assets/**
 esbuild.mjs
 tsconfig.json
 *.ts

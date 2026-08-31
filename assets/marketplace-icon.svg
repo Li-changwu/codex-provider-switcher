@@ -1,0 +1,20 @@
+<!-- Lucide repeat-2 icon paths are licensed under the ISC License: https://lucide.dev/license -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-labelledby="title">
+  <title id="title">Codex Provider Switcher Signal Switch icon</title>
+  <rect width="128" height="128" rx="8" fill="#151515"/>
+  <g
+    transform="translate(26 26) scale(3.1666666667)"
+    fill="none"
+    stroke="#f7f7f2"
+    stroke-width="2.25"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  >
+    <path d="m2 9 3-3 3 3"/>
+    <path d="M13 18H7a2 2 0 0 1-2-2V6"/>
+    <path d="m22 15-3 3-3-3"/>
+    <path d="M11 6h6a2 2 0 0 1 2 2v10"/>
+  </g>
+  <circle cx="95.5" cy="34.5" r="7.5" fill="#b7f34b"/>
+  <circle cx="32.5" cy="93.5" r="7.5" fill="#ff664d"/>
+</svg>
