@@ -2,6 +2,14 @@
 
 All notable changes to Codex Provider Switcher are documented in this file.
 
+## 0.1.2
+
+- Publish under the permanent Marketplace identity
+  `Li-changwu.codex-provider-switcher-vscode` after the original package name
+  was found to be globally unavailable.
+- Preserve the runtime behavior and supported Windows x64, Linux x64, and
+  Remote SSH Extension Host boundaries from 0.1.1.
+
 ## 0.1.1
 
 - Publish the Marketplace-ready extension metadata, icon, documentation, and

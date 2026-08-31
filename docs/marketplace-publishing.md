@@ -10,7 +10,11 @@ This guide is for the repository owner. Complete it only when the repository bra
 4. Enter the intended display name and a monitored contact address, accept the Marketplace agreement, and finish creation.
 5. Confirm that the management page shows Publisher `Li-changwu`. If the ID is unavailable, stop: do not choose a substitute without first changing and reviewing the permanent extension identity in the repository.
 
-The Marketplace identity for this repository is `Li-changwu.codex-provider-switcher`.
+The Marketplace identity for this repository is
+`Li-changwu.codex-provider-switcher-vscode`. Marketplace package names are
+global across Publishers; `codex-provider-switcher` was already owned by a
+different Publisher, and no version under that old identity was published by
+`Li-changwu`.
 
 ## 2. Create a Least-Privilege PAT
 
@@ -42,9 +46,9 @@ Use an Environment Secret, not a repository or organization secret. Only the fin
 
 ## 4. Run the First Publication
 
-1. Confirm that the existing tag is `v0.1.1` and that `package.json` contains version `0.1.1`.
+1. Confirm that the existing tag is `v0.1.2` and that `package.json` contains version `0.1.2`.
 2. Open the repository's **Actions** tab and select **Marketplace Publish**.
-3. Choose **Run workflow**, enter `v0.1.1` in the `tag` field, and start the run.
+3. Choose **Run workflow**, enter `v0.1.2` in the `tag` field, and start the run.
 4. Wait for both `win32-x64` and `linux-x64` package jobs to pass.
 5. Review the pending `marketplace` Environment deployment and approve it only after the tag and package jobs are correct.
 6. Wait for artifact validation and both Marketplace uploads to finish. A missing secret, invalid Publisher, tag mismatch, package mismatch, or Marketplace rejection must leave the run failed.
