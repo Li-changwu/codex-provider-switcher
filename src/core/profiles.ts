@@ -6,6 +6,7 @@ import {
   readFile as nativeReadFile,
   realpath as nativeRealpath,
   rename as nativeRename,
+  rm as nativeRm,
   unlink as nativeUnlink,
   writeFile as nativeWriteFile,
 } from "node:fs/promises";
@@ -60,6 +61,7 @@ export interface ProfileFileSystem {
   rename(from: string, to: string): Promise<void>;
   chmod(path: string, mode: number): Promise<void>;
   unlink(path: string): Promise<void>;
+  removeDirectory?(path: string): Promise<void>;
 }
 
 export interface ProfileReadFileHandle {
@@ -324,6 +326,41 @@ export class ProfileStore {
         );
       }
       return withDerivedSecretId(updated);
+    });
+  }
+
+  async delete(id: string): Promise<boolean> {
+    if (!storedProfileIdPattern.test(id)) {
+      return false;
+    }
+    return this.withProfileLock(async () => {
+      const profiles = await this.readProfiles();
+      const index = profiles.findIndex((profile) => profile.id === id);
+      if (index === -1) {
+        return false;
+      }
+      const trusted = await this.inspectTrustedProfileConfig(id, true);
+      if (!trusted) {
+        throw profilePersistenceError();
+      }
+      const remaining = profiles.filter((profile) => profile.id !== id);
+      await this.writeAtomically(
+        this.indexPath,
+        `${JSON.stringify({ profiles: remaining.map(toPublicProfileRecord) }, undefined, 2)}\n`,
+        () => this.assertTrustedProfileConfigIdentity(id, trusted.config, trusted.directory),
+      );
+      try {
+        await (this.fileSystem.removeDirectory ?? nativeRemoveProfileDirectory)(
+          dirname(trusted.path),
+        );
+      } catch (error: unknown) {
+        throw new ProfileStoreError(
+          "persistence-failed",
+          "The Profile was removed from the index, but its managed directory could not be cleaned up.",
+          { cause: error },
+        );
+      }
+      return true;
     });
   }
 
@@ -1845,6 +1882,28 @@ export function profileApiKeySecretId(profileId: string): string {
   return `${profileSecretNamespace}.${profileId}.api-key`;
 }
 
+export type ProfileAuthPreview =
+  | { readonly kind: "official"; readonly secretConfigured: false }
+  | {
+    readonly kind: "custom";
+    readonly json: string;
+    readonly secretConfigured: boolean;
+  };
+
+export function createProfileAuthPreview(
+  kind: ProfileKind,
+  secretConfigured: boolean,
+): ProfileAuthPreview {
+  if (kind === "official") {
+    return { kind, secretConfigured: false };
+  }
+  return {
+    kind,
+    json: `{\n  "OPENAI_API_KEY": "${secretConfigured ? "[REDACTED]" : ""}"\n}`,
+    secretConfigured,
+  };
+}
+
 export function normalizeProfileId(name: string): string {
   const normalized = name
     .normalize("NFKD")
@@ -1967,7 +2026,12 @@ const nativeProfileFileSystem: ProfileFileSystem = {
   rename: nativeRename,
   chmod: nativeChmod,
   unlink: nativeUnlink,
+  removeDirectory: nativeRemoveProfileDirectory,
 };
+
+async function nativeRemoveProfileDirectory(path: string): Promise<void> {
+  await nativeRm(path, { recursive: true, force: false });
+}
 
 const nativeProfileLockFileSystem: ProfileLockFileSystem = {
   async mkdir(path) {
