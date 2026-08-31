@@ -1,7 +1,7 @@
 # Provider Management UI Design
 
 Date: 2026-08-31
-Status: Approved direction, pending written-spec review
+Status: Approved direction, continuation interaction incorporated
 
 ## Goal
 
@@ -32,6 +32,18 @@ The workbench has three logical regions:
 - Session region: a manually triggered “Sync session metadata” action, progress bar, current stage, result count, warnings, and errors.
 
 “Continue Codex session” is deliberately outside this first workbench design. The existing command remains available; no new continuation interaction is inferred until its product behavior is specified.
+
+## Continue Codex Session
+
+The workbench exposes a session list only after a successful manual synchronization for the currently selected target Provider. Synchronization completion is scoped to `Provider + session`; switching Provider clears the continuation eligibility shown for the prior target until that target is synchronized. A successful no-op scan (no metadata changes required) still counts as a completed synchronization and can enable continuation for compatible sessions. A cancelled, failed, or recovery-required synchronization never enables continuation.
+
+For an eligible session, the Continue action runs a capability probe before starting Codex:
+
+1. If the current Provider and session support native resume, invoke the existing `resume` path in place.
+2. If native resume is explicitly unavailable, keep the source session unchanged, show a confirmation explaining that a new branch will be created from the synchronized history, and ask for the target Provider. After confirmation, invoke the existing `fork` path and display the new branch session identifier.
+3. Do not silently fall back for malformed rollout data, permission errors, identity mismatches, database failures, or other unexpected errors. Show the error and leave the Continue action available only after a fresh successful synchronization.
+
+The confirmation text distinguishes “continue in place” from “create a new branch”. The original session remains immutable in the branch path. The Webview receives `continuationEligibility`, `continuationProbe`, and `continuationCompleted` events so it can explain why a button is disabled or which path was taken. The underlying continuation module and its existing source-anchor and branch-mapping safeguards remain authoritative.
 
 ## Webview Message Contract
 
@@ -84,7 +96,6 @@ The UI does not auto-sync local Codex metadata and does not add a new background
 
 ## Out of Scope
 
-- Designing a new “continue Codex session” workflow.
 - Automatic session synchronization.
 - Storing API keys or official tokens in TOML, JSON profile files, Webview state, telemetry, or logs.
 - Replacing the existing transactional switch engine, official-login executor, or continuation implementation.
