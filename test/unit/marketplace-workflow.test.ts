@@ -6,6 +6,9 @@ import { fileURLToPath } from "node:url";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const workflowPath = resolve(projectRoot, ".github/workflows/marketplace.yml");
+const readmePath = resolve(projectRoot, "README.md");
+const developmentPath = resolve(projectRoot, "docs/development.md");
+const publishingGuidePath = resolve(projectRoot, "docs/marketplace-publishing.md");
 
 async function readWorkflow(): Promise<string> {
   return (await readFile(workflowPath, "utf8")).replace(/\r\n/g, "\n");
@@ -98,4 +101,53 @@ test("protected publish job validates both native packages before local vsce pub
     .filter((line) => line.includes("VSCE_PAT"));
   assert.deepEqual(secretLines, ["          VSCE_PAT: ${{ secrets.VSCE_PAT }}"]);
   assert.doesNotMatch(workflow, /\bgh release\b|\bgit tag\b|create-release/);
+});
+
+test("README documents Marketplace and verified GitHub Release installation", async () => {
+  const readme = await readFile(readmePath, "utf8");
+
+  assert.match(readme, /VS Code Marketplace/);
+  assert.match(readme, /Li-changwu\.codex-provider-switcher/);
+  assert.match(readme, /automatically selects[^.]*compatible target/iu);
+  assert.match(readme, /GitHub Releases/);
+  assert.match(readme, /win32-x64/);
+  assert.match(readme, /linux-x64/);
+  assert.match(readme, /Remote SSH/);
+  assert.match(readme, /SHA256SUMS\.txt/);
+  assert.match(readme, /Upgrade/);
+  assert.match(readme, /Uninstall/);
+  assert.doesNotMatch(readme, /not the VS Code Marketplace/);
+});
+
+test("owner guide covers Publisher and least-privilege PAT setup without token examples", async () => {
+  const guide = await readFile(publishingGuidePath, "utf8");
+
+  assert.match(guide, /https:\/\/marketplace\.visualstudio\.com\/manage/);
+  assert.match(guide, /Publisher ID[^\n]*`Li-changwu`/);
+  assert.match(guide, /Azure DevOps[^\n]*PAT/);
+  assert.match(guide, /Marketplace: Manage/);
+  assert.match(guide, /all accessible organizations/iu);
+  assert.match(guide, /GitHub Environment[^\n]*`marketplace`/);
+  assert.match(guide, /Environment Secret[^\n]*`VSCE_PAT`/);
+  assert.match(guide, /Marketplace Publish/);
+  assert.match(guide, /`v0\.1\.0`/);
+  assert.match(guide, /rotate|rotation/iu);
+  assert.match(guide, /revoke|revocation/iu);
+  assert.match(guide, /Remove-Item Env:NODE_TLS_REJECT_UNAUTHORIZED/);
+  assert.match(guide, /Never paste[^\n]*PAT[^\n]*chat/iu);
+  assert.doesNotMatch(guide, /\b[a-z0-9]{52}\b/iu);
+  assert.doesNotMatch(guide, /\b[a-z0-9]{75}AZDO[a-z0-9]{4}\b/iu);
+  assert.doesNotMatch(guide, /VSCE_PAT\s*[:=]\s*[^\s`]+/u);
+});
+
+test("development guide keeps GitHub and Marketplace release gates separate", async () => {
+  const development = await readFile(developmentPath, "utf8");
+
+  assert.match(development, /GitHub Release[^\n]*Marketplace[^\n]*separate/iu);
+  assert.match(development, /Marketplace Publish/);
+  assert.match(development, /workflow_dispatch/);
+  assert.match(development, /tag[^\n]*package\.json/iu);
+  assert.match(development, /marketplace[^\n]*Environment/iu);
+  assert.match(development, /VSCE_PAT/);
+  assert.match(development, /only[^\n]*publish step/iu);
 });
