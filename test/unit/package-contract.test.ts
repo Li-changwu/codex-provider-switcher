@@ -60,6 +60,7 @@ test("packages verified platform-specific native dependencies", async () => {
     .split(/\r?\n/)
     .filter((entry) => entry.startsWith("!node_modules/@iarna/toml/"));
   assert.match(vscodeIgnore, /^\*\*\/\*.map$/m);
+  assert.match(vscodeIgnore, /^\.worktrees\/\*\*$/m);
   assert.match(vscodeIgnore, /^node_modules\/\*\*$/m);
   assert.deepEqual(tomlAllowlistEntries, [
     "!node_modules/@iarna/toml/package.json",
