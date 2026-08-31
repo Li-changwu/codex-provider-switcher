@@ -63,13 +63,13 @@ test("rejects a VSIX without required README documentation", async (context) => 
   context.after(() => rm(directory, { recursive: true, force: true }));
   const vsixPath = join(directory, "missing-readme.vsix");
   const entries = baseEntries();
-  delete entries["extension/README.md"];
+  delete entries["extension/readme.md"];
 
   await writeVsix(vsixPath, entries);
 
   await assert.rejects(
     verifyVsix(vsixPath),
-    /VSIX is missing required entry: extension\/README\.md/,
+    /VSIX is missing required entry: extension\/readme\.md/,
   );
 });
 
@@ -87,6 +87,26 @@ test("rejects a VSIX without required license documentation", async (context) =>
     /VSIX is missing required entry: extension\/LICENSE\.txt/,
   );
 });
+
+for (const requiredEntry of [
+  "extension/changelog.md",
+  "extension/media/icon.png",
+]) {
+  test(`rejects a VSIX without required Marketplace asset: ${requiredEntry}`, async (context) => {
+    const directory = await mkdtemp(join(tmpdir(), "codex-provider-switcher-vsix-"));
+    context.after(() => rm(directory, { recursive: true, force: true }));
+    const vsixPath = join(directory, "missing-marketplace-asset.vsix");
+    const entries = baseEntries();
+    delete entries[requiredEntry];
+
+    await writeVsix(vsixPath, entries);
+
+    await assert.rejects(
+      verifyVsix(vsixPath),
+      new RegExp(`VSIX is missing required entry: ${escapeRegex(requiredEntry)}`),
+    );
+  });
+}
 
 test("permits required README documentation in a VSIX", async (context) => {
   const directory = await mkdtemp(join(tmpdir(), "codex-provider-switcher-vsix-"));
@@ -273,6 +293,21 @@ test("rejects unexpected extension files before platform-dependent extraction", 
   await assert.rejects(
     verifyVsix(vsixPath),
     /VSIX contains unexpected archive entry: extension\/unapproved\.js/,
+  );
+});
+
+test("allows the canonical lowercase documentation paths emitted by vsce 3", () => {
+  assert.equal(typeof createArchiveRules, "function");
+  assert.equal(typeof validateArchiveEntries, "function");
+  const expectedNativeBindingEntry =
+    "extension/node_modules/sqlite3/bindings/current/binding.node";
+  const entries = Object.keys(baseEntries());
+
+  assert.doesNotThrow(() =>
+    validateArchiveEntries!(
+      entries,
+      createArchiveRules!(expectedNativeBindingEntry, "linux-x64"),
+    ),
   );
 });
 
@@ -540,8 +575,10 @@ function baseEntries(): Record<string, string> {
     "extension.vsixmanifest":
       '<?xml version="1.0" encoding="utf-8"?><PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011"><Metadata><Identity Id="fixture" Version="0.0.0" Publisher="fixture"/></Metadata><Installation><InstallationTarget Id="Microsoft.VisualStudio.Code"/></Installation></PackageManifest>',
     "extension/.gitignore": "node_modules/\n",
+    "extension/changelog.md": "# Changelog\n",
     "extension/LICENSE.txt": "MIT License\n",
-    "extension/README.md": "# Codex Provider Switcher\n",
+    "extension/readme.md": "# Codex Provider Switcher\n",
+    "extension/media/icon.png": "PNG fixture",
     "extension/package.json": "{}",
     "extension/dist/extension.js": "",
   };

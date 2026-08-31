@@ -64,7 +64,12 @@ test("packages verified platform-specific native dependencies", async () => {
     .filter((entry) => entry.startsWith("!node_modules/@iarna/toml/"));
   assert.match(vscodeIgnore, /^\*\*\/\*.map$/m);
   assert.match(vscodeIgnore, /^\.worktrees\/\*\*$/m);
+  assert.match(vscodeIgnore, /^assets\/\*\*$/m);
   assert.match(vscodeIgnore, /^node_modules\/\*\*$/m);
+  const mediaAllowlistEntries = vscodeIgnore
+    .split(/\r?\n/)
+    .filter((entry) => entry === "media/**" || entry.startsWith("!media/"));
+  assert.deepEqual(mediaAllowlistEntries, ["media/**", "!media/icon.png"]);
   assert.deepEqual(tomlAllowlistEntries, [
     "!node_modules/@iarna/toml/package.json",
     "!node_modules/@iarna/toml/toml.js",
