@@ -43,7 +43,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: marketplace-${{ matrix.target }}
-          path: codex-provider-switcher-0.1.1@${{ matrix.target }}.vsix
+          path: codex-provider-switcher-vscode-0.1.2@${{ matrix.target }}.vsix
           if-no-files-found: error
 
   publish:
@@ -66,6 +66,6 @@ jobs:
           path: marketplace-assets
           merge-multiple: true
       - run: node scripts/release-artifacts.mjs "$GITHUB_WORKSPACE/marketplace-assets" "${{ inputs.tag }}"
-      - run: ./node_modules/.bin/vsce publish --packagePath marketplace-assets/codex-provider-switcher-0.1.1@win32-x64.vsix marketplace-assets/codex-provider-switcher-0.1.1@linux-x64.vsix --skip-duplicate
+      - run: ./node_modules/.bin/vsce publish --packagePath marketplace-assets/codex-provider-switcher-vscode-0.1.2@win32-x64.vsix marketplace-assets/codex-provider-switcher-vscode-0.1.2@linux-x64.vsix --skip-duplicate
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}

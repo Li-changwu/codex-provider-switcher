@@ -14,10 +14,10 @@ macOS, WSL, cross-device switching, and cloud profile/session synchronization ar
 
 ### VS Code Marketplace
 
-Install [Codex Provider Switcher from the VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=Li-changwu.codex-provider-switcher) in the Extensions view, or run:
+Install [Codex Provider Switcher from the VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=Li-changwu.codex-provider-switcher-vscode) in the Extensions view, or run:
 
 ```text
-code --install-extension Li-changwu.codex-provider-switcher
+code --install-extension Li-changwu.codex-provider-switcher-vscode
 ```
 
 VS Code automatically selects the compatible target package for the machine running the Extension Host. In a Remote SSH window, install the extension on the SSH host; VS Code selects the `linux-x64` package for a compatible remote glibc Linux x64 host. The available Marketplace targets are:
@@ -32,8 +32,8 @@ macOS, WSL, musl Linux, non-x64 hosts, and browser Extension Hosts are not suppo
 
 For an offline or manually verified installation, download the VSIX and `SHA256SUMS.txt` from [GitHub Releases](https://github.com/Li-changwu/codex-provider-switcher/releases). Choose the file for the machine running the VS Code Extension Host:
 
-- Native Windows x64: `codex-provider-switcher-<version>@win32-x64.vsix`.
-- Native glibc Linux x64: `codex-provider-switcher-<version>@linux-x64.vsix`.
+- Native Windows x64: `codex-provider-switcher-vscode-<version>@win32-x64.vsix`.
+- Native glibc Linux x64: `codex-provider-switcher-vscode-<version>@linux-x64.vsix`.
 - Remote SSH Linux x64: open the Remote SSH window first, then use the Linux VSIX in that window so VS Code installs it on the remote Extension Host.
 
 Do not install either artifact on macOS, WSL, musl Linux, or a different CPU architecture.
@@ -41,13 +41,13 @@ Do not install either artifact on macOS, WSL, musl Linux, or a different CPU arc
 Each release includes `SHA256SUMS.txt`. Verify the downloaded VSIX before installation:
 
 ```powershell
-$vsix = "codex-provider-switcher-<version>@win32-x64.vsix"
+$vsix = "codex-provider-switcher-vscode-<version>@win32-x64.vsix"
 $expected = (Select-String -Path .\SHA256SUMS.txt -Pattern "  $([regex]::Escape($vsix))$").Line.Split("  ")[0]
 (Get-FileHash ".\$vsix" -Algorithm SHA256).Hash.ToLowerInvariant() -eq $expected
 ```
 
 ```sh
-grep -F "  codex-provider-switcher-<version>@linux-x64.vsix" SHA256SUMS.txt | sha256sum -c -
+grep -F "  codex-provider-switcher-vscode-<version>@linux-x64.vsix" SHA256SUMS.txt | sha256sum -c -
 ```
 
 The selected command must print `True` or `OK`; otherwise, do not install the file.

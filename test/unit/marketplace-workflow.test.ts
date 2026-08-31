@@ -17,22 +17,28 @@ async function readWorkflow(): Promise<string> {
   return (await readFile(workflowPath, "utf8")).replace(/\r\n/g, "\n");
 }
 
-test("Marketplace release metadata is aligned on version 0.1.1", async () => {
+test("Marketplace release metadata is aligned on identity and version 0.1.2", async () => {
   const manifest = JSON.parse(await readFile(packagePath, "utf8")) as {
+    name?: unknown;
     version?: unknown;
   };
   const lockfile = JSON.parse(await readFile(packageLockPath, "utf8")) as {
+    name?: unknown;
     version?: unknown;
-    packages?: Record<string, { version?: unknown }>;
+    packages?: Record<string, { name?: unknown; version?: unknown }>;
   };
   const changelog = await readFile(changelogPath, "utf8");
   const guide = await readFile(publishingGuidePath, "utf8");
 
-  assert.equal(manifest.version, "0.1.1");
-  assert.equal(lockfile.version, "0.1.1");
-  assert.equal(lockfile.packages?.[""]?.version, "0.1.1");
-  assert.match(changelog, /^## 0\.1\.1$/m);
-  assert.match(guide, /`v0\.1\.1`/);
+  assert.equal(manifest.name, "codex-provider-switcher-vscode");
+  assert.equal(manifest.version, "0.1.2");
+  assert.equal(lockfile.name, "codex-provider-switcher-vscode");
+  assert.equal(lockfile.version, "0.1.2");
+  assert.equal(lockfile.packages?.[""]?.name, "codex-provider-switcher-vscode");
+  assert.equal(lockfile.packages?.[""]?.version, "0.1.2");
+  assert.match(changelog, /^## 0\.1\.2$/m);
+  assert.match(guide, /`v0\.1\.2`/);
+  assert.match(guide, /`Li-changwu\.codex-provider-switcher-vscode`/);
 });
 
 test("Marketplace publication is manual, tag-scoped, and read-only", async () => {
@@ -82,7 +88,10 @@ test("native package jobs build the exact input tag without Marketplace credenti
     packageJob,
     /uses: actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a/,
   );
-  assert.match(packageJob, /path: codex-provider-switcher-0\.1\.1@\$\{\{ matrix\.target \}\}\.vsix/);
+  assert.match(
+    packageJob,
+    /path: codex-provider-switcher-vscode-0\.1\.2@\$\{\{ matrix\.target \}\}\.vsix/,
+  );
   assert.match(packageJob, /if-no-files-found: error/);
   assert.doesNotMatch(packageJob, /\b(?:environment|VSCE_PAT|secrets\.)\b/);
 });
@@ -107,7 +116,7 @@ test("protected publish job validates both native packages before local vsce pub
   const validationCommand =
     'node scripts/release-artifacts.mjs "$GITHUB_WORKSPACE/marketplace-assets" "${{ inputs.tag }}"';
   const publishCommand =
-    "./node_modules/.bin/vsce publish --packagePath marketplace-assets/codex-provider-switcher-0.1.1@win32-x64.vsix marketplace-assets/codex-provider-switcher-0.1.1@linux-x64.vsix --skip-duplicate";
+    "./node_modules/.bin/vsce publish --packagePath marketplace-assets/codex-provider-switcher-vscode-0.1.2@win32-x64.vsix marketplace-assets/codex-provider-switcher-vscode-0.1.2@linux-x64.vsix --skip-duplicate";
   const validationIndex = publishJob.indexOf(validationCommand);
   const publishIndex = publishJob.indexOf(publishCommand);
   assert.ok(validationIndex >= 0, "release artifact validation must use the input tag");
@@ -128,7 +137,16 @@ test("README documents Marketplace and verified GitHub Release installation", as
   const readme = await readFile(readmePath, "utf8");
 
   assert.match(readme, /VS Code Marketplace/);
-  assert.match(readme, /Li-changwu\.codex-provider-switcher/);
+  assert.match(
+    readme,
+    /items\?itemName=Li-changwu\.codex-provider-switcher-vscode/,
+  );
+  assert.match(
+    readme,
+    /code --install-extension Li-changwu\.codex-provider-switcher-vscode/,
+  );
+  assert.match(readme, /codex-provider-switcher-vscode-<version>@win32-x64\.vsix/);
+  assert.match(readme, /codex-provider-switcher-vscode-<version>@linux-x64\.vsix/);
   assert.match(readme, /automatically selects[^.]*compatible target/iu);
   assert.match(readme, /GitHub Releases/);
   assert.match(readme, /win32-x64/);
@@ -151,7 +169,8 @@ test("owner guide covers Publisher and least-privilege PAT setup without token e
   assert.match(guide, /GitHub Environment[^\n]*`marketplace`/);
   assert.match(guide, /Environment Secret[^\n]*`VSCE_PAT`/);
   assert.match(guide, /Marketplace Publish/);
-  assert.match(guide, /`v0\.1\.1`/);
+  assert.match(guide, /`Li-changwu\.codex-provider-switcher-vscode`/);
+  assert.match(guide, /`v0\.1\.2`/);
   assert.match(guide, /rotate|rotation/iu);
   assert.match(guide, /revoke|revocation/iu);
   assert.match(guide, /Remove-Item Env:NODE_TLS_REJECT_UNAUTHORIZED/);

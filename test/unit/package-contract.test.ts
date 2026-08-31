@@ -142,6 +142,10 @@ test("runs target-specific packaging commands on both CI platforms", async () =>
 
   assert.match(workflow, /if: matrix\.os == 'windows-latest'[\s\S]*?npm run package:win32-x64/);
   assert.match(workflow, /if: matrix\.os == 'ubuntu-latest'[\s\S]*?npm run package:linux-x64/);
+  assert.match(
+    workflow,
+    /path: codex-provider-switcher-vscode-0\.1\.2@\*\.vsix/,
+  );
 });
 
 test("runs target-specific packaging in the CI test matrix", async () => {
