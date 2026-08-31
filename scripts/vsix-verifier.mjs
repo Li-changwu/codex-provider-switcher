@@ -47,8 +47,10 @@ const baseRequiredVsixEntries = [
   "[Content_Types].xml",
   "extension.vsixmanifest",
   "extension/.gitignore",
+  "extension/changelog.md",
   "extension/LICENSE.txt",
-  "extension/README.md",
+  "extension/readme.md",
+  "extension/media/icon.png",
   "extension/package.json",
   "extension/dist/extension.js",
 ];

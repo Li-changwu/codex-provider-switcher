@@ -35,6 +35,9 @@ test("packages verified platform-specific native dependencies", async () => {
   assert.equal(manifest.dependencies?.sqlite3, "^6.0.1");
   assert.equal(manifest.dependencies?.["@vscode/sqlite3"], undefined);
   assert.equal(manifest.devDependencies?.["@types/vscode"], "^1.98.0");
+  assert.equal(manifest.devDependencies?.["@vscode/vsce"], "^3.9.2");
+  assert.equal(manifest.devDependencies?.esbuild, "^0.28.2");
+  assert.equal(manifest.devDependencies?.sharp, "^0.35.4");
   assert.deepEqual(manifest.repository, {
     type: "git",
     url: "https://github.com/Li-changwu/codex-provider-switcher.git",
@@ -61,7 +64,12 @@ test("packages verified platform-specific native dependencies", async () => {
     .filter((entry) => entry.startsWith("!node_modules/@iarna/toml/"));
   assert.match(vscodeIgnore, /^\*\*\/\*.map$/m);
   assert.match(vscodeIgnore, /^\.worktrees\/\*\*$/m);
+  assert.match(vscodeIgnore, /^assets\/\*\*$/m);
   assert.match(vscodeIgnore, /^node_modules\/\*\*$/m);
+  const mediaAllowlistEntries = vscodeIgnore
+    .split(/\r?\n/)
+    .filter((entry) => entry === "media/**" || entry.startsWith("!media/"));
+  assert.deepEqual(mediaAllowlistEntries, ["media/**", "!media/icon.png"]);
   assert.deepEqual(tomlAllowlistEntries, [
     "!node_modules/@iarna/toml/package.json",
     "!node_modules/@iarna/toml/toml.js",

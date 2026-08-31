@@ -3,11 +3,27 @@
   "displayName": "Codex Provider Switcher",
   "version": "0.1.0",
   "private": true,
+  "description": "Safely manage and switch local Codex provider profiles on Windows, Linux, and Remote SSH.",
   "license": "MIT",
   "publisher": "Li-changwu",
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "codex",
+    "provider",
+    "profiles",
+    "configuration",
+    "remote-ssh"
+  ],
+  "icon": "media/icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/Li-changwu/codex-provider-switcher.git"
+  },
+  "homepage": "https://github.com/Li-changwu/codex-provider-switcher#readme",
+  "bugs": {
+    "url": "https://github.com/Li-changwu/codex-provider-switcher/issues"
   },
   "extensionKind": [
     "workspace"
@@ -90,6 +106,7 @@
   },
   "scripts": {
     "build": "node esbuild.mjs",
+    "generate:icon": "node scripts/generate-marketplace-icon.mjs",
     "check": "tsc --noEmit",
     "test": "tsx --test test/unit/*.test.ts",
     "test:integration": "tsx --test test/integration/*.test.ts",
@@ -108,9 +125,10 @@
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.98.0",
     "@vscode/test-electron": "^2.4.1",
-    "@vscode/vsce": "^2.26.1",
-    "esbuild": "^0.24.0",
+    "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.28.2",
     "node-gyp": "12.4.0",
+    "sharp": "^0.35.4",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
     "yauzl": "^2.10.0",

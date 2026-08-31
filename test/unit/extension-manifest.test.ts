@@ -20,7 +20,15 @@ const expectedCommandIds = [
 
 test("declares the VS Code extension manifest contract", async () => {
   const manifest = JSON.parse(await readFile(packagePath, "utf8")) as {
+    name?: string;
+    private?: boolean;
     publisher?: string;
+    description?: string;
+    categories?: string[];
+    keywords?: string[];
+    icon?: string;
+    homepage?: string;
+    bugs?: { url?: string };
     extensionKind?: string[];
     engines?: { vscode?: string };
     main?: string;
@@ -35,7 +43,29 @@ test("declares the VS Code extension manifest contract", async () => {
     };
   };
 
+  assert.equal(manifest.name, "codex-provider-switcher");
+  assert.equal(manifest.private, true);
   assert.equal(manifest.publisher, "Li-changwu");
+  assert.equal(
+    manifest.description,
+    "Safely manage and switch local Codex provider profiles on Windows, Linux, and Remote SSH.",
+  );
+  assert.deepEqual(manifest.categories, ["Other"]);
+  assert.deepEqual(manifest.keywords, [
+    "codex",
+    "provider",
+    "profiles",
+    "configuration",
+    "remote-ssh",
+  ]);
+  assert.equal(manifest.icon, "media/icon.png");
+  assert.equal(
+    manifest.homepage,
+    "https://github.com/Li-changwu/codex-provider-switcher#readme",
+  );
+  assert.deepEqual(manifest.bugs, {
+    url: "https://github.com/Li-changwu/codex-provider-switcher/issues",
+  });
   assert.deepEqual(manifest.extensionKind, ["workspace"]);
   assert.equal(manifest.engines?.vscode, "^1.98.0");
   assert.equal(manifest.main, "./dist/extension.js");

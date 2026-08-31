@@ -46,7 +46,7 @@ test("package matrix builds both native VSIX targets and fails on missing artifa
 
 test("workflow pins every third-party action to an immutable commit", async () => {
   const workflow = await readWorkflow();
-  const actionUses = [...workflow.matchAll(/^\s+-\s+uses:\s+([^\s]+)$/gm)].map(
+  const actionUses = [...workflow.matchAll(/^\s+-\s+uses:\s+([^\s#]+)(?:\s+#.*)?$/gm)].map(
     (match) => match[1],
   );
   const requiredActions = [

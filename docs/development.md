@@ -2,11 +2,13 @@
 
 Install dependencies with `npm ci` and build with `npm run build`.
 
-## GitHub Release Delivery
+## Release Channels
 
-GitHub Releases are the installable distribution channel; this project does not
-publish to the VS Code Marketplace. Pushing a `v*` tag runs the release
-workflow. Before any assets are published, the tag must exactly equal
+GitHub Release delivery and VS Code Marketplace delivery are separate channels with independent workflows. A pushed version tag creates GitHub Release assets; it does not publish to the Marketplace. The manual Marketplace workflow does not create tags or GitHub Releases.
+
+### GitHub Release Delivery
+
+Pushing a `v*` tag runs the release workflow. Before any assets are published, the tag must exactly equal
 `v${version}`, where `version` is read from `package.json`. A mismatch fails
 the release job.
 
@@ -31,6 +33,14 @@ wait for Windows and Ubuntu CI to pass, merge it, then deliberately push the
 matching tag when a public GitHub Release is intended. Do not add Marketplace
 credentials, provider API keys, OAuth data, profiles, or sessions to the
 workflow or release artifacts.
+
+### VS Code Marketplace Delivery
+
+The `Marketplace Publish` workflow is manual-only through `workflow_dispatch`. Its tag input must exactly match the version in `package.json`, and the referenced tag must already exist. Native Windows and Ubuntu jobs check out that tag, run the corresponding package command, and upload separate `win32-x64` and `linux-x64` VSIX files without Marketplace credentials.
+
+The publish job depends on both native package jobs and enters the protected `marketplace` GitHub Environment. It downloads the two artifacts into a clean directory and runs `scripts/release-artifacts.mjs` before invoking the repository-pinned `vsce` binary. The `VSCE_PAT` Environment Secret is available only to the publish step; package jobs, validation steps, and the rest of the workflow cannot read it.
+
+Do not run this workflow until the Publisher, protected Environment, and secret are configured according to [Marketplace Publishing](marketplace-publishing.md). A successful Marketplace publication does not alter the GitHub Release channel. A GitHub Release can likewise succeed without Marketplace credentials.
 
 ## Official Profile Login
 

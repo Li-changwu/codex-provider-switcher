@@ -10,9 +10,27 @@ VS Code extension for maintaining named local Codex provider profiles and switch
 
 macOS, WSL, cross-device switching, and cloud profile/session synchronization are not supported.
 
-## Install from GitHub Releases
+## Install
 
-This extension is distributed through [GitHub Releases](https://github.com/Li-changwu/codex-provider-switcher/releases), not the VS Code Marketplace. Download the VSIX that matches the machine running the VS Code Extension Host:
+### VS Code Marketplace
+
+Install [Codex Provider Switcher from the VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=Li-changwu.codex-provider-switcher) in the Extensions view, or run:
+
+```text
+code --install-extension Li-changwu.codex-provider-switcher
+```
+
+VS Code automatically selects the compatible target package for the machine running the Extension Host. In a Remote SSH window, install the extension on the SSH host; VS Code selects the `linux-x64` package for a compatible remote glibc Linux x64 host. The available Marketplace targets are:
+
+- Native Windows x64: `win32-x64`.
+- Native glibc Linux x64: `linux-x64`.
+- Remote SSH to glibc Linux x64: `linux-x64` on the remote Extension Host.
+
+macOS, WSL, musl Linux, non-x64 hosts, and browser Extension Hosts are not supported.
+
+### GitHub Releases
+
+For an offline or manually verified installation, download the VSIX and `SHA256SUMS.txt` from [GitHub Releases](https://github.com/Li-changwu/codex-provider-switcher/releases). Choose the file for the machine running the VS Code Extension Host:
 
 - Native Windows x64: `codex-provider-switcher-<version>@win32-x64.vsix`.
 - Native glibc Linux x64: `codex-provider-switcher-<version>@linux-x64.vsix`.
@@ -38,7 +56,7 @@ In VS Code, open the Extensions view, select the `...` menu, select **Install fr
 
 ### Upgrade and Uninstall
 
-To upgrade, download and verify the newer VSIX for the same Extension Host, then repeat **Install from VSIX...**. VS Code replaces the extension while preserving its local VS Code SecretStorage and the Codex Home data on that host. To uninstall, use the extension's gear menu and choose **Uninstall** in the same local or Remote SSH window where it was installed. Uninstalling the extension does not delete Codex profiles, backups, sessions, or credentials; remove those separately only when you explicitly intend to do so.
+Marketplace installations follow the normal VS Code extension update flow. To upgrade a manual installation, download and verify the newer VSIX for the same Extension Host, then repeat **Install from VSIX...**. VS Code replaces the extension while preserving its local VS Code SecretStorage and the Codex Home data on that host. To uninstall, use the extension's gear menu and choose **Uninstall** in the same local or Remote SSH window where it was installed. Uninstalling the extension does not delete Codex profiles, backups, sessions, or credentials; remove those separately only when you explicitly intend to do so.
 
 ## Profiles and Credentials
 
