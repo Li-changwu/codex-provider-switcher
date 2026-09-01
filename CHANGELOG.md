@@ -2,6 +2,17 @@
 
 All notable changes to Codex Provider Switcher are documented in this file.
 
+## Unreleased
+
+- Add the Codex Providers Activity Bar workbench with TreeView navigation and a
+  VS Code-native details panel.
+- Add structured and raw custom Provider editing, write-only SecretStorage API
+  key handling, named official-login aliases, and an explicit re-login action.
+- Make session synchronization manual, show progress and no-op status, and gate
+  continuation until the selected Provider has been synchronized.
+- Require confirmation before capability-unavailable continuation falls back to
+  a fork, while refusing to downgrade encrypted or unreadable content errors.
+
 ## 0.1.2
 
 - Publish under the permanent Marketplace identity

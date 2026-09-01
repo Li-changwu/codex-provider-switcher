@@ -449,6 +449,7 @@ test("offers confirmed readable-content fallback when the native fork command is
       confirmationRequired: true,
       confirmationGranted: true,
       fallbackLaunched: true,
+      fallbackReason: "capability-unavailable",
     });
     assert.deepEqual(terminal.invocations, [{
       command: "codex",

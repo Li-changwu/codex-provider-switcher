@@ -41,6 +41,7 @@ export interface WorkbenchContinuationResult {
   readonly status: "resumed" | "forked" | "forkLaunched" | "reusedBranch" | "readableContentFallback";
   readonly sourceSessionId: string;
   readonly branchSessionId?: string;
+  readonly fallbackReason?: "capability-unavailable" | "encrypted-content";
 }
 
 export interface ProviderWorkbenchDependencies {
@@ -60,6 +61,7 @@ type WorkbenchMessage =
   | { readonly type: "loadProfile"; readonly profileId: string }
   | { readonly type: "listSessions"; readonly profileId: string }
   | { readonly type: "syncSessions"; readonly profileId: string }
+  | { readonly type: "loginOfficial"; readonly profileId: string }
   | { readonly type: "continueSession"; readonly profileId: string; readonly sessionId: string }
   | { readonly type: "switchProfile"; readonly profileId: string }
   | { readonly type: "deleteProfile"; readonly profileId: string }
@@ -95,6 +97,8 @@ export class ProviderWorkbenchController {
         return this.listSessions(message.profileId);
       case "syncSessions":
         return this.syncSessions(message.profileId);
+      case "loginOfficial":
+        return this.loginOfficial(message.profileId);
       case "continueSession":
         return this.continueSession(message.profileId, message.sessionId);
       case "switchProfile":
@@ -194,6 +198,9 @@ export class ProviderWorkbenchController {
     if (resumed.status !== "readableContentFallback") {
       return { type: "continuationCompleted" as const, mode: "resume" as const, ...resumed };
     }
+    if (resumed.fallbackReason !== "capability-unavailable") {
+      throw new Error("Native continuation could not safely fall back because the session content is not readable.");
+    }
     const profile = await requireProfile(this.dependencies.profiles, profileId);
     const confirmed = await this.dependencies.confirm(
       `This session cannot continue in place. Create a new branch from its synchronized history using ${profile.name}?`,
@@ -218,6 +225,20 @@ export class ProviderWorkbenchController {
     return result.status === "committed"
       ? { type: "operationCompleted" as const, operation: "switchProfile" as const }
       : { type: "operationFailed" as const, message: "Provider switch did not complete safely." };
+  }
+
+  private async loginOfficial(profileId: string) {
+    const profile = await requireProfile(this.dependencies.profiles, profileId);
+    if (profile.kind !== "official") {
+      throw new Error("Official login is available only for an OpenAI official Provider.");
+    }
+    const result = await this.dependencies.switchProfile(profileId, this.dependencies.onProgress);
+    if (result.status !== "committed") {
+      return { type: "operationFailed" as const, operation: "loginOfficial" as const, message: "OpenAI official login did not complete safely." };
+    }
+    this.clearEligibility();
+    await this.dependencies.onStateChanged?.();
+    return { type: "operationCompleted" as const, operation: "loginOfficial" as const };
   }
 
   private async deleteProfile(profileId: string) {
@@ -307,7 +328,7 @@ function parseMessage(raw: unknown): WorkbenchMessage {
   if (type === "listProfiles") {
     return { type };
   }
-  if (["loadProfile", "listSessions", "syncSessions", "switchProfile", "deleteProfile"].includes(type)) {
+  if (["loadProfile", "listSessions", "syncSessions", "loginOfficial", "switchProfile", "deleteProfile"].includes(type)) {
     return { type, profileId: requiredId(raw.profileId) } as WorkbenchMessage;
   }
   if (type === "continueSession") {

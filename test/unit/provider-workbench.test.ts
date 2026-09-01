@@ -96,11 +96,71 @@ test("starts the native official login switch after creating an official Provide
   assert.equal(result.loginCompleted, true);
 });
 
+test("re-runs official login only for an official Provider", async () => {
+  const official: ProfileRecord = {
+    ...profile(),
+    id: "official-lab",
+    name: "Official Lab",
+    kind: "official",
+    providerId: "openai",
+    apiKeySecretId: undefined,
+  };
+  const switched: string[] = [];
+  const controller = new ProviderWorkbenchController({
+    profiles: {
+      list: async () => [official],
+      get: async (id) => id === official.id ? official : undefined,
+      readConfig: async () => 'model_provider = "openai"\n',
+      create: async () => { throw new Error("unused"); },
+      update: async () => undefined,
+      delete: async () => false,
+    },
+    secrets: { get: async () => undefined, set: async () => undefined },
+    activeProfileId: async () => official.id,
+    switchProfile: async (id) => {
+      switched.push(id);
+      return { status: "committed" };
+    },
+    listSessionAnchors: async () => [],
+    continueSession: async () => { throw new Error("unused"); },
+    confirm: async () => true,
+  });
+
+  const result = await controller.handleMessage({
+    type: "loginOfficial",
+    profileId: official.id,
+  });
+
+  assert.deepEqual(switched, [official.id]);
+  assert.deepEqual(result, {
+    type: "operationCompleted",
+    operation: "loginOfficial",
+  });
+});
+
+test("does not fork when continuation fallback is caused by encrypted content", async () => {
+  const fixture = workbenchFixture();
+  fixture.continuationFallbackReason = "encrypted-content";
+  await fixture.controller.handleMessage({ type: "syncSessions", profileId: "proxy" });
+
+  await assert.rejects(
+    () => fixture.controller.handleMessage({
+      type: "continueSession",
+      profileId: "proxy",
+      sessionId: "session-1",
+    }),
+    /encrypted|continuation/i,
+  );
+  assert.deepEqual(fixture.continuationModes, ["resume"]);
+  assert.equal(fixture.confirmations.length, 0);
+});
+
 function workbenchFixture() {
   const records = new Map<string, ProfileRecord>([["proxy", profile()]]);
   const switchCalls: string[] = [];
   const continuationModes: string[] = [];
   const confirmations: string[] = [];
+  let continuationFallbackReason: "capability-unavailable" | "encrypted-content" = "capability-unavailable";
   const controller = new ProviderWorkbenchController({
     profiles: {
       list: async () => [...records.values()],
@@ -131,7 +191,7 @@ function workbenchFixture() {
     continueSession: async (request) => {
       continuationModes.push(request.mode);
       return request.mode === "resume"
-        ? { status: "readableContentFallback", sourceSessionId: request.sessionId }
+        ? { status: "readableContentFallback", sourceSessionId: request.sessionId, fallbackReason: continuationFallbackReason }
         : { status: "forked", sourceSessionId: request.sessionId, branchSessionId: "branch-1" };
     },
     confirm: async (message) => {
@@ -139,7 +199,7 @@ function workbenchFixture() {
       return true;
     },
   });
-  return { controller, switchCalls, continuationModes, confirmations };
+  return { controller, switchCalls, continuationModes, confirmations, get continuationFallbackReason() { return continuationFallbackReason; }, set continuationFallbackReason(value: "capability-unavailable" | "encrypted-content") { continuationFallbackReason = value; } };
 }
 
 function profile(): ProfileRecord {
