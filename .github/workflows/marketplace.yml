@@ -36,6 +36,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - id: version
+        run: echo "version=$(node -p \"require('./package.json').version\")" >> "$GITHUB_OUTPUT"
       - if: matrix.target == 'win32-x64'
         run: npm run package:win32-x64
       - if: matrix.target == 'linux-x64'
@@ -43,7 +45,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: marketplace-${{ matrix.target }}
-          path: codex-provider-switcher-vscode-0.1.2@${{ matrix.target }}.vsix
+          path: codex-provider-switcher-vscode-${{ steps.version.outputs.version }}@${{ matrix.target }}.vsix
           if-no-files-found: error
 
   publish:
@@ -59,6 +61,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - id: version
+        run: echo "version=$(node -p \"require('./package.json').version\")" >> "$GITHUB_OUTPUT"
       - run: rm -rf marketplace-assets && mkdir marketplace-assets
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -66,6 +70,6 @@ jobs:
           path: marketplace-assets
           merge-multiple: true
       - run: node scripts/release-artifacts.mjs "$GITHUB_WORKSPACE/marketplace-assets" "${{ inputs.tag }}"
-      - run: ./node_modules/.bin/vsce publish --packagePath marketplace-assets/codex-provider-switcher-vscode-0.1.2@win32-x64.vsix marketplace-assets/codex-provider-switcher-vscode-0.1.2@linux-x64.vsix --skip-duplicate
+      - run: ./node_modules/.bin/vsce publish --packagePath "marketplace-assets/codex-provider-switcher-vscode-${{ steps.version.outputs.version }}@win32-x64.vsix" "marketplace-assets/codex-provider-switcher-vscode-${{ steps.version.outputs.version }}@linux-x64.vsix" --skip-duplicate
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}

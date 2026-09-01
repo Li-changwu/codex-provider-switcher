@@ -151,6 +151,9 @@ export class ProviderWorkbenchController {
 
   private async listSessions(profileId: string) {
     await requireProfile(this.dependencies.profiles, profileId);
+    if ((await this.dependencies.activeProfileId()) !== profileId) {
+      this.clearEligibility();
+    }
     const anchors = await this.dependencies.listSessionAnchors();
     return {
       type: "sessionSnapshot" as const,
@@ -189,6 +192,9 @@ export class ProviderWorkbenchController {
   }
 
   private async continueSession(profileId: string, sessionId: string) {
+    if ((await this.dependencies.activeProfileId()) !== profileId) {
+      this.clearEligibility();
+    }
     assertContinuationEligible(this.eligibility, profileId, sessionId);
     const anchor = this.anchors.get(sessionId);
     if (!anchor) {
@@ -214,6 +220,9 @@ export class ProviderWorkbenchController {
       sessionId,
       sourceEventHash: anchor.sourceEventHash,
     });
+    if (forked.status === "readableContentFallback" || !forked.branchSessionId) {
+      throw new Error("A new continuation branch could not be created safely.");
+    }
     return { type: "continuationCompleted" as const, mode: "fork" as const, ...forked };
   }
 
@@ -299,6 +308,16 @@ export class ProviderWorkbenchController {
   private async saveProfile(message: Extract<WorkbenchMessage, { type: "saveProfile" }>) {
     const profile = await requireProfile(this.dependencies.profiles, message.profileId);
     const validated = validateProfileConfig(message.configText, profile.kind);
+    const secretId = profile.apiKeySecretId ?? profileApiKeySecretId(profile.id);
+    const replacementKey = profile.kind === "custom" && message.apiKey?.trim()
+      ? message.apiKey
+      : undefined;
+    const previousKey = replacementKey !== undefined
+      ? await this.dependencies.secrets.get(secretId)
+      : undefined;
+    if (replacementKey !== undefined) {
+      await this.dependencies.secrets.set(secretId, replacementKey);
+    }
     const updated = await this.dependencies.profiles.update(profile.id, {
       name: requiredName(message.name),
       kind: profile.kind,
@@ -306,17 +325,32 @@ export class ProviderWorkbenchController {
       providerId: validated.providerId,
     });
     if (!updated) {
+      if (replacementKey !== undefined) {
+        await restoreSecret(this.dependencies.secrets, secretId, previousKey);
+      }
       throw new Error("The Provider is no longer available.");
     }
-    if (profile.kind === "custom" && message.apiKey?.trim()) {
-      await this.dependencies.secrets.set(
-        profile.apiKeySecretId ?? profileApiKeySecretId(profile.id),
-        message.apiKey,
-      );
+    if ((await this.dependencies.activeProfileId()) === profile.id) {
+      const materialized = await this.dependencies.switchProfile(profile.id, this.dependencies.onProgress);
+      if (materialized.status !== "committed") {
+        throw new Error("The Provider was saved, but its active configuration could not be materialized safely.");
+      }
     }
     this.clearEligibility();
     await this.dependencies.onStateChanged?.();
     return { type: "operationCompleted" as const, operation: "saveProfile" as const };
+  }
+}
+
+async function restoreSecret(
+  secrets: WorkbenchSecretStore,
+  id: string,
+  previous: string | undefined,
+): Promise<void> {
+  if (previous !== undefined) {
+    await secrets.set(id, previous);
+  } else {
+    await secrets.delete?.(id);
   }
 }
 

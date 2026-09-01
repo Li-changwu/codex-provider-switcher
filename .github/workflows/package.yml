@@ -26,6 +26,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - id: version
+        run: echo "version=$(node -p \"require('./package.json').version\")" >> "$GITHUB_OUTPUT"
       - if: matrix.os == 'windows-latest'
         run: npm run package:win32-x64
       - if: matrix.os == 'ubuntu-latest'
@@ -33,5 +35,5 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: codex-provider-switcher-vscode-${{ matrix.os }}
-          path: codex-provider-switcher-vscode-0.1.2@*.vsix
+          path: codex-provider-switcher-vscode-${{ steps.version.outputs.version }}@*.vsix
           if-no-files-found: error

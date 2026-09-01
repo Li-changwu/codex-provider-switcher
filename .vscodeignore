@@ -1,5 +1,6 @@
 .vscode/**
 .worktrees/**
+.superpowers/**
 .github/**
 docs/**
 test/**

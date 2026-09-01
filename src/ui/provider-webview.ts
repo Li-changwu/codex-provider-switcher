@@ -43,7 +43,7 @@ export class ProviderWorkbenchPanel {
 
   refresh(): void {
     if (this.panel) {
-      void this.publishInitialState();
+      void this.publishInitialState().catch(() => undefined);
     }
   }
 
@@ -99,13 +99,17 @@ export class ProviderWorkbenchPanel {
       ?? (isRecord(profileList) && typeof profileList.activeProfileId === "string"
         ? profileList.activeProfileId
         : undefined);
-    if (requested) {
+    const available = isRecord(profileList) && Array.isArray(profileList.profiles)
+      && profileList.profiles.some((profile) => isRecord(profile) && profile.id === requested);
+    if (requested && available) {
       await this.panel.webview.postMessage(
         await this.controller.handleMessage({ type: "loadProfile", profileId: requested }),
       );
       await this.panel.webview.postMessage(
         await this.controller.handleMessage({ type: "listSessions", profileId: requested }),
       );
+    } else if (this.requestedProfileId === requested) {
+      this.requestedProfileId = undefined;
     }
     if (this.createRequested) {
       this.createRequested = false;

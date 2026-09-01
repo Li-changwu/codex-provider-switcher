@@ -64,6 +64,7 @@ test("packages verified platform-specific native dependencies", async () => {
     .filter((entry) => entry.startsWith("!node_modules/@iarna/toml/"));
   assert.match(vscodeIgnore, /^\*\*\/\*.map$/m);
   assert.match(vscodeIgnore, /^\.worktrees\/\*\*$/m);
+  assert.match(vscodeIgnore, /^\.superpowers\/\*\*$/m);
   assert.match(vscodeIgnore, /^assets\/\*\*$/m);
   assert.match(vscodeIgnore, /^node_modules\/\*\*$/m);
   const mediaAllowlistEntries = vscodeIgnore
@@ -144,7 +145,7 @@ test("runs target-specific packaging commands on both CI platforms", async () =>
   assert.match(workflow, /if: matrix\.os == 'ubuntu-latest'[\s\S]*?npm run package:linux-x64/);
   assert.match(
     workflow,
-    /path: codex-provider-switcher-vscode-0\.1\.2@\*\.vsix/,
+    /path: codex-provider-switcher-vscode-\$\{\{ steps\.version\.outputs\.version \}\}@\*\.vsix/,
   );
 });
 

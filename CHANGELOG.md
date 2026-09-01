@@ -2,7 +2,7 @@
 
 All notable changes to Codex Provider Switcher are documented in this file.
 
-## Unreleased
+## 0.1.3
 
 - Add the Codex Providers Activity Bar workbench with TreeView navigation and a
   VS Code-native details panel.

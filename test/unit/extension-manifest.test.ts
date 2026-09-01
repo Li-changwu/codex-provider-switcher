@@ -54,7 +54,7 @@ test("declares the VS Code extension manifest contract", async () => {
 
   assert.equal(manifest.name, "codex-provider-switcher-vscode");
   assert.equal(manifest.displayName, "Codex Provider Switcher");
-  assert.equal(manifest.version, "0.1.2");
+  assert.equal(manifest.version, "0.1.3");
   assert.equal(manifest.private, true);
   assert.equal(manifest.publisher, "Li-changwu");
   assert.equal(

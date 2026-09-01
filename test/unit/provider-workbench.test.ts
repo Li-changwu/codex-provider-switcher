@@ -155,13 +155,76 @@ test("does not fork when continuation fallback is caused by encrypted content", 
   assert.equal(fixture.confirmations.length, 0);
 });
 
+test("materializes an edited active Provider before completing save", async () => {
+  const record = profile();
+  const switchCalls: string[] = [];
+  const controller = new ProviderWorkbenchController({
+    profiles: {
+      list: async () => [record],
+      get: async (id) => id === record.id ? record : undefined,
+      readConfig: async () => 'model_provider = "proxy"\n[model_providers.proxy]\nname = "Proxy"\nbase_url = "https://example.test/v1"\nwire_api = "responses"\n',
+      create: async () => { throw new Error("unused"); },
+      update: async () => record,
+      delete: async () => false,
+    },
+    secrets: { get: async () => "raw-key", set: async () => undefined },
+    activeProfileId: async () => record.id,
+    switchProfile: async (id) => { switchCalls.push(id); return { status: "committed" }; },
+    listSessionAnchors: async () => [],
+    continueSession: async () => { throw new Error("unused"); },
+    confirm: async () => true,
+  });
+
+  const result = await controller.handleMessage({
+    type: "saveProfile",
+    profileId: record.id,
+    name: record.name,
+    configText: 'model_provider = "proxy"\n[model_providers.proxy]\nname = "Updated"\nbase_url = "https://updated.example/v1"\nwire_api = "responses"\n',
+  });
+
+  assert.equal(result.type, "operationCompleted");
+  assert.deepEqual(switchCalls, [record.id]);
+});
+
+test("does not claim a branch when fork continuation falls back again", async () => {
+  const fixture = workbenchFixture();
+  fixture.forkResult = { status: "readableContentFallback", sourceSessionId: "session-1", fallbackReason: "capability-unavailable" };
+  await fixture.controller.handleMessage({ type: "syncSessions", profileId: "proxy" });
+  await assert.rejects(
+    () => fixture.controller.handleMessage({ type: "continueSession", profileId: "proxy", sessionId: "session-1" }),
+    /fork|continuation/i,
+  );
+});
+
+test("invalidates continuation eligibility when another Provider becomes active", async () => {
+  const fixture = workbenchFixture();
+  let active = "proxy";
+  fixture.setActiveProfile = (id: string) => { active = id; };
+  fixture.controller = new ProviderWorkbenchController({
+    profiles: fixture.dependencies.profiles,
+    secrets: fixture.dependencies.secrets,
+    activeProfileId: async () => active,
+    switchProfile: fixture.dependencies.switchProfile,
+    listSessionAnchors: fixture.dependencies.listSessionAnchors,
+    continueSession: fixture.dependencies.continueSession,
+    confirm: fixture.dependencies.confirm,
+  });
+  await fixture.controller.handleMessage({ type: "syncSessions", profileId: "proxy" });
+  fixture.setActiveProfile("other");
+  await assert.rejects(
+    () => fixture.controller.handleMessage({ type: "continueSession", profileId: "proxy", sessionId: "session-1" }),
+    /synchronized|Provider/i,
+  );
+});
+
 function workbenchFixture() {
   const records = new Map<string, ProfileRecord>([["proxy", profile()]]);
   const switchCalls: string[] = [];
   const continuationModes: string[] = [];
   const confirmations: string[] = [];
   let continuationFallbackReason: "capability-unavailable" | "encrypted-content" = "capability-unavailable";
-  const controller = new ProviderWorkbenchController({
+  let forkResult: any = { status: "forked", sourceSessionId: "session-1", branchSessionId: "branch-1" };
+  const dependencies = {
     profiles: {
       list: async () => [...records.values()],
       get: async (id) => records.get(id),
@@ -192,14 +255,15 @@ function workbenchFixture() {
       continuationModes.push(request.mode);
       return request.mode === "resume"
         ? { status: "readableContentFallback", sourceSessionId: request.sessionId, fallbackReason: continuationFallbackReason }
-        : { status: "forked", sourceSessionId: request.sessionId, branchSessionId: "branch-1" };
+        : forkResult;
     },
     confirm: async (message) => {
       confirmations.push(message);
       return true;
     },
-  });
-  return { controller, switchCalls, continuationModes, confirmations, get continuationFallbackReason() { return continuationFallbackReason; }, set continuationFallbackReason(value: "capability-unavailable" | "encrypted-content") { continuationFallbackReason = value; } };
+  };
+  const controller = new ProviderWorkbenchController(dependencies);
+  return { controller, switchCalls, continuationModes, confirmations, dependencies, setActiveProfile: (_id: string) => undefined, get continuationFallbackReason() { return continuationFallbackReason; }, set continuationFallbackReason(value: "capability-unavailable" | "encrypted-content") { continuationFallbackReason = value; }, get forkResult() { return forkResult; }, set forkResult(value: any) { forkResult = value; } };
 }
 
 function profile(): ProfileRecord {
