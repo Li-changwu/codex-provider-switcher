@@ -30,7 +30,7 @@ jobs:
         shell: node {0}
         run: |
           const fs = require('fs');
-          const pkg = require('./package.json');
+          const pkg = require(`${process.env.GITHUB_WORKSPACE}/package.json`);
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${pkg.version}\n`);
       - if: matrix.os == 'windows-latest'
         run: npm run package:win32-x64
