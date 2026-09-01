@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFile as nativeExecFile } from "node:child_process";
 import { lstatSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import {
+  access,
   chmod,
   link,
   lstat,
@@ -24,6 +25,7 @@ import type { CodexLayout, ProfileRecord } from "../../src/core/types";
 import {
   ProfileStore,
   ProfileStoreError,
+  createProfileAuthPreview,
   type ProfileFileSystem,
   type ProfileLockFileSystem,
   type ProfileLockOptions,
@@ -41,6 +43,38 @@ import type {
 
 const nodeRequire = createRequire(import.meta.url);
 const execFile = promisify(nativeExecFile);
+
+test("deletes a managed Profile and removes it from the public index", async () => {
+  await withTemporaryLayout(async (layout) => {
+    const store = new ProfileStore(layout);
+    const created = await store.create({
+      name: "Disposable",
+      kind: "custom",
+      configText: 'model_provider = "disposable"\n',
+      providerId: "disposable",
+    });
+
+    assert.equal(await store.delete(created.id), true);
+    assert.deepEqual(await store.list(), []);
+    assert.equal(await access(join(layout.switcherDir, "profiles", created.id)).then(
+      () => true,
+      () => false,
+    ), false);
+    assert.equal(await store.delete(created.id), false);
+  });
+});
+
+test("creates only redacted auth previews for Provider UI", () => {
+  assert.deepEqual(createProfileAuthPreview("custom", true), {
+    kind: "custom",
+    json: '{\n  "OPENAI_API_KEY": "[REDACTED]"\n}',
+    secretConfigured: true,
+  });
+  assert.deepEqual(createProfileAuthPreview("official", false), {
+    kind: "official",
+    secretConfigured: false,
+  });
+});
 
 test("accepts a Windows 8.3 alias for Profile storage", async (t) => {
   if (process.platform !== "win32") {

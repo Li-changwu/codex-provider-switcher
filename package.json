@@ -38,6 +38,23 @@
   "contributes": {
     "commands": [
       {
+        "command": "codexProvider.openWorkbench",
+        "title": "Codex: Open Provider Workbench",
+        "enablement": "codexProvider.commandsAvailable"
+      },
+      {
+        "command": "codexProvider.addProvider",
+        "title": "Codex: Add Provider",
+        "icon": "$(add)",
+        "enablement": "codexProvider.commandsAvailable"
+      },
+      {
+        "command": "codexProvider.refreshProviders",
+        "title": "Codex: Refresh Providers",
+        "icon": "$(refresh)",
+        "enablement": "codexProvider.commandsAvailable"
+      },
+      {
         "command": "codexProvider.createProfile",
         "title": "Codex: Create Profile",
         "enablement": "codexProvider.commandsAvailable"
@@ -71,6 +88,18 @@
     "menus": {
       "commandPalette": [
         {
+          "command": "codexProvider.openWorkbench",
+          "when": "codexProvider.commandsAvailable"
+        },
+        {
+          "command": "codexProvider.addProvider",
+          "when": "codexProvider.commandsAvailable"
+        },
+        {
+          "command": "codexProvider.refreshProviders",
+          "when": "codexProvider.commandsAvailable"
+        },
+        {
           "command": "codexProvider.createProfile",
           "when": "codexProvider.commandsAvailable"
         },
@@ -100,6 +129,42 @@
           "command": "codexProvider.switchProfile",
           "when": "codexProvider.commandsAvailable",
           "group": "navigation"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "codexProvider.addProvider",
+          "when": "view == codexProvider.providers",
+          "group": "navigation@1"
+        },
+        {
+          "command": "codexProvider.refreshProviders",
+          "when": "view == codexProvider.providers",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "codexProvider.openWorkbench",
+          "when": "view == codexProvider.providers",
+          "group": "inline"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codexProvider",
+          "title": "Codex Providers",
+          "icon": "media/activitybar.svg"
+        }
+      ]
+    },
+    "views": {
+      "codexProvider": [
+        {
+          "id": "codexProvider.providers",
+          "name": "Providers"
         }
       ]
     }

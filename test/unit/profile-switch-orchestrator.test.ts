@@ -332,6 +332,7 @@ test("forwards every real rollout scan update before the scan stage completes", 
     );
 
     assert.equal(result.status, "committed");
+    assert.equal(result.synchronizedChanges, 2);
     const scans = events.filter((event) => event.stage === "scan");
     assert.deepEqual(scans.map(({ completed, total }) => ({ completed, total })), [
       { completed: 1, total: 2 },

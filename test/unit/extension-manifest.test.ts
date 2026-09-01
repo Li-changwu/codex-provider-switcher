@@ -10,9 +10,12 @@ const packagePath = resolve(
 );
 const commandAvailabilityContextKey = "codexProvider.commandsAvailable";
 const expectedCommandIds = [
+  "codexProvider.addProvider",
   "codexProvider.continueSession",
   "codexProvider.createProfile",
   "codexProvider.editProfile",
+  "codexProvider.openWorkbench",
+  "codexProvider.refreshProviders",
   "codexProvider.restoreBackup",
   "codexProvider.switchProfile",
   "codexProvider.syncSessions",
@@ -41,7 +44,11 @@ test("declares the VS Code extension manifest contract", async () => {
       menus?: {
         commandPalette?: Array<{ command?: string; when?: string }>;
         statusBar?: Array<{ command?: string; when?: string }>;
+        "view/title"?: Array<{ command?: string; when?: string }>;
+        "view/item/context"?: Array<{ command?: string; when?: string }>;
       };
+      viewsContainers?: { activitybar?: Array<{ id?: string; title?: string; icon?: string }> };
+      views?: { codexProvider?: Array<{ id?: string; name?: string }> };
     };
   };
 
@@ -85,6 +92,18 @@ test("declares the VS Code extension manifest contract", async () => {
       (entry) => entry.enablement === commandAvailabilityContextKey,
     ),
   );
+  assert.deepEqual(manifest.contributes?.viewsContainers?.activitybar, [{
+    id: "codexProvider",
+    title: "Codex Providers",
+    icon: "media/activitybar.svg",
+  }]);
+  assert.deepEqual(manifest.contributes?.views?.codexProvider, [{
+    id: "codexProvider.providers",
+    name: "Providers",
+  }]);
+  assert.ok(manifest.contributes?.menus?.["view/title"]?.some(
+    (entry) => entry.command === "codexProvider.addProvider" && entry.when === "view == codexProvider.providers",
+  ));
   const commandPalette = manifest.contributes?.menus?.commandPalette ?? [];
   assert.deepEqual(
     commandPalette.map((entry) => entry.command).sort(),

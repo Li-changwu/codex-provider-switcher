@@ -121,6 +121,29 @@ export interface ContinueSessionResult {
   readonly confirmationGranted?: boolean;
   readonly fallbackLaunched?: boolean;
   readonly retentionWarning?: boolean;
+  /** Why readable fallback was selected, when native continuation was unavailable. */
+  readonly fallbackReason?: "capability-unavailable" | "encrypted-content";
+}
+
+export interface ContinuationEligibility {
+  readonly providerId: string;
+  readonly sessionIds: ReadonlySet<string>;
+}
+
+export function assertContinuationEligible(
+  eligibility: ContinuationEligibility | undefined,
+  providerId: string,
+  sessionId: string,
+): void {
+  if (
+    eligibility?.providerId !== providerId ||
+    !eligibility.sessionIds.has(sessionId)
+  ) {
+    throw new ContinuationError(
+      "invalid-session",
+      "The session must be synchronized for the selected Provider before it can continue.",
+    );
+  }
 }
 
 interface CodexCapabilities {
@@ -147,7 +170,7 @@ export async function continueSession(
   ));
   const supported = await getCodexCapabilities(invocation, runner);
   if (!supported.resume || (request.mode === "fork" && !supported.fork)) {
-    return launchReadableContentFallback(request, invocation);
+    return launchReadableContentFallback(request, invocation, "capability-unavailable");
   }
 
   if (request.mode === "resume") {
@@ -239,7 +262,7 @@ async function continueFork(
   if (forkResult.exitCode !== undefined && forkResult.exitCode !== 0) {
     await reservation.rollback();
     if (isEncryptedContentFailure(forkResult.stderr)) {
-      return launchReadableContentFallback(request, invocation);
+      return launchReadableContentFallback(request, invocation, "encrypted-content");
     }
     throw new ContinuationError(
       "native-command-failed",
@@ -311,6 +334,7 @@ async function assertCurrentSourceAnchor(request: ContinueSessionRequest): Promi
 async function launchReadableContentFallback(
   request: ContinueSessionRequest,
   invocation: CodexInvocationSpec,
+  fallbackReason: "capability-unavailable" | "encrypted-content",
 ): Promise<ContinueSessionResult> {
   const prompt = request.readableFallbackPrompt;
   if (!prompt) {
@@ -318,6 +342,7 @@ async function launchReadableContentFallback(
       status: "readableContentFallback",
       sourceSessionId: request.sessionId,
       confirmationRequired: true,
+      fallbackReason,
     };
   }
   if (Buffer.byteLength(prompt, "utf8") > maximumReadableFallbackBytes) {
@@ -331,6 +356,7 @@ async function launchReadableContentFallback(
       status: "readableContentFallback",
       sourceSessionId: request.sessionId,
       confirmationRequired: true,
+      fallbackReason,
     };
   }
   const confirmationGranted = await request.confirmReadableContent();
@@ -341,6 +367,7 @@ async function launchReadableContentFallback(
       confirmationRequired: true,
       confirmationGranted: false,
       fallbackLaunched: false,
+      fallbackReason,
     };
   }
   await launchOrThrow(request.terminal, {
@@ -355,6 +382,7 @@ async function launchReadableContentFallback(
     confirmationRequired: true,
     confirmationGranted: true,
     fallbackLaunched: true,
+    fallbackReason,
   });
 }
 

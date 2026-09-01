@@ -64,6 +64,15 @@ Create a named Profile with non-secret TOML configuration. Custom provider API k
 
 Official Profiles use native Codex authentication. When switching to an official Profile, the extension runs native `codex login` in the current Extension Host terminal and then checks `codex login status`. If login fails, is cancelled, or status cannot be verified, the switch finishes its rollback before the command ends. OAuth credentials remain managed by Codex; the extension does not read, copy, or write them to Profiles, logs, backups, or SecretStorage.
 
+## Provider Workbench
+
+Open the **Codex Providers** icon in the Activity Bar, or run **Codex: Open Provider Workbench**. The left navigation lists named Providers; the work area shows the selected Provider's details and session actions.
+
+- Add either a **Custom configuration** Provider or an **OpenAI official login** Provider. Custom Providers use the structured form by default and also expose validated `config.toml` and write-only `auth.json` editors.
+- Official Providers can have different display names and each has a **Log in again** action. They are named aliases for the one Codex account currently authenticated in that Extension Host; OAuth accounts are not copied or isolated by the extension.
+- Session metadata is never synchronized automatically. Open **Sessions** and click **Sync session metadata** when you want to refresh it. A successful no-op reports `No session metadata needs synchronization.`
+- **Continue** stays disabled until synchronization succeeds for the selected Provider. Native resume is attempted first. If Codex explicitly reports that the capability is unavailable, the workbench asks for confirmation before creating a new fork; encrypted, corrupt, or otherwise unreadable content is reported as an error and is never silently forked.
+
 ## Switching and Recovery
 
 Switching materializes the selected Profile, updates provider metadata for local sessions, and reports progress. A cancellation waits for rollback to finish before another command runs. The switch process creates backups, and **Codex: Restore Backup** can recover an interrupted operation. Session synchronization remains local to the current Extension Host and Codex Home; cross-device and cloud session synchronization are not supported.
